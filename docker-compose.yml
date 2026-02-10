@@ -1,0 +1,23 @@
+services:
+  frameart:
+    build: .
+    container_name: frameart
+    volumes:
+      - frameart_data:/data/frameart
+      # Mount config if you have one:
+      # - ./config.yaml:/app/config.yaml:ro
+    environment:
+      - FRAMEART_DATA_DIR=/data/frameart
+      # Provider API keys — set these in your .env file or shell:
+      # - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    # Host networking is recommended for Samsung TV discovery/control
+    # on the same subnet. Uncomment if needed:
+    # network_mode: host
+    restart: "no"
+    # Override the entrypoint command as needed:
+    # command: ["generate-and-apply", "--prompt", "a sunset over the ocean", "--tv-ip", "192.168.1.100"]
+
+volumes:
+  frameart_data:
+    driver: local
