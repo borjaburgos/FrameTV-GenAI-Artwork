@@ -13,8 +13,8 @@ RUN groupadd -r frameart && useradd -r -g frameart -m frameart
 
 WORKDIR /app
 
-# Install Python dependencies
-COPY pyproject.toml .
+# Copy build metadata first (for dependency caching)
+COPY pyproject.toml README.md ./
 RUN pip install --no-cache-dir . 2>/dev/null || true
 
 # Copy application code
