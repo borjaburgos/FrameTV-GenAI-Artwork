@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -15,10 +16,14 @@ from samsungtvws import SamsungTVWS
 
 from frameart.config import TVProfile
 
+# Samsung TVs use self-signed certs — suppress urllib3 SSL warnings
+warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+
 logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 3
 RETRY_BACKOFF = [2, 4, 8]
+DEFAULT_TIMEOUT = 10  # seconds for websocket operations
 
 
 @dataclass
@@ -47,9 +52,25 @@ def _ensure_token_dir(token_file: str) -> None:
     parent.mkdir(parents=True, exist_ok=True)
 
 
+def _find_token_file(ip: str) -> str | None:
+    """Look for an existing token file for the given IP."""
+    from frameart.config import _default_data_dir
+
+    secrets_dir = _default_data_dir() / "secrets"
+    candidate = secrets_dir / f"{ip.replace('.', '_')}.token"
+    if candidate.is_file():
+        return str(candidate)
+    return None
+
+
 def _connect(profile: TVProfile) -> SamsungTVWS:
     """Create a SamsungTVWS connection from a TVProfile."""
     token_file = profile.token_file
+
+    # Auto-discover saved token if none specified
+    if not token_file:
+        token_file = _find_token_file(profile.ip)
+
     if token_file:
         _ensure_token_dir(token_file)
 
@@ -58,6 +79,7 @@ def _connect(profile: TVProfile) -> SamsungTVWS:
         port=profile.port,
         token_file=token_file,
         name=profile.name,
+        timeout=DEFAULT_TIMEOUT,
     )
 
 
