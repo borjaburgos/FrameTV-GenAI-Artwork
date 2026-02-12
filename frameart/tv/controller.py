@@ -307,9 +307,6 @@ def _art_upload(
     to return error -1 on many firmware versions.  The fix is taken from
     the NickWaterton fork (see xchwarze/samsung-tv-ws-api#130).
 
-    For 2019 Frame TVs (firmware 14xx), art mode must be turned OFF
-    before uploading.  This function handles that automatically.
-
     Returns the ``content_id`` assigned by the TV.
     """
     file_size = len(file_bytes)
@@ -333,22 +330,14 @@ def _art_upload(
         "image_date": date,
         "matte_id": matte,
         "file_size": file_size,
+        # Some firmware versions require the category to be specified
+        # for user-uploaded content.
+        "category": "MY-C0004",
     }
 
     # Ensure the WebSocket is open
     if not art.connection:
         art.open()
-
-    # 2019 Frame TVs (firmware 14xx) require art mode to be OFF before
-    # accepting an image upload.  Turn it off; we'll re-enable it after
-    # the image is selected.
-    try:
-        logger.debug("Turning art mode OFF before upload (required by 2019 firmware)")
-        art.set_artmode(False)
-        # Give the TV a moment to transition out of art mode
-        time.sleep(1)
-    except Exception as e:
-        logger.debug("Could not turn art mode off (may not be needed): %s", e)
 
     logger.debug("Sending send_image request: %s", json.dumps(request_data))
     art.send_command(ArtChannelEmitCommand.art_app_request(request_data))
