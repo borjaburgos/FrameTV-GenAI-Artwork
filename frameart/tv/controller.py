@@ -290,6 +290,7 @@ def _prepare_image_for_tv(
 
 
 _UPLOAD_CHUNK = 64 * 1024  # 64 KB chunks for TCP socket transfer
+_ART_EVENT_TIMEOUT = 30  # seconds to wait for a TV art-app response
 
 
 def _art_upload(
@@ -305,6 +306,9 @@ def _art_upload(
     xchwarze library omits this field, which causes Samsung Frame TVs
     to return error -1 on many firmware versions.  The fix is taken from
     the NickWaterton fork (see xchwarze/samsung-tv-ws-api#130).
+
+    For 2019 Frame TVs (firmware 14xx), art mode must be turned OFF
+    before uploading.  This function handles that automatically.
 
     Returns the ``content_id`` assigned by the TV.
     """
@@ -328,13 +332,23 @@ def _art_upload(
         },
         "image_date": date,
         "matte_id": matte,
-        "portrait_matte_id": matte,
         "file_size": file_size,
     }
 
     # Ensure the WebSocket is open
     if not art.connection:
         art.open()
+
+    # 2019 Frame TVs (firmware 14xx) require art mode to be OFF before
+    # accepting an image upload.  Turn it off; we'll re-enable it after
+    # the image is selected.
+    try:
+        logger.debug("Turning art mode OFF before upload (required by 2019 firmware)")
+        art.set_artmode(False)
+        # Give the TV a moment to transition out of art mode
+        time.sleep(1)
+    except Exception as e:
+        logger.debug("Could not turn art mode off (may not be needed): %s", e)
 
     logger.debug("Sending send_image request: %s", json.dumps(request_data))
     art.send_command(ArtChannelEmitCommand.art_app_request(request_data))
@@ -384,15 +398,39 @@ def _wait_for_art_event(
     expected_sub_event: str,
     request_uuid: str,
     request_name: str,
+    timeout: int = _ART_EVENT_TIMEOUT,
 ) -> dict[str, Any]:
     """Read WebSocket messages until we get the expected d2d sub-event.
 
     Matches responses by ``request_id`` or ``id`` so stray events
     (like ``clientDisconnect``) are silently skipped.
+
+    Raises ``TimeoutError`` if no matching response arrives within
+    *timeout* seconds.
     """
+    import websocket as _ws_mod
+
     assert art.connection
+    deadline = time.monotonic() + timeout
+    # Set socket-level timeout so recv() doesn't block forever
+    if hasattr(art.connection, "sock") and art.connection.sock:
+        art.connection.sock.settimeout(timeout)
+
     while True:
-        raw = art.connection.recv()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Timed out after {timeout}s waiting for '{expected_sub_event}' "
+                f"response to `{request_name}`"
+            )
+        try:
+            raw = art.connection.recv()
+        except _ws_mod.WebSocketTimeoutException:
+            raise TimeoutError(
+                f"Timed out after {timeout}s waiting for '{expected_sub_event}' "
+                f"response to `{request_name}`"
+            ) from None
+
         response = process_api_response(raw)
         event = response.get("event", "*")
         art._websocket_event(event, response)
@@ -506,23 +544,21 @@ def upload_image(
         return UploadResult(content_id=content_id, success=True)
     except Exception as e:
         error_msg = str(e)
-        # Provide actionable guidance for the most common failure
-        if "error number -1" in error_msg:
-            token_file = _token_path_for_ip(profile.ip)
-            has_token = Path(token_file).is_file()
-            if not has_token:
-                error_msg += (
-                    "\n\nHint: The TV may not have accepted this client yet. "
-                    "Try pairing first:\n"
-                    f"  frameart tv pair --tv-ip {profile.ip}"
-                )
-            else:
-                error_msg += (
-                    "\n\nHint: Token file exists but the TV still rejected "
-                    "the upload. Try re-pairing:\n"
-                    f"  frameart tv pair --tv-ip {profile.ip}\n"
-                    "and accept the prompt on your TV screen."
-                )
+        if isinstance(e, TimeoutError):
+            error_msg += (
+                "\n\nHint: The TV did not respond in time. This can happen "
+                "when the TV's art service is in a bad state. "
+                "Try power-cycling the TV, then retry."
+            )
+        elif "error number -1" in error_msg:
+            error_msg += (
+                "\n\nHint: The TV rejected the upload (error -1). "
+                "Common causes:\n"
+                "  - 2019 Frame TVs need a power cycle after repeated failures\n"
+                "  - Try re-pairing: frameart tv pair --tv-ip "
+                f"{profile.ip}\n"
+                "  - Ensure the TV screen is on (not in standby)"
+            )
         return UploadResult(content_id="", success=False, error=error_msg)
     finally:
         if tv is not None:
