@@ -17,15 +17,14 @@ from frameart.providers.base import GeneratedImage, ImageProvider
 logger = logging.getLogger(__name__)
 
 # DALL-E 3 supported sizes
-_DALLE3_SIZES = {
-    "1024x1024": (1024, 1024),
-    "1792x1024": (1792, 1024),  # landscape — closest to 16:9
-    "1024x1792": (1024, 1792),
-}
+_DALLE3_SIZES = {"1024x1024", "1792x1024", "1024x1792"}
+
+# gpt-image-1 supported sizes
+_GPT_IMAGE_SIZES = {"1024x1024", "1536x1024", "1024x1536", "auto"}
 
 
 class OpenAIProvider(ImageProvider):
-    """Generate images via OpenAI's DALL-E API."""
+    """Generate images via OpenAI's image generation API."""
 
     def __init__(self, config: ProviderConfig | None = None) -> None:
         self._config = config or ProviderConfig()
@@ -42,6 +41,53 @@ class OpenAIProvider(ImageProvider):
     def name(self) -> str:
         return "openai"
 
+    def _build_payload(
+        self,
+        prompt: str,
+        width: int | None,
+        height: int | None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Build the API payload based on the model."""
+        model = self._model
+
+        if model.startswith("gpt-image"):
+            # gpt-image-1: landscape = 1536x1024
+            size = "1536x1024"
+            if width and height and height > width:
+                size = "1024x1536"
+
+            payload: dict[str, Any] = {
+                "model": model,
+                "prompt": prompt,
+                "n": 1,
+                "size": size,
+            }
+            quality = kwargs.get("quality", "high")
+            if quality:
+                payload["quality"] = quality
+
+        else:
+            # dall-e-3 / dall-e-2
+            size = "1792x1024"
+            if width and height and height > width:
+                size = "1024x1792"
+
+            quality = kwargs.get("quality", "hd")
+            style = kwargs.get("dalle_style", "vivid")
+
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "n": 1,
+                "size": size,
+                "quality": quality,
+                "style": style,
+                "response_format": "b64_json",
+            }
+
+        return payload
+
     def generate(
         self,
         prompt: str,
@@ -57,28 +103,15 @@ class OpenAIProvider(ImageProvider):
         if not self._api_key:
             raise RuntimeError(
                 "OpenAI API key not set. "
-                "Set OPENAI_API_KEY env var or configure providers.openai.api_key"
+                "Set OPENAI_API_KEY env var or providers.openai.api_key"
             )
 
-        # Pick the best DALL-E 3 size — landscape for 16:9 content
-        size = "1792x1024"
-        if width and height and height > width:
-            size = "1024x1792"
+        payload = self._build_payload(prompt, width, height, **kwargs)
 
-        quality = kwargs.get("quality", "hd")
-        style = kwargs.get("dalle_style", "vivid")
-
-        payload: dict[str, Any] = {
-            "model": self._model,
-            "prompt": prompt,
-            "n": 1,
-            "size": size,
-            "quality": quality,
-            "style": style,
-            "response_format": "b64_json",
-        }
-
-        logger.info("OpenAI generate: model=%s size=%s quality=%s", self._model, size, quality)
+        logger.info(
+            "OpenAI generate: model=%s size=%s",
+            payload["model"], payload.get("size"),
+        )
 
         with httpx.Client(timeout=self._timeout) as client:
             resp = client.post(
@@ -89,12 +122,36 @@ class OpenAIProvider(ImageProvider):
                 },
                 json=payload,
             )
-            resp.raise_for_status()
+
+        # Parse error body for a useful message instead of generic 400
+        if resp.status_code >= 400:
+            try:
+                err_body = resp.json()
+                err_msg = err_body.get("error", {}).get("message", resp.text)
+            except Exception:
+                err_msg = resp.text
+            raise RuntimeError(
+                f"OpenAI API error {resp.status_code}: {err_msg}"
+            )
 
         data = resp.json()
-        b64_data = data["data"][0]["b64_json"]
-        revised_prompt = data["data"][0].get("revised_prompt", prompt)
-        image_bytes = base64.b64decode(b64_data)
+
+        # Extract image bytes — response format varies by model
+        image_entry = data["data"][0]
+        if "b64_json" in image_entry:
+            image_bytes = base64.b64decode(image_entry["b64_json"])
+        elif "url" in image_entry:
+            # Some models return a URL instead of base64
+            with httpx.Client(timeout=self._timeout) as client:
+                img_resp = client.get(image_entry["url"])
+                img_resp.raise_for_status()
+                image_bytes = img_resp.content
+        else:
+            raise RuntimeError(
+                f"Unexpected response format: {list(image_entry.keys())}"
+            )
+
+        revised_prompt = image_entry.get("revised_prompt", prompt)
 
         # Detect actual dimensions
         img = Image.open(io.BytesIO(image_bytes))
@@ -110,9 +167,7 @@ class OpenAIProvider(ImageProvider):
             metadata={
                 "provider": self.name,
                 "model": self._model,
-                "size_requested": size,
-                "quality": quality,
-                "style": style,
+                "size_requested": payload.get("size"),
                 "revised_prompt": revised_prompt,
             },
         )
