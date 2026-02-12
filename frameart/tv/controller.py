@@ -6,7 +6,6 @@ Uses the ``samsungtvws`` library (xchwarze/samsung-tv-ws-api).
 from __future__ import annotations
 
 import logging
-import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,10 +93,13 @@ def pair(profile: TVProfile) -> bool:
     Returns True if connection succeeds.
     """
     if not profile.token_file:
-        # Generate a default token file path
-        secrets_dir = Path(os.environ.get("FRAMEART_DATA_DIR", "/data/frameart")) / "secrets"
+        from frameart.config import _default_data_dir
+
+        secrets_dir = _default_data_dir() / "secrets"
         secrets_dir.mkdir(parents=True, exist_ok=True)
-        profile.token_file = str(secrets_dir / f"{profile.ip.replace('.', '_')}.token")
+        profile.token_file = str(
+            secrets_dir / f"{profile.ip.replace('.', '_')}.token"
+        )
 
     logger.info(
         "Pairing with TV at %s:%d (token will be saved to %s)",
@@ -106,9 +108,12 @@ def pair(profile: TVProfile) -> bool:
 
     tv = _connect(profile)
     try:
-        # Opening a connection triggers the pairing prompt
-        info = tv.device_info()
-        logger.info("Connected to TV: %s", info)
+        # open() triggers the pairing prompt on the TV
+        tv.open()
+        # rest_device_info() confirms connectivity via REST (no websocket)
+        info = tv.rest_device_info()
+        logger.info("Connected to TV: %s", info.get("device", {}).get("name", info))
+        tv.close()
         return True
     except Exception as e:
         logger.error("Pairing failed: %s", e)
@@ -119,6 +124,7 @@ def get_status(profile: TVProfile) -> TVStatus:
     """Check the current status of the Frame TV."""
     try:
         tv = _connect(profile)
+        tv.rest_device_info()  # REST check — confirms TV is reachable
     except Exception as e:
         return TVStatus(reachable=False, error=str(e))
 
@@ -188,9 +194,12 @@ def upload_image(
         tv = _connect(profile)
         art = tv.art()
 
-        kwargs: dict[str, Any] = {
-            "file_type": file_type,
-        }
+        # samsungtvws expects lowercase file_type: "png", "jpeg"
+        ft = file_type.lower()
+        if ft == "jpg":
+            ft = "jpeg"
+
+        kwargs: dict[str, Any] = {"file_type": ft}
         if matte and matte != "none":
             kwargs["matte"] = matte
 

@@ -16,6 +16,7 @@ import yaml
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+
 def _default_data_dir() -> Path:
     """Pick a sensible default data directory.
 
