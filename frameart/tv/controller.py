@@ -5,6 +5,7 @@ Uses the ``samsungtvws`` library (xchwarze/samsung-tv-ws-api).
 
 from __future__ import annotations
 
+import io
 import logging
 import time
 import warnings
@@ -12,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from PIL import Image
 from samsungtvws import SamsungTVWS
 
 from frameart.config import TVProfile
@@ -24,6 +26,11 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 3
 RETRY_BACKOFF = [2, 4, 8]
 DEFAULT_TIMEOUT = 10  # seconds for websocket operations
+
+# Samsung Frame TVs reject large uploads over WebSocket.
+# Convert images to JPEG to keep size reasonable.
+_JPEG_QUALITY = 95
+_MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB safety threshold
 
 
 @dataclass
@@ -212,6 +219,35 @@ def get_status(profile: TVProfile) -> TVStatus:
     )
 
 
+def _prepare_image_for_tv(
+    image_bytes: bytes, file_type: str,
+) -> tuple[bytes, str]:
+    """Convert image to JPEG for TV upload if needed.
+
+    Samsung Frame TVs reject large uploads via WebSocket. PNG at 3840x2160
+    can be 15-25 MB; JPEG at the same size is 1-3 MB.
+
+    Returns (image_bytes, file_type) ready for the TV.
+    """
+    size_mb = len(image_bytes) / (1024 * 1024)
+
+    if file_type.upper() in ("PNG",) or len(image_bytes) > _MAX_UPLOAD_BYTES:
+        logger.info(
+            "Converting %s (%.1f MB) to JPEG for TV upload",
+            file_type, size_mb,
+        )
+        img = Image.open(io.BytesIO(image_bytes))
+        img = img.convert("RGB")  # drop alpha if present
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=_JPEG_QUALITY)
+        jpeg_bytes = buf.getvalue()
+        new_mb = len(jpeg_bytes) / (1024 * 1024)
+        logger.info("Converted to JPEG: %.1f MB -> %.1f MB", size_mb, new_mb)
+        return jpeg_bytes, "JPEG"
+
+    return image_bytes, file_type
+
+
 def upload_image(
     profile: TVProfile,
     image_bytes: bytes,
@@ -235,21 +271,32 @@ def upload_image(
     -------
     UploadResult with the content_id assigned by the TV.
     """
+    # Samsung TVs prefer JPEG and reject large PNGs
+    upload_bytes, upload_type = _prepare_image_for_tv(image_bytes, file_type)
 
     def _do_upload() -> str:
         tv = _connect(profile)
         art = tv.art()
 
-        # samsungtvws expects lowercase file_type: "png", "jpeg"
-        ft = file_type.lower()
+        # samsungtvws normalizes "jpeg" -> "jpg" internally
+        ft = upload_type.lower()
         if ft == "jpg":
             ft = "jpeg"
 
         kwargs: dict[str, Any] = {"file_type": ft}
-        if matte and matte != "none":
-            kwargs["matte"] = matte
+        # Always pass matte — the library defaults to "shadowbox_polar"
+        # which can confuse the TV. Pass "none" explicitly when unwanted.
+        kwargs["matte"] = matte if matte and matte != "none" else "none"
 
-        content_id = art.upload(image_bytes, **kwargs)
+        logger.info(
+            "Uploading %s image (%.1f KB, file_type=%s, matte=%s)",
+            upload_type,
+            len(upload_bytes) / 1024,
+            ft,
+            kwargs["matte"],
+        )
+
+        content_id = art.upload(upload_bytes, **kwargs)
         return content_id
 
     try:
