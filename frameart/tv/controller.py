@@ -7,15 +7,25 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import logging
+import random
+import socket as _socket
+import ssl
 import time
+import uuid
 import warnings
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from PIL import Image
 from samsungtvws import SamsungTVWS
+from samsungtvws import exceptions as _tv_exc
+from samsungtvws.art import ArtChannelEmitCommand
+from samsungtvws.event import D2D_SERVICE_MESSAGE_EVENT
+from samsungtvws.helper import process_api_response
 
 from frameart.config import TVProfile
 
@@ -279,6 +289,140 @@ def _prepare_image_for_tv(
     return image_bytes, file_type
 
 
+_UPLOAD_CHUNK = 64 * 1024  # 64 KB chunks for TCP socket transfer
+
+
+def _art_upload(
+    art,
+    file_bytes: bytes,
+    file_type: str = "jpg",
+    matte: str = "shadowbox_polar",
+) -> str:
+    """Upload an image via the Samsung art WebSocket API.
+
+    This reimplements ``art.upload()`` from samsungtvws to include the
+    ``request_id`` field in the ``send_image`` request.  The upstream
+    xchwarze library omits this field, which causes Samsung Frame TVs
+    to return error -1 on many firmware versions.  The fix is taken from
+    the NickWaterton fork (see xchwarze/samsung-tv-ws-api#130).
+
+    Returns the ``content_id`` assigned by the TV.
+    """
+    file_size = len(file_bytes)
+    file_type = file_type.lower()
+    if file_type == "jpeg":
+        file_type = "jpg"
+
+    request_uuid = str(uuid.uuid4())
+    date = datetime.now().strftime("%Y:%m:%d %H:%M:%S")
+
+    request_data: dict[str, Any] = {
+        "request": "send_image",
+        "file_type": file_type,
+        "request_id": request_uuid,
+        "id": request_uuid,
+        "conn_info": {
+            "d2d_mode": "socket",
+            "connection_id": random.randrange(4 * 1024 * 1024 * 1024),
+            "id": request_uuid,
+        },
+        "image_date": date,
+        "matte_id": matte,
+        "portrait_matte_id": matte,
+        "file_size": file_size,
+    }
+
+    # Ensure the WebSocket is open
+    if not art.connection:
+        art.open()
+
+    logger.debug("Sending send_image request: %s", json.dumps(request_data))
+    art.send_command(ArtChannelEmitCommand.art_app_request(request_data))
+
+    # ---- Wait for "ready_to_use" d2d response ----
+    conn_info = _wait_for_art_event(
+        art, "ready_to_use", request_uuid, "send_image",
+    )
+    d2d_info = json.loads(conn_info["conn_info"])
+
+    # ---- Open TCP socket and send image data ----
+    art_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    try:
+        art_sock.connect((d2d_info["ip"], int(d2d_info["port"])))
+        if d2d_info.get("secured", False):
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            art_sock = ctx.wrap_socket(art_sock)
+
+        header = json.dumps({
+            "num": 0,
+            "total": 1,
+            "fileLength": file_size,
+            "fileName": "frameart_upload",
+            "fileType": file_type,
+            "secKey": d2d_info["key"],
+            "version": "0.0.1",
+        })
+        art_sock.sendall(len(header).to_bytes(4, "big"))
+        art_sock.sendall(header.encode("ascii"))
+        for pos in range(0, file_size, _UPLOAD_CHUNK):
+            art_sock.sendall(file_bytes[pos : pos + _UPLOAD_CHUNK])
+    finally:
+        art_sock.close()
+
+    logger.debug("Image data sent, waiting for image_added confirmation")
+
+    # ---- Wait for "image_added" confirmation ----
+    result = _wait_for_art_event(art, "image_added", request_uuid, "send_image")
+    content_id: str = result["content_id"]
+    return content_id
+
+
+def _wait_for_art_event(
+    art,
+    expected_sub_event: str,
+    request_uuid: str,
+    request_name: str,
+) -> dict[str, Any]:
+    """Read WebSocket messages until we get the expected d2d sub-event.
+
+    Matches responses by ``request_id`` or ``id`` so stray events
+    (like ``clientDisconnect``) are silently skipped.
+    """
+    assert art.connection
+    while True:
+        raw = art.connection.recv()
+        response = process_api_response(raw)
+        event = response.get("event", "*")
+        art._websocket_event(event, response)
+
+        if event != D2D_SERVICE_MESSAGE_EVENT:
+            logger.debug("Skipping non-d2d event: %s", event)
+            continue
+
+        data = json.loads(response["data"])
+        # Match by request_id or id to ignore responses for stale requests
+        resp_id = data.get("request_id", data.get("id"))
+        if resp_id != request_uuid:
+            logger.debug(
+                "Skipping d2d event for different request: %s (want %s)",
+                resp_id, request_uuid,
+            )
+            continue
+
+        sub_event = data.get("event", "*")
+        if sub_event == "error":
+            raise _tv_exc.ResponseError(
+                f"`{request_name}` request failed "
+                f"with error number {data.get('error_code', '?')}"
+            )
+        if sub_event == expected_sub_event:
+            return data
+
+        logger.debug("Skipping unexpected sub-event: %s (want %s)", sub_event, expected_sub_event)
+
+
 def upload_image(
     profile: TVProfile,
     image_bytes: bytes,
@@ -305,17 +449,13 @@ def upload_image(
     # Samsung TVs prefer JPEG and reject large PNGs
     upload_bytes, upload_type = _prepare_image_for_tv(image_bytes, file_type)
 
-    # samsungtvws normalizes "jpeg" -> "jpg" internally
+    # Normalize file type for the TV API ("jpeg" -> "jpg" internally)
     ft = upload_type.lower()
-    if ft == "jpg":
-        ft = "jpeg"
+    if ft == "jpeg":
+        ft = "jpg"
 
-    kwargs: dict[str, Any] = {"file_type": ft}
-    # Only pass matte when the user requested one; otherwise let the library
-    # use its default.  Passing an unrecognised value (like "none") to
-    # certain TV firmware versions triggers error -1.
-    if matte and matte != "none":
-        kwargs["matte"] = matte
+    # Resolve matte: use library default when the user hasn't picked one
+    effective_matte = matte if matte and matte != "none" else "shadowbox_polar"
 
     # Validate image bytes before attempting upload
     if len(upload_bytes) < 100:
@@ -323,12 +463,12 @@ def upload_image(
             content_id="", success=False,
             error=f"Image too small ({len(upload_bytes)} bytes) — likely corrupt",
         )
-    if ft == "jpeg" and upload_bytes[:2] != b"\xff\xd8":
+    if ft == "jpg" and upload_bytes[:2] != b"\xff\xd8":
         logger.warning("Expected JPEG but magic bytes are %r", upload_bytes[:4])
 
     logger.info(
         "Uploading %s image (%.1f KB, file_type=%s, matte=%s)",
-        upload_type, len(upload_bytes) / 1024, ft, kwargs.get("matte", "<default>"),
+        upload_type, len(upload_bytes) / 1024, ft, effective_matte,
     )
 
     tv: SamsungTVWS | None = None
@@ -348,11 +488,15 @@ def upload_image(
             "Upload details: host=%s port=%d size=%d bytes file_type=%s "
             "matte=%s token_file=%s",
             profile.ip, profile.port, len(upload_bytes), ft,
-            kwargs.get("matte", "<default>"),
-            tv.token_file,
+            effective_matte, tv.token_file,
         )
 
-        content_id = art.upload(upload_bytes, **kwargs)
+        # Use our custom upload that includes `request_id` in the
+        # send_image request — required by many Samsung firmware versions.
+        # See: xchwarze/samsung-tv-ws-api#130
+        content_id = _art_upload(
+            art, upload_bytes, file_type=ft, matte=effective_matte,
+        )
         logger.debug("TV returned content_id=%s", content_id)
         return content_id
 
