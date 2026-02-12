@@ -8,10 +8,15 @@ Usage:
     frameart tv pair --tv-ip 192.168.1.100
     frameart list
     frameart cleanup --older-than 30
+
+Debugging:
+    frameart --debug generate-and-apply --prompt "..." --tv-ip 1.2.3.4
+    frameart generate-and-apply --debug --prompt "..." --tv-ip 1.2.3.4
 """
 
 from __future__ import annotations
 
+import logging
 import sys
 
 import click
@@ -19,6 +24,48 @@ import click
 from frameart import __version__
 from frameart.artifacts import setup_logging
 from frameart.config import STYLE_PRESETS, load_settings
+
+# Shared options for --debug / --verbose that can appear on any subcommand.
+_debug_option = click.option(
+    "--debug", is_flag=True, default=False, expose_value=False, is_eager=True,
+    callback=lambda ctx, _param, val: ctx.ensure_object(dict).update({"_debug": val}) or val,
+    help="Enable debug logging (includes samsungtvws wire protocol).",
+)
+_verbose_option = click.option(
+    "--verbose", "-v", is_flag=True, default=False, expose_value=False, is_eager=True,
+    callback=lambda ctx, _param, val: ctx.ensure_object(dict).update({"_verbose": val}) or val,
+    help="Enable verbose logging.",
+)
+
+
+def _ensure_logging(ctx: click.Context) -> None:
+    """Idempotently set up logging + settings (handles --debug on subcommand)."""
+    obj = ctx.ensure_object(dict)
+    if "settings" in obj:
+        # Already initialised by the group callback — but re-check if a
+        # subcommand-level --debug upgraded us from WARNING → DEBUG.
+        if obj.get("_debug") and obj.get("_log_level") != "DEBUG":
+            obj["_log_level"] = "DEBUG"
+            settings = obj["settings"]
+            # Re-configure logging at DEBUG
+            root = logging.getLogger("frameart")
+            root.handlers.clear()
+            setup_logging(settings.data_dir, level="DEBUG", log_file=settings.log_file)
+        return
+
+    debug = obj.get("_debug", False)
+    verbose = obj.get("_verbose", False)
+    log_level = "DEBUG" if debug else ("INFO" if verbose else "WARNING")
+    obj["_log_level"] = log_level
+
+    overrides = {}
+    data_dir = obj.get("_data_dir")
+    if data_dir:
+        overrides["data_dir"] = data_dir
+
+    settings = load_settings(log_level=log_level, **overrides)
+    setup_logging(settings.data_dir, level=log_level, log_file=settings.log_file)
+    obj["settings"] = settings
 
 
 def _print_result(result) -> None:
@@ -56,23 +103,23 @@ def _print_result(result) -> None:
 @click.pass_context
 def main(ctx, verbose, debug, data_dir):
     """FrameArt — generate AI artwork and display it on Samsung Frame TVs."""
-    ctx.ensure_object(dict)
+    obj = ctx.ensure_object(dict)
 
-    log_level = "DEBUG" if debug else ("INFO" if verbose else "WARNING")
-    overrides = {}
+    # Store for _ensure_logging (may be called again from subcommands)
+    obj["_debug"] = obj.get("_debug") or debug
+    obj["_verbose"] = obj.get("_verbose") or verbose
     if data_dir:
-        overrides["data_dir"] = data_dir
+        obj["_data_dir"] = data_dir
 
-    settings = load_settings(log_level=log_level, **overrides)
-    setup_logging(settings.data_dir, level=log_level, log_file=settings.log_file)
-
-    ctx.obj["settings"] = settings
+    _ensure_logging(ctx)
 
 
 # --- generate ----------------------------------------------------------------
 
 
 @main.command()
+@_debug_option
+@_verbose_option
 @click.option("--prompt", "-p", required=True, help="Text description of the image.")
 @click.option(
     "--style", "-s",
@@ -90,6 +137,7 @@ def main(ctx, verbose, debug, data_dir):
 @click.pass_context
 def generate(ctx, prompt, style, provider, model, upscaler, negative_prompt, seed, steps, guidance):
     """Generate an image from a text prompt (no TV upload)."""
+    _ensure_logging(ctx)
     from frameart.pipeline import run_generate
 
     settings = ctx.obj["settings"]
@@ -113,6 +161,8 @@ def generate(ctx, prompt, style, provider, model, upscaler, negative_prompt, see
 
 
 @main.command()
+@_debug_option
+@_verbose_option
 @click.option("--image", "-i", required=True, type=click.Path(exists=True), help="Image to upload.")
 @click.option("--tv", type=str, default=None, help="TV profile name from config.")
 @click.option("--tv-ip", type=str, default=None, help="TV IP address.")
@@ -120,6 +170,7 @@ def generate(ctx, prompt, style, provider, model, upscaler, negative_prompt, see
 @click.pass_context
 def apply(ctx, image, tv, tv_ip, matte):
     """Upload an existing image to the Frame TV and switch to it."""
+    _ensure_logging(ctx)
     from frameart.pipeline import run_apply
 
     settings = ctx.obj["settings"]
@@ -132,6 +183,8 @@ def apply(ctx, image, tv, tv_ip, matte):
 
 
 @main.command("generate-and-apply")
+@_debug_option
+@_verbose_option
 @click.option("--prompt", "-p", required=True, help="Text description of the image.")
 @click.option(
     "--style", "-s",
@@ -158,6 +211,7 @@ def generate_and_apply(
     seed, steps, guidance, tv, tv_ip, matte, no_upload, no_switch, dry_run,
 ):
     """Generate an image and display it on the Frame TV."""
+    _ensure_logging(ctx)
     from frameart.pipeline import run_generate_and_apply
 
     settings = ctx.obj["settings"]
@@ -191,11 +245,14 @@ def tv():
 
 
 @tv.command("status")
+@_debug_option
+@_verbose_option
 @click.option("--tv", "tv_name", type=str, default=None, help="TV profile name.")
 @click.option("--tv-ip", type=str, default=None, help="TV IP address.")
 @click.pass_context
 def tv_status(ctx, tv_name, tv_ip):
     """Check the status of a Frame TV."""
+    _ensure_logging(ctx)
     from frameart.config import TVProfile
     from frameart.tv.controller import _connect, _run_with_timeout
 
@@ -266,6 +323,8 @@ def tv_status(ctx, tv_name, tv_ip):
 
 
 @tv.command("pair")
+@_debug_option
+@_verbose_option
 @click.option("--tv-ip", required=True, help="TV IP address.")
 @click.option("--port", type=int, default=8002, help="TV port (default: 8002).")
 @click.option("--name", type=str, default="FrameArt", help="Name shown on TV during pairing.")
@@ -275,6 +334,7 @@ def tv_pair(ctx, tv_ip, port, name):
 
     The TV will display an "Allow" prompt — accept it on the TV.
     """
+    _ensure_logging(ctx)
     from frameart.config import TVProfile
     from frameart.tv.controller import pair
 
@@ -307,11 +367,14 @@ def tv_pair(ctx, tv_ip, port, name):
 
 
 @tv.command("list-art")
+@_debug_option
+@_verbose_option
 @click.option("--tv", "tv_name", type=str, default=None, help="TV profile name.")
 @click.option("--tv-ip", type=str, default=None, help="TV IP address.")
 @click.pass_context
 def tv_list_art(ctx, tv_name, tv_ip):
     """List artworks on the Frame TV."""
+    _ensure_logging(ctx)
     from frameart.config import TVProfile
     from frameart.tv.controller import list_art
 
@@ -344,10 +407,13 @@ def tv_list_art(ctx, tv_name, tv_ip):
 
 
 @main.command("list")
+@_debug_option
+@_verbose_option
 @click.option("--limit", type=int, default=20, help="Max number of jobs to show.")
 @click.pass_context
 def list_jobs(ctx, limit):
     """List recent generated artifacts."""
+    _ensure_logging(ctx)
 
     settings = ctx.obj["settings"]
     artifacts_dir = settings.data_dir / "artifacts"
@@ -385,11 +451,14 @@ def list_jobs(ctx, limit):
 
 
 @main.command()
+@_debug_option
+@_verbose_option
 @click.option("--older-than", type=int, default=30, help="Delete artifacts older than N days.")
 @click.option("--dry-run", is_flag=True, help="Show what would be deleted without deleting.")
 @click.pass_context
 def cleanup(ctx, older_than, dry_run):
     """Remove old generated artifacts."""
+    _ensure_logging(ctx)
     import shutil
     from datetime import datetime, timedelta, timezone
 

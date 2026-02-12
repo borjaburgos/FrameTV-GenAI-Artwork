@@ -95,3 +95,12 @@ def setup_logging(data_dir: Path, level: str = "INFO", log_file: str | None = No
     sh.setLevel(numeric_level)
     sh.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
     root_logger.addHandler(sh)
+
+    # In DEBUG mode, also enable samsungtvws library logging so we can
+    # see the raw WebSocket messages exchanged with the TV.
+    if numeric_level <= logging.DEBUG:
+        for lib_name in ("samsungtvws", "websocket"):
+            lib_logger = logging.getLogger(lib_name)
+            lib_logger.setLevel(logging.DEBUG)
+            lib_logger.addHandler(sh)
+            lib_logger.addHandler(fh)

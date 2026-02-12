@@ -98,6 +98,10 @@ def _retry(func, description: str) -> Any:
             return func()
         except Exception as e:
             last_error = e
+            logger.debug(
+                "%s error detail (attempt %d): %s: %s",
+                description, attempt + 1, type(e).__name__, e,
+            )
             if attempt < MAX_RETRIES - 1:
                 wait = RETRY_BACKOFF[attempt]
                 logger.warning(
@@ -230,6 +234,10 @@ def _prepare_image_for_tv(
     Returns (image_bytes, file_type) ready for the TV.
     """
     size_mb = len(image_bytes) / (1024 * 1024)
+    logger.debug(
+        "Preparing image for TV: input_format=%s input_size=%.2f MB",
+        file_type, size_mb,
+    )
 
     if file_type.upper() in ("PNG",) or len(image_bytes) > _MAX_UPLOAD_BYTES:
         logger.info(
@@ -237,6 +245,7 @@ def _prepare_image_for_tv(
             file_type, size_mb,
         )
         img = Image.open(io.BytesIO(image_bytes))
+        logger.debug("Image dimensions: %dx%d mode=%s", img.width, img.height, img.mode)
         img = img.convert("RGB")  # drop alpha if present
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=_JPEG_QUALITY)
@@ -245,6 +254,7 @@ def _prepare_image_for_tv(
         logger.info("Converted to JPEG: %.1f MB -> %.1f MB", size_mb, new_mb)
         return jpeg_bytes, "JPEG"
 
+    logger.debug("No conversion needed (format=%s, size=%.2f MB)", file_type, size_mb)
     return image_bytes, file_type
 
 
@@ -288,15 +298,28 @@ def upload_image(
         # which can confuse the TV. Pass "none" explicitly when unwanted.
         kwargs["matte"] = matte if matte and matte != "none" else "none"
 
+        size_kb = len(upload_bytes) / 1024
         logger.info(
             "Uploading %s image (%.1f KB, file_type=%s, matte=%s)",
-            upload_type,
-            len(upload_bytes) / 1024,
-            ft,
-            kwargs["matte"],
+            upload_type, size_kb, ft, kwargs["matte"],
+        )
+        logger.debug(
+            "Upload details: host=%s port=%d size=%d bytes file_type=%s "
+            "matte=%s token_file=%s",
+            profile.ip, profile.port, len(upload_bytes), ft,
+            kwargs["matte"], profile.token_file,
         )
 
+        # Validate image bytes are plausible
+        if len(upload_bytes) < 100:
+            raise RuntimeError(f"Image too small ({len(upload_bytes)} bytes) — likely corrupt")
+
+        # Check JPEG magic bytes when we expect JPEG
+        if ft == "jpeg" and upload_bytes[:2] != b"\xff\xd8":
+            logger.warning("Expected JPEG but magic bytes are %r", upload_bytes[:4])
+
         content_id = art.upload(upload_bytes, **kwargs)
+        logger.debug("TV returned content_id=%s", content_id)
         return content_id
 
     try:
