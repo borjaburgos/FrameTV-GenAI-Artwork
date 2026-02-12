@@ -5,6 +5,7 @@ Uses the ``samsungtvws`` library (xchwarze/samsung-tv-ws-api).
 
 from __future__ import annotations
 
+import contextlib
 import io
 import logging
 import time
@@ -70,16 +71,36 @@ def _find_token_file(ip: str) -> str | None:
     return None
 
 
+def _token_path_for_ip(ip: str) -> str:
+    """Return the canonical token file path for a TV IP address."""
+    from frameart.config import _default_data_dir
+
+    secrets_dir = _default_data_dir() / "secrets"
+    return str(secrets_dir / f"{ip.replace('.', '_')}.token")
+
+
 def _connect(profile: TVProfile) -> SamsungTVWS:
-    """Create a SamsungTVWS connection from a TVProfile."""
+    """Create a SamsungTVWS connection from a TVProfile.
+
+    Always provides a token_file so that the samsungtvws library can persist
+    the pairing token received from the TV. Without a token_file, tokens are
+    only kept in-memory and lost between connections — which causes write
+    operations (like send_image) to fail with error -1.
+    """
     token_file = profile.token_file
 
-    # Auto-discover saved token if none specified
+    # Auto-discover saved token or create a path for a new one
     if not token_file:
         token_file = _find_token_file(profile.ip)
+    if not token_file:
+        token_file = _token_path_for_ip(profile.ip)
 
-    if token_file:
-        _ensure_token_dir(token_file)
+    _ensure_token_dir(token_file)
+
+    logger.debug(
+        "Connecting to %s:%d token_file=%s (exists=%s)",
+        profile.ip, profile.port, token_file, Path(token_file).is_file(),
+    )
 
     return SamsungTVWS(
         host=profile.ip,
@@ -284,39 +305,52 @@ def upload_image(
     # Samsung TVs prefer JPEG and reject large PNGs
     upload_bytes, upload_type = _prepare_image_for_tv(image_bytes, file_type)
 
+    # samsungtvws normalizes "jpeg" -> "jpg" internally
+    ft = upload_type.lower()
+    if ft == "jpg":
+        ft = "jpeg"
+
+    kwargs: dict[str, Any] = {"file_type": ft}
+    # Only pass matte when the user requested one; otherwise let the library
+    # use its default.  Passing an unrecognised value (like "none") to
+    # certain TV firmware versions triggers error -1.
+    if matte and matte != "none":
+        kwargs["matte"] = matte
+
+    # Validate image bytes before attempting upload
+    if len(upload_bytes) < 100:
+        return UploadResult(
+            content_id="", success=False,
+            error=f"Image too small ({len(upload_bytes)} bytes) — likely corrupt",
+        )
+    if ft == "jpeg" and upload_bytes[:2] != b"\xff\xd8":
+        logger.warning("Expected JPEG but magic bytes are %r", upload_bytes[:4])
+
+    logger.info(
+        "Uploading %s image (%.1f KB, file_type=%s, matte=%s)",
+        upload_type, len(upload_bytes) / 1024, ft, kwargs.get("matte", "<default>"),
+    )
+
+    tv: SamsungTVWS | None = None
+
     def _do_upload() -> str:
+        nonlocal tv
+        # Close any leftover connection from a previous attempt so we
+        # don't pile up stale WebSocket clients on the TV.
+        if tv is not None:
+            with contextlib.suppress(Exception):
+                tv.close()
+
         tv = _connect(profile)
         art = tv.art()
 
-        # samsungtvws normalizes "jpeg" -> "jpg" internally
-        ft = upload_type.lower()
-        if ft == "jpg":
-            ft = "jpeg"
-
-        kwargs: dict[str, Any] = {"file_type": ft}
-        # Always pass matte — the library defaults to "shadowbox_polar"
-        # which can confuse the TV. Pass "none" explicitly when unwanted.
-        kwargs["matte"] = matte if matte and matte != "none" else "none"
-
-        size_kb = len(upload_bytes) / 1024
-        logger.info(
-            "Uploading %s image (%.1f KB, file_type=%s, matte=%s)",
-            upload_type, size_kb, ft, kwargs["matte"],
-        )
         logger.debug(
             "Upload details: host=%s port=%d size=%d bytes file_type=%s "
             "matte=%s token_file=%s",
             profile.ip, profile.port, len(upload_bytes), ft,
-            kwargs["matte"], profile.token_file,
+            kwargs.get("matte", "<default>"),
+            tv.token_file,
         )
-
-        # Validate image bytes are plausible
-        if len(upload_bytes) < 100:
-            raise RuntimeError(f"Image too small ({len(upload_bytes)} bytes) — likely corrupt")
-
-        # Check JPEG magic bytes when we expect JPEG
-        if ft == "jpeg" and upload_bytes[:2] != b"\xff\xd8":
-            logger.warning("Expected JPEG but magic bytes are %r", upload_bytes[:4])
 
         content_id = art.upload(upload_bytes, **kwargs)
         logger.debug("TV returned content_id=%s", content_id)
@@ -327,7 +361,29 @@ def upload_image(
         logger.info("Uploaded image, content_id=%s", content_id)
         return UploadResult(content_id=content_id, success=True)
     except Exception as e:
-        return UploadResult(content_id="", success=False, error=str(e))
+        error_msg = str(e)
+        # Provide actionable guidance for the most common failure
+        if "error number -1" in error_msg:
+            token_file = _token_path_for_ip(profile.ip)
+            has_token = Path(token_file).is_file()
+            if not has_token:
+                error_msg += (
+                    "\n\nHint: The TV may not have accepted this client yet. "
+                    "Try pairing first:\n"
+                    f"  frameart tv pair --tv-ip {profile.ip}"
+                )
+            else:
+                error_msg += (
+                    "\n\nHint: Token file exists but the TV still rejected "
+                    "the upload. Try re-pairing:\n"
+                    f"  frameart tv pair --tv-ip {profile.ip}\n"
+                    "and accept the prompt on your TV screen."
+                )
+        return UploadResult(content_id="", success=False, error=error_msg)
+    finally:
+        if tv is not None:
+            with contextlib.suppress(Exception):
+                tv.close()
 
 
 def switch_art(profile: TVProfile, content_id: str) -> bool:
