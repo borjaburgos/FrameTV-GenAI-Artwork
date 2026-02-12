@@ -142,43 +142,67 @@ def pair(profile: TVProfile) -> bool:
         raise
 
 
+def _run_with_timeout(func, timeout_sec: int = 8):
+    """Run a function in a thread with a timeout. Returns (result, error)."""
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(func)
+        try:
+            return future.result(timeout=timeout_sec), None
+        except concurrent.futures.TimeoutError:
+            return None, "timed out"
+        except Exception as e:
+            return None, str(e)
+
+
 def get_status(profile: TVProfile) -> TVStatus:
     """Check the current status of the Frame TV."""
+    # Step 1: REST-only reachability check (no websocket)
     try:
         tv = _connect(profile)
-        tv.rest_device_info()  # REST check — confirms TV is reachable
+        device_info = tv.rest_device_info()
     except Exception as e:
         return TVStatus(reachable=False, error=str(e))
 
-    try:
-        art = tv.art()
-    except Exception as e:
-        return TVStatus(reachable=True, error=f"Could not access art interface: {e}")
+    # Step 2: Check FrameTVSupport from REST response (no websocket)
+    device = device_info.get("device", {})
+    is_support_str = device_info.get("isSupport", "{}")
+    frame_supported = (
+        device.get("FrameTVSupport") == "true"
+        or '"FrameTVSupport":"true"' in is_support_str
+    )
 
-    try:
-        supported = art.supported()
-    except Exception:
-        supported = False
-
-    if not supported:
+    if not frame_supported:
         return TVStatus(reachable=True, art_mode_supported=False)
 
+    # Step 3: Try art websocket calls with a thread timeout
+    # These can hang if the TV doesn't respond, so we cap them.
     art_mode_on = False
     current_artwork = None
 
-    try:
-        art_mode_on = art.get_artmode()
-    except Exception as e:
-        logger.warning("Could not get art mode status: %s", e)
+    def _query_art_mode():
+        art = tv.art()
+        return art.get_artmode()
 
-    try:
-        current = art.get_current()
-        if isinstance(current, dict):
-            current_artwork = current.get("content_id")
-        elif isinstance(current, str):
-            current_artwork = current
-    except Exception as e:
-        logger.warning("Could not get current artwork: %s", e)
+    def _query_current():
+        art = tv.art()
+        return art.get_current()
+
+    result, err = _run_with_timeout(_query_art_mode)
+    if err:
+        logger.warning("Could not get art mode status: %s", err)
+    else:
+        art_mode_on = bool(result)
+
+    result, err = _run_with_timeout(_query_current)
+    if err:
+        logger.warning("Could not get current artwork: %s", err)
+    else:
+        if isinstance(result, dict):
+            current_artwork = result.get("content_id")
+        elif isinstance(result, str):
+            current_artwork = result
 
     return TVStatus(
         reachable=True,
