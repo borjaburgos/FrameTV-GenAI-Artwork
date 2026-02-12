@@ -197,7 +197,7 @@ def tv():
 def tv_status(ctx, tv_name, tv_ip):
     """Check the status of a Frame TV."""
     from frameart.config import TVProfile
-    from frameart.tv.controller import get_status
+    from frameart.tv.controller import _connect, _run_with_timeout
 
     settings = ctx.obj["settings"]
 
@@ -214,20 +214,55 @@ def tv_status(ctx, tv_name, tv_ip):
         sys.exit(1)
 
     click.echo(f"Checking TV at {profile.ip}:{profile.port}...")
-    status = get_status(profile)
 
-    if not status.reachable:
-        click.secho(f"TV not reachable: {status.error}", fg="red")
+    # Step 1: REST reachability
+    click.echo("  [1/4] REST device info...", nl=False)
+    try:
+        tv = _connect(profile)
+        device_info = tv.rest_device_info()
+        device = device_info.get("device", {})
+        click.secho(" OK", fg="green")
+        click.echo(f"         Model: {device.get('modelName', '?')}")
+        click.echo(f"         Name:  {device.get('name', '?')}")
+    except Exception as e:
+        click.secho(f" FAILED: {e}", fg="red")
         sys.exit(1)
 
-    click.secho("TV is reachable.", fg="green")
-    click.echo(f"  Art mode supported: {status.art_mode_supported}")
-    if status.art_mode_supported:
-        click.echo(f"  Art mode active:   {status.art_mode_on}")
-        if status.current_artwork:
-            click.echo(f"  Current artwork:   {status.current_artwork}")
-    if status.error:
-        click.secho(f"  Warning: {status.error}", fg="yellow")
+    # Step 2: FrameTVSupport
+    click.echo("  [2/4] Frame TV support...", nl=False)
+    is_support_str = device_info.get("isSupport", "{}")
+    frame_supported = (
+        device.get("FrameTVSupport") == "true"
+        or '"FrameTVSupport":"true"' in is_support_str
+    )
+    if frame_supported:
+        click.secho(" Yes", fg="green")
+    else:
+        click.secho(" No", fg="yellow")
+        return
+
+    # Step 3: Art mode status (websocket — may time out)
+    click.echo("  [3/4] Art mode status...", nl=False)
+    result, err = _run_with_timeout(lambda: tv.art().get_artmode())
+    if err:
+        click.secho(f" unavailable ({err})", fg="yellow")
+    else:
+        state = "ON" if result else "OFF"
+        color = "green" if result else "yellow"
+        click.secho(f" {state}", fg=color)
+
+    # Step 4: Current artwork (websocket — may time out)
+    click.echo("  [4/4] Current artwork...", nl=False)
+    result, err = _run_with_timeout(lambda: tv.art().get_current())
+    if err:
+        click.secho(f" unavailable ({err})", fg="yellow")
+    else:
+        if isinstance(result, dict):
+            click.secho(f" {result.get('content_id', '?')}", fg="green")
+        elif isinstance(result, str):
+            click.secho(f" {result}", fg="green")
+        else:
+            click.secho(f" {result}", fg="green")
 
 
 @tv.command("pair")
