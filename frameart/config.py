@@ -16,7 +16,23 @@ import yaml
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-DEFAULT_DATA_DIR = Path("/data/frameart")
+def _default_data_dir() -> Path:
+    """Pick a sensible default data directory.
+
+    - If FRAMEART_DATA_DIR is set, use it.
+    - If /data/frameart exists (Docker/LXC), use it.
+    - Otherwise fall back to ~/.local/share/frameart (works on macOS/Linux).
+    """
+    env = os.environ.get("FRAMEART_DATA_DIR")
+    if env:
+        return Path(env)
+    container_path = Path("/data/frameart")
+    if container_path.exists():
+        return container_path
+    return Path("~/.local/share/frameart").expanduser()
+
+
+DEFAULT_DATA_DIR = _default_data_dir()
 DEFAULT_CONFIG_PATHS = [
     Path("config.yaml"),
     Path("~/.config/frameart/config.yaml").expanduser(),
