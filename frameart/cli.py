@@ -366,6 +366,35 @@ def tv_pair(ctx, tv_ip, port, name):
         sys.exit(1)
 
 
+@tv.command("discover")
+@_debug_option
+@_verbose_option
+@click.option("--timeout", type=float, default=4.0, help="SSDP timeout in seconds.")
+@click.option("--frame-only", is_flag=True, help="Only show Frame TVs.")
+@click.pass_context
+def tv_discover(ctx, timeout, frame_only):
+    """Discover Samsung TVs on the local network via SSDP."""
+    _ensure_logging(ctx)
+    from frameart.tv.discovery import discover
+
+    click.echo("Scanning for Samsung TVs on the network...")
+    tvs = discover(timeout=timeout, frame_only=frame_only)
+
+    if not tvs:
+        click.secho("No Samsung TVs found.", fg="yellow")
+        return
+
+    click.echo(f"Found {len(tvs)} TV(s):\n")
+    for dtv in tvs:
+        frame_label = click.style(" [Frame TV]", fg="green") if dtv.frame_tv else ""
+        click.echo(f"  {dtv.ip:<16} {dtv.model:<20} {dtv.name}{frame_label}")
+
+    # Hint for pairing
+    frame_tvs = [t for t in tvs if t.frame_tv]
+    if frame_tvs:
+        click.echo(f"\nTo pair: frameart tv pair --tv-ip {frame_tvs[0].ip}")
+
+
 @tv.command("list-art")
 @_debug_option
 @_verbose_option

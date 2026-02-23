@@ -9,18 +9,25 @@ Endpoints:
     POST /generate            — generate image only (no TV upload)
     POST /apply               — upload an existing image to the TV
     GET  /tv/status           — check TV connection and art mode
-    GET  /jobs                — list recent jobs
+    GET  /tv/discover         — auto-discover Samsung TVs on the LAN
+    GET  /jobs                — list recent jobs (artifacts on disk)
+    GET  /jobs/{job_id}       — get detailed job status (async queue)
     GET  /jobs/{job_id}/image — serve the final image for a job
+    POST /async/generate      — async: return immediately, poll /jobs/{id}
+    POST /async/generate-and-apply — async variant
+    POST /async/apply         — async variant
+    GET  /                    — web UI
     GET  /health              — liveness check
 """
 
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
 from frameart import __version__
@@ -86,6 +93,23 @@ class JobResponse(BaseModel):
     error: str | None = None
 
 
+class AsyncJobResponse(BaseModel):
+    """Response for async job submission."""
+
+    job_id: str
+    status: str
+
+
+class AsyncJobDetail(BaseModel):
+    """Detailed status of an async job."""
+
+    job_id: str
+    status: str
+    request: dict[str, Any] = Field(default_factory=dict)
+    result: JobResponse | None = None
+    error: str | None = None
+
+
 class TVStatusResponse(BaseModel):
     """Response for TV status check."""
 
@@ -94,6 +118,15 @@ class TVStatusResponse(BaseModel):
     art_mode_on: bool = False
     current_artwork: str | None = None
     error: str | None = None
+
+
+class DiscoveredTVResponse(BaseModel):
+    """A discovered Samsung TV."""
+
+    ip: str
+    name: str
+    model: str
+    frame_tv: bool
 
 
 class HealthResponse(BaseModel):
@@ -137,7 +170,7 @@ def _pipeline_result_to_response(result) -> JobResponse:
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# Routes — synchronous
 # ---------------------------------------------------------------------------
 
 
@@ -259,6 +292,26 @@ def tv_status(
     )
 
 
+@app.get("/tv/discover", response_model=list[DiscoveredTVResponse])
+def tv_discover(
+    timeout: float = Query(4.0, ge=1, le=30, description="SSDP timeout in seconds."),
+    frame_only: bool = Query(False, description="Only return Frame TVs."),
+):
+    """Auto-discover Samsung TVs on the local network via SSDP."""
+    from frameart.tv.discovery import discover
+
+    tvs = discover(timeout=timeout, frame_only=frame_only)
+    return [
+        DiscoveredTVResponse(ip=tv.ip, name=tv.name, model=tv.model, frame_tv=tv.frame_tv)
+        for tv in tvs
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Routes — artifact-based jobs
+# ---------------------------------------------------------------------------
+
+
 @app.get("/jobs", response_model=list[JobSummary])
 def list_jobs(limit: int = Query(20, ge=1, le=200, description="Max jobs to return.")):
     """List recent generated jobs."""
@@ -298,6 +351,142 @@ def get_job_image(job_id: str):
     if not matches:
         raise HTTPException(status_code=404, detail=f"No image found for job {job_id}")
     return FileResponse(matches[0], media_type="image/png")
+
+
+# ---------------------------------------------------------------------------
+# Routes — async job queue
+# ---------------------------------------------------------------------------
+
+
+@app.get("/jobs/{job_id}/status", response_model=AsyncJobDetail)
+def get_job_status(job_id: str):
+    """Get the detailed status of an async job."""
+    from frameart.jobs import job_store
+
+    job = job_store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found in async queue")
+
+    result_response = None
+    if job.result is not None:
+        result_response = _pipeline_result_to_response(job.result)
+
+    return AsyncJobDetail(
+        job_id=job.id,
+        status=job.status.value,
+        request=job.request,
+        result=result_response,
+        error=job.error,
+    )
+
+
+@app.post("/async/generate", response_model=AsyncJobResponse)
+def async_generate(req: GenerateRequest):
+    """Submit an image generation job to the background queue."""
+    from frameart.artifacts import generate_job_id
+    from frameart.jobs import job_store
+    from frameart.pipeline import run_generate
+
+    settings = _settings()
+    job_id = generate_job_id()
+
+    job_store.submit(
+        job_id=job_id,
+        func=run_generate,
+        args=(settings, req.prompt),
+        kwargs={
+            "style": req.style,
+            "provider_name": req.provider,
+            "model": req.model,
+            "upscaler_name": req.upscaler,
+            "negative_prompt": req.negative_prompt,
+            "seed": req.seed,
+            "steps": req.steps,
+            "guidance": req.guidance,
+        },
+        request_summary={"type": "generate", "prompt": req.prompt, "style": req.style},
+    )
+
+    return AsyncJobResponse(job_id=job_id, status="pending")
+
+
+@app.post("/async/generate-and-apply", response_model=AsyncJobResponse)
+def async_generate_and_apply(req: GenerateAndApplyRequest):
+    """Submit a generate-and-apply job to the background queue."""
+    from frameart.artifacts import generate_job_id
+    from frameart.jobs import job_store
+    from frameart.pipeline import run_generate_and_apply
+
+    settings = _settings()
+    job_id = generate_job_id()
+
+    job_store.submit(
+        job_id=job_id,
+        func=run_generate_and_apply,
+        args=(settings, req.prompt),
+        kwargs={
+            "style": req.style,
+            "provider_name": req.provider,
+            "model": req.model,
+            "upscaler_name": req.upscaler,
+            "negative_prompt": req.negative_prompt,
+            "seed": req.seed,
+            "steps": req.steps,
+            "guidance": req.guidance,
+            "tv_name": req.tv,
+            "tv_ip": req.tv_ip,
+            "matte": req.matte,
+            "no_switch": req.no_switch,
+        },
+        request_summary={
+            "type": "generate-and-apply",
+            "prompt": req.prompt,
+            "style": req.style,
+        },
+    )
+
+    return AsyncJobResponse(job_id=job_id, status="pending")
+
+
+@app.post("/async/apply", response_model=AsyncJobResponse)
+def async_apply(req: ApplyRequest):
+    """Submit an apply (upload) job to the background queue."""
+    from frameart.artifacts import generate_job_id
+    from frameart.jobs import job_store
+    from frameart.pipeline import run_apply
+
+    settings = _settings()
+    job_id = generate_job_id()
+
+    job_store.submit(
+        job_id=job_id,
+        func=run_apply,
+        args=(settings, req.image_path),
+        kwargs={
+            "tv_name": req.tv,
+            "tv_ip": req.tv_ip,
+            "matte": req.matte,
+        },
+        request_summary={"type": "apply", "image_path": req.image_path},
+    )
+
+    return AsyncJobResponse(job_id=job_id, status="pending")
+
+
+# ---------------------------------------------------------------------------
+# Web UI
+# ---------------------------------------------------------------------------
+
+_STATIC_DIR = Path(__file__).parent / "static"
+
+
+@app.get("/", response_class=HTMLResponse)
+def web_ui():
+    """Serve the FrameArt web UI."""
+    index = _STATIC_DIR / "index.html"
+    if not index.exists():
+        raise HTTPException(status_code=404, detail="Web UI not found")
+    return HTMLResponse(index.read_text())
 
 
 # ---------------------------------------------------------------------------

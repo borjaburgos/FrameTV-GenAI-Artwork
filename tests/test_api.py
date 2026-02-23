@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -249,3 +250,135 @@ class TestGetJobImage:
 
         resp = client.get("/jobs/doesnotexist/image")
         assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# GET /tv/discover
+# ---------------------------------------------------------------------------
+
+class TestTVDiscover:
+    @patch("frameart.tv.discovery.discover")
+    def test_returns_tvs(self, mock_discover):
+        from frameart.tv.discovery import DiscoveredTV
+
+        mock_discover.return_value = [
+            DiscoveredTV(ip="10.0.0.1", name="LivingRoom", model="QN55LS03", frame_tv=True),
+        ]
+
+        resp = client.get("/tv/discover")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["ip"] == "10.0.0.1"
+        assert data[0]["frame_tv"] is True
+
+    @patch("frameart.tv.discovery.discover")
+    def test_empty(self, mock_discover):
+        mock_discover.return_value = []
+        resp = client.get("/tv/discover")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+
+# ---------------------------------------------------------------------------
+# POST /async/generate + GET /jobs/{id}/status
+# ---------------------------------------------------------------------------
+
+class TestAsyncGenerate:
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_generate")
+    def test_submit_and_poll(self, mock_run, mock_settings):
+        mock_settings.return_value = MagicMock()
+        mock_run.return_value = _fake_result()
+
+        # Submit
+        resp = client.post("/async/generate", json={"prompt": "a sunset"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "job_id" in data
+        assert data["status"] == "pending"
+
+        job_id = data["job_id"]
+
+        # Wait for the background thread to complete
+        for _ in range(50):
+            status_resp = client.get(f"/jobs/{job_id}/status")
+            if status_resp.json()["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.05)
+
+        status_data = status_resp.json()
+        assert status_data["status"] == "completed"
+        assert status_data["result"]["job_id"] == "120000-abcd1234"
+        assert status_data["error"] is None
+
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_generate")
+    def test_failed_job(self, mock_run, mock_settings):
+        mock_settings.return_value = MagicMock()
+        mock_run.return_value = _fake_result(error="provider exploded")
+
+        resp = client.post("/async/generate", json={"prompt": "fail"})
+        job_id = resp.json()["job_id"]
+
+        for _ in range(50):
+            status_resp = client.get(f"/jobs/{job_id}/status")
+            if status_resp.json()["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.05)
+
+        status_data = status_resp.json()
+        assert status_data["status"] == "failed"
+        assert "provider exploded" in status_data["error"]
+
+
+class TestAsyncGenerateAndApply:
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_generate_and_apply")
+    def test_submit(self, mock_run, mock_settings):
+        mock_settings.return_value = MagicMock()
+        mock_run.return_value = _fake_result()
+
+        resp = client.post(
+            "/async/generate-and-apply",
+            json={"prompt": "mountains", "tv_ip": "10.0.0.1"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "pending"
+
+
+class TestAsyncApply:
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_apply")
+    def test_submit(self, mock_run, mock_settings):
+        mock_settings.return_value = MagicMock()
+        mock_run.return_value = _fake_result()
+
+        resp = client.post(
+            "/async/apply",
+            json={"image_path": "/tmp/test.png", "tv_ip": "10.0.0.1"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# GET /jobs/{id}/status — not found
+# ---------------------------------------------------------------------------
+
+class TestJobStatusNotFound:
+    def test_missing_job(self):
+        resp = client.get("/jobs/nonexistent/status")
+        assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# GET / — Web UI
+# ---------------------------------------------------------------------------
+
+class TestWebUI:
+    def test_returns_html(self):
+        resp = client.get("/")
+        assert resp.status_code == 200
+        assert "text/html" in resp.headers["content-type"]
+        assert "FrameArt" in resp.text
