@@ -1,16 +1,17 @@
 # FrameArt
 
-Generate AI artwork from text prompts and display it on Samsung Frame TVs.
+Generate AI artwork from text prompts and display it on Samsung Frame TVs and Netgear Meural canvases.
 
-**prompt -> 4K art -> upload -> display**
+**prompt -> art -> upload -> display**
 
-FrameArt is a self-hosted tool that accepts a text description, generates an image using AI (local or remote providers), enforces 16:9 at 3840x2160, and uploads it directly to a Samsung The Frame TV over your local network. It ships as both a **CLI** and an **HTTP API** so you can drive it from a terminal, a voice assistant (Siri, Home Assistant), or any automation platform.
+FrameArt is a self-hosted tool that accepts a text description, generates an image using AI (local or remote providers), post-processes it for the target display, and sends it directly to a Samsung Frame TV or Netgear Meural canvas over your local network. It ships as both a **CLI** and an **HTTP API** so you can drive it from a terminal, a voice assistant (Siri, Home Assistant), or any automation platform.
 
 ## Features
 
 - **Multiple AI providers**: OpenAI DALL-E and Ollama/local models (pluggable registry)
 - **Automatic post-processing**: Smart crop to 16:9, upscale/downscale to 4K UHD
 - **Samsung Frame TV integration**: Upload art and switch display via WebSocket API
+- **Netgear Meural canvas integration**: Display art via the local REST API (portrait + landscape, no cloud required)
 - **TV auto-discovery**: Find Frame TVs on your LAN automatically via UPnP/SSDP
 - **HTTP API**: FastAPI server with sync and async endpoints — ideal for voice agents and Home Assistant
 - **Async job queue**: Submit long-running generation jobs and poll for results
@@ -156,6 +157,64 @@ frameart tv status --tv livingroom_frame
 frameart tv list-art --tv livingroom_frame
 ```
 
+---
+
+### Meural Canvas
+
+#### Generate and display on Meural
+
+```bash
+frameart meural generate-and-display \
+    --prompt "a serene mountain lake at dawn" \
+    --meural-ip 192.168.1.50 \
+    --orientation vertical
+```
+
+By default, `duration=0` keeps the image displayed indefinitely (slideshow paused). Set `--duration 300` to show it for 5 minutes before returning to the normal playlist.
+
+#### Display an existing image
+
+```bash
+frameart meural display \
+    --image ./my_artwork.png \
+    --meural-ip 192.168.1.50
+```
+
+#### Check Meural status
+
+```bash
+frameart meural status --meural-ip 192.168.1.50
+```
+
+#### Control orientation, brightness, and sleep
+
+```bash
+frameart meural orientation portrait --meural-ip 192.168.1.50
+frameart meural orientation landscape --meural-ip 192.168.1.50
+
+frameart meural brightness 75 --meural-ip 192.168.1.50
+frameart meural brightness --reset --meural-ip 192.168.1.50
+
+frameart meural sleep --meural-ip 192.168.1.50
+frameart meural wake --meural-ip 192.168.1.50
+```
+
+#### Navigate images and list galleries
+
+```bash
+frameart meural next --meural-ip 192.168.1.50
+frameart meural previous --meural-ip 192.168.1.50
+frameart meural galleries --meural-ip 192.168.1.50
+```
+
+#### Discover Meural canvases on the network
+
+```bash
+frameart meural discover --subnet 192.168.1
+```
+
+---
+
 ### List generated artifacts
 
 ```bash
@@ -236,6 +295,14 @@ Interactive API docs are available at `http://localhost:8000/docs` and the web U
 | `GET` | `/jobs` | List recent jobs |
 | `GET` | `/jobs/{job_id}/image` | Serve the final processed image |
 
+**Meural canvas**:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/meural/status` | Check Meural canvas connection |
+| `POST` | `/meural/display` | Display an image on the Meural canvas |
+| `POST` | `/meural/generate-and-display` | Generate and display on Meural |
+
 **Misc**:
 
 | Method | Path | Description |
@@ -313,6 +380,33 @@ curl -X POST http://localhost:8000/async/generate \
 # Poll until complete
 curl http://localhost:8000/jobs/143022-a1b2c3d4/status
 # {"job_id":"143022-a1b2c3d4","status":"completed","result":{...}}
+```
+
+**Generate and display on Meural canvas (portrait):**
+
+```bash
+curl -X POST http://localhost:8000/meural/generate-and-display \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "a tall redwood forest, looking up at the canopy",
+    "meural_ip": "192.168.1.50",
+    "orientation": "vertical",
+    "duration": 0
+  }'
+```
+
+**Display an existing image on Meural:**
+
+```bash
+curl -X POST http://localhost:8000/meural/display \
+  -H "Content-Type: application/json" \
+  -d '{"image_path": "/data/frameart/artifacts/2025/01/15/120000-abc123/final.png", "meural_ip": "192.168.1.50"}'
+```
+
+**Check Meural status:**
+
+```bash
+curl http://localhost:8000/meural/status?meural_ip=192.168.1.50
 ```
 
 **Discover TVs on the network:**
@@ -422,6 +516,19 @@ tvs:
   bedroom_frame:
     ip: "192.168.1.101"
     token_file: "/data/frameart/secrets/bedroom.token"
+```
+
+### Meural Canvases
+
+```yaml
+meurals:
+  office_canvas:
+    ip: "192.168.1.50"
+    orientation: "vertical"     # or "horizontal"
+    name: "Office Canvas"
+  hallway_canvas:
+    ip: "192.168.1.51"
+    orientation: "horizontal"
 ```
 
 ---
@@ -549,6 +656,18 @@ FrameArt attempts to switch to Art Mode automatically. If it fails, press the po
 - The image may need a moment to process on the TV after upload.
 - Try listing artworks to confirm it uploaded: `frameart tv list-art --tv-ip <IP>`
 
+### Meural not reachable
+
+- Verify the canvas is powered on and connected to the same network.
+- The local API runs on port 80 with no authentication.
+- Try `curl http://<MEURAL_IP>/remote/identify/` — you should get a JSON response.
+- Discovery requires scanning the subnet: `frameart meural discover --subnet 192.168.1`
+
+### Meural image disappears after a while
+
+- By default, `duration=0` pauses the slideshow to keep the image on screen.
+- If the image still cycles away, the Meural's `previewDuration` setting may override this. Adjusting that setting requires the Meural cloud API or the Meural mobile app.
+
 ### Provider API errors
 
 - **OpenAI**: Ensure `OPENAI_API_KEY` is set and valid. DALL-E 3 requires a paid account.
@@ -573,12 +692,12 @@ ruff check frameart/ tests/
 
 ```
 frameart/
-  cli.py              # Click CLI commands
+  cli.py              # Click CLI commands (tv + meural subgroups)
   api.py              # FastAPI HTTP server (sync + async endpoints)
   jobs.py             # Async job queue (ThreadPoolExecutor, in-memory)
-  pipeline.py         # Core orchestration: generate -> postprocess -> upload -> switch
+  pipeline.py         # Core orchestration: generate -> postprocess -> display
   config.py           # Configuration management (YAML + env vars + CLI flags)
-  postprocess.py      # 16:9 crop + 4K resize logic
+  postprocess.py      # Aspect ratio crop + resolution resize (configurable target)
   artifacts.py        # File storage and metadata
   static/
     index.html        # Web UI (single-page, no build step)
@@ -597,6 +716,9 @@ frameart/
     controller.py     # Samsung Frame TV: pair, upload, switch, status
     discovery.py      # UPnP/SSDP auto-discovery
     cleanup.py        # Delete old user-uploaded artworks
+  meural/
+    controller.py     # Netgear Meural: display, orientation, brightness, sleep/wake
+    discovery.py      # Subnet scan for Meural canvases
 ```
 
 ---
@@ -608,6 +730,7 @@ frameart/
 - **No rate limiting.** Each request triggers an AI provider API call. If exposed without rate limiting, it could rack up provider costs quickly.
 - **No image upload via HTTP multipart.** The `/apply` endpoint takes a filesystem path, not a file upload. This works for local and Docker-volume use cases but not for remote clients sending image bytes over HTTP.
 - **Async jobs are in-memory only.** They do not survive server restarts. Completed jobs are evicted after 200 entries to bound memory usage.
+- **Meural postcard images are temporary.** The local API's `/remote/postcard/` endpoint displays images as a preview. FrameArt works around this by pausing the slideshow (duration=0), but the image is not permanently saved to the device. Permanent storage requires the Meural cloud API (not yet supported).
 
 ### Potential Future Work
 
@@ -615,7 +738,8 @@ frameart/
 - HTTP multipart image upload for `/apply`
 - Webhook/callback on job completion
 - Scheduling (cron-like "change art every morning")
-- Multi-TV fan-out (upload to all TVs at once)
+- Multi-device fan-out (upload to all TVs/canvases at once)
+- Meural cloud API integration (permanent gallery uploads, playlist management)
 - Additional image providers (Gemini, Anthropic, Stability AI)
 
 ---

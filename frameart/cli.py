@@ -79,11 +79,15 @@ def _print_result(result) -> None:
     if result.source_path:
         click.echo(f"  Source: {result.source_path}")
     if result.final_path:
-        click.echo(f"  Final:  {result.final_path} (3840x2160)")
+        dims = result.metadata.get("final_width", ""), result.metadata.get("final_height", "")
+        dim_str = f" ({dims[0]}x{dims[1]})" if all(dims) else ""
+        click.echo(f"  Final:  {result.final_path}{dim_str}")
     if result.content_id:
         click.echo(f"  TV content ID: {result.content_id}")
     if result.tv_switched:
         click.secho("  Display switched to new artwork.", fg="green")
+    if result.meural_displayed:
+        click.secho("  Image displayed on Meural canvas.", fg="green")
 
     if result.timings:
         parts = []
@@ -559,6 +563,362 @@ def tv_cleanup(ctx, tv_name, tv_ip, keep, delete_all, order, include_favourites,
     if result.deleted:
         for cid in result.deleted:
             click.echo(f"  Deleted: {cid}")
+
+
+# --- meural subgroup ---------------------------------------------------------
+
+
+@main.group()
+def meural():
+    """Netgear Meural canvas management commands."""
+
+
+@meural.command("status")
+@_debug_option
+@_verbose_option
+@click.option("--meural", "meural_name", type=str, default=None, help="Meural profile name.")
+@click.option("--meural-ip", type=str, default=None, help="Meural IP address.")
+@click.pass_context
+def meural_status(ctx, meural_name, meural_ip):
+    """Check the status of a Meural canvas."""
+    _ensure_logging(ctx)
+    from frameart.config import MeuralProfile
+    from frameart.meural.controller import get_status
+
+    settings = ctx.obj["settings"]
+    profile = None
+    if meural_name and meural_name in settings.meurals:
+        profile = settings.meurals[meural_name]
+    elif meural_ip:
+        profile = MeuralProfile(ip=meural_ip)
+    elif len(settings.meurals) == 1:
+        profile = next(iter(settings.meurals.values()))
+
+    if profile is None:
+        click.secho(
+            "No Meural specified. Use --meural or --meural-ip.", fg="red", err=True,
+        )
+        sys.exit(1)
+
+    click.echo(f"Checking Meural at {profile.ip}...")
+    status = get_status(profile)
+
+    if not status.reachable:
+        click.secho(f"  Not reachable: {status.error}", fg="red")
+        sys.exit(1)
+
+    click.secho("  Reachable: Yes", fg="green")
+    if status.device_name:
+        click.echo(f"  Name:  {status.device_name}")
+    if status.device_model:
+        click.echo(f"  Model: {status.device_model}")
+    click.echo(f"  Orientation: {status.orientation or '?'}")
+    sleep_state = "sleeping" if status.sleeping else "awake"
+    color = "yellow" if status.sleeping else "green"
+    click.secho(f"  State: {sleep_state}", fg=color)
+    if status.current_gallery:
+        click.echo(f"  Gallery: {status.current_gallery}")
+    if status.current_item:
+        click.echo(f"  Item:    {status.current_item}")
+
+
+@meural.command("display")
+@_debug_option
+@_verbose_option
+@click.option(
+    "--image", "-i", required=True,
+    type=click.Path(exists=True), help="Image to display.",
+)
+@click.option("--meural", "meural_name", type=str, default=None, help="Meural profile name.")
+@click.option("--meural-ip", type=str, default=None, help="Meural IP address.")
+@click.option(
+    "--duration", type=int, default=0,
+    help="Seconds to display before returning to playlist (0 = stay indefinitely).",
+)
+@click.pass_context
+def meural_display(ctx, image, meural_name, meural_ip, duration):
+    """Display an image on the Meural canvas via the local postcard API."""
+    _ensure_logging(ctx)
+    from frameart.pipeline import run_meural_apply
+
+    settings = ctx.obj["settings"]
+    result = run_meural_apply(
+        settings, image,
+        meural_name=meural_name, meural_ip=meural_ip,
+        duration=duration,
+    )
+    _print_result(result)
+    sys.exit(1 if result.error else 0)
+
+
+@meural.command("generate-and-display")
+@_debug_option
+@_verbose_option
+@click.option("--prompt", "-p", required=True, help="Text description of the image.")
+@click.option(
+    "--style", "-s",
+    type=click.Choice(list(STYLE_PRESETS.keys()) + ["custom"], case_sensitive=False),
+    default=None, help="Style preset.",
+)
+@click.option("--provider", type=str, default=None, help="Image provider.")
+@click.option("--model", type=str, default=None, help="Provider-specific model ID.")
+@click.option("--upscaler", type=str, default=None, help="Upscaler.")
+@click.option("--negative-prompt", type=str, default=None, help="Negative prompt.")
+@click.option("--seed", type=int, default=None, help="Deterministic seed.")
+@click.option("--steps", type=int, default=None, help="Diffusion steps.")
+@click.option("--guidance", type=float, default=None, help="Guidance scale.")
+@click.option("--meural", "meural_name", type=str, default=None, help="Meural profile name.")
+@click.option("--meural-ip", type=str, default=None, help="Meural IP address.")
+@click.option(
+    "--orientation", type=click.Choice(["vertical", "horizontal"]),
+    default="vertical", help="Canvas orientation (default: vertical).",
+)
+@click.option(
+    "--duration", type=int, default=0,
+    help="Seconds to display before returning to playlist (0 = stay indefinitely).",
+)
+@click.option("--no-upload", is_flag=True, help="Generate only, skip display.")
+@click.option("--dry-run", is_flag=True, help="Alias for --no-upload.")
+@click.pass_context
+def meural_generate_and_display(
+    ctx, prompt, style, provider, model, upscaler, negative_prompt,
+    seed, steps, guidance, meural_name, meural_ip, orientation,
+    duration, no_upload, dry_run,
+):
+    """Generate an image and display it on the Meural canvas."""
+    _ensure_logging(ctx)
+    from frameart.pipeline import run_meural_generate_and_apply
+
+    settings = ctx.obj["settings"]
+    result = run_meural_generate_and_apply(
+        settings,
+        prompt,
+        style=style,
+        provider_name=provider,
+        model=model,
+        upscaler_name=upscaler,
+        negative_prompt=negative_prompt,
+        seed=seed,
+        steps=steps,
+        guidance=guidance,
+        meural_name=meural_name,
+        meural_ip=meural_ip,
+        orientation=orientation,
+        duration=duration,
+        no_upload=no_upload or dry_run,
+    )
+    _print_result(result)
+    sys.exit(1 if result.error else 0)
+
+
+@meural.command("orientation")
+@_debug_option
+@_verbose_option
+@click.option("--meural", "meural_name", type=str, default=None, help="Meural profile name.")
+@click.option("--meural-ip", type=str, default=None, help="Meural IP address.")
+@click.argument("direction", type=click.Choice(["portrait", "landscape"]))
+@click.pass_context
+def meural_orientation(ctx, meural_name, meural_ip, direction):
+    """Set canvas orientation to portrait or landscape."""
+    _ensure_logging(ctx)
+    from frameart.meural.controller import set_orientation
+
+    settings = ctx.obj["settings"]
+    profile = _resolve_meural(settings, meural_name, meural_ip)
+    if set_orientation(profile, direction):
+        click.secho(f"Orientation set to {direction}.", fg="green")
+    else:
+        click.secho("Failed to set orientation.", fg="red", err=True)
+        sys.exit(1)
+
+
+@meural.command("brightness")
+@_debug_option
+@_verbose_option
+@click.option("--meural", "meural_name", type=str, default=None, help="Meural profile name.")
+@click.option("--meural-ip", type=str, default=None, help="Meural IP address.")
+@click.option("--reset", is_flag=True, help="Reset to auto (ambient light sensor).")
+@click.argument("level", type=int, required=False)
+@click.pass_context
+def meural_brightness(ctx, meural_name, meural_ip, reset, level):
+    """Set backlight brightness (0-100), or --reset for auto."""
+    _ensure_logging(ctx)
+    from frameart.meural.controller import reset_brightness, set_brightness
+
+    settings = ctx.obj["settings"]
+    profile = _resolve_meural(settings, meural_name, meural_ip)
+
+    if reset:
+        if reset_brightness(profile):
+            click.secho("Brightness reset to auto.", fg="green")
+        else:
+            click.secho("Failed to reset brightness.", fg="red", err=True)
+            sys.exit(1)
+    elif level is not None:
+        if set_brightness(profile, level):
+            click.secho(f"Brightness set to {level}.", fg="green")
+        else:
+            click.secho("Failed to set brightness.", fg="red", err=True)
+            sys.exit(1)
+    else:
+        click.secho("Provide a level (0-100) or --reset.", fg="red", err=True)
+        sys.exit(1)
+
+
+@meural.command("sleep")
+@_debug_option
+@_verbose_option
+@click.option("--meural", "meural_name", type=str, default=None, help="Meural profile name.")
+@click.option("--meural-ip", type=str, default=None, help="Meural IP address.")
+@click.pass_context
+def meural_sleep(ctx, meural_name, meural_ip):
+    """Put the Meural canvas to sleep (screen off)."""
+    _ensure_logging(ctx)
+    from frameart.meural.controller import sleep
+
+    settings = ctx.obj["settings"]
+    profile = _resolve_meural(settings, meural_name, meural_ip)
+    if sleep(profile):
+        click.secho("Meural is now sleeping.", fg="green")
+    else:
+        click.secho("Failed to put Meural to sleep.", fg="red", err=True)
+        sys.exit(1)
+
+
+@meural.command("wake")
+@_debug_option
+@_verbose_option
+@click.option("--meural", "meural_name", type=str, default=None, help="Meural profile name.")
+@click.option("--meural-ip", type=str, default=None, help="Meural IP address.")
+@click.pass_context
+def meural_wake(ctx, meural_name, meural_ip):
+    """Wake the Meural canvas (screen on)."""
+    _ensure_logging(ctx)
+    from frameart.meural.controller import wake
+
+    settings = ctx.obj["settings"]
+    profile = _resolve_meural(settings, meural_name, meural_ip)
+    if wake(profile):
+        click.secho("Meural is now awake.", fg="green")
+    else:
+        click.secho("Failed to wake Meural.", fg="red", err=True)
+        sys.exit(1)
+
+
+@meural.command("next")
+@_debug_option
+@_verbose_option
+@click.option("--meural", "meural_name", type=str, default=None, help="Meural profile name.")
+@click.option("--meural-ip", type=str, default=None, help="Meural IP address.")
+@click.pass_context
+def meural_next(ctx, meural_name, meural_ip):
+    """Skip to the next image in the current playlist."""
+    _ensure_logging(ctx)
+    from frameart.meural.controller import next_image
+
+    settings = ctx.obj["settings"]
+    profile = _resolve_meural(settings, meural_name, meural_ip)
+    if next_image(profile):
+        click.echo("Skipped to next image.")
+    else:
+        click.secho("Failed.", fg="red", err=True)
+        sys.exit(1)
+
+
+@meural.command("previous")
+@_debug_option
+@_verbose_option
+@click.option("--meural", "meural_name", type=str, default=None, help="Meural profile name.")
+@click.option("--meural-ip", type=str, default=None, help="Meural IP address.")
+@click.pass_context
+def meural_previous(ctx, meural_name, meural_ip):
+    """Go to the previous image in the current playlist."""
+    _ensure_logging(ctx)
+    from frameart.meural.controller import previous_image
+
+    settings = ctx.obj["settings"]
+    profile = _resolve_meural(settings, meural_name, meural_ip)
+    if previous_image(profile):
+        click.echo("Went to previous image.")
+    else:
+        click.secho("Failed.", fg="red", err=True)
+        sys.exit(1)
+
+
+@meural.command("galleries")
+@_debug_option
+@_verbose_option
+@click.option("--meural", "meural_name", type=str, default=None, help="Meural profile name.")
+@click.option("--meural-ip", type=str, default=None, help="Meural IP address.")
+@click.pass_context
+def meural_galleries(ctx, meural_name, meural_ip):
+    """List galleries on the Meural canvas."""
+    _ensure_logging(ctx)
+    from frameart.meural.controller import list_galleries
+
+    settings = ctx.obj["settings"]
+    profile = _resolve_meural(settings, meural_name, meural_ip)
+
+    try:
+        galleries = list_galleries(profile)
+        if not galleries:
+            click.echo("No galleries found.")
+            return
+        click.echo(f"Found {len(galleries)} gallery(ies):")
+        for g in galleries:
+            click.echo(f"  [{g.id}] {g.name} ({g.item_count} items)")
+    except Exception as e:
+        click.secho(f"Failed to list galleries: {e}", fg="red", err=True)
+        sys.exit(1)
+
+
+@meural.command("discover")
+@_debug_option
+@_verbose_option
+@click.option(
+    "--subnet", type=str, required=True,
+    help="Subnet prefix to scan (e.g., 192.168.1).",
+)
+@click.option("--timeout", type=float, default=3.0, help="Per-host timeout in seconds.")
+@click.pass_context
+def meural_discover(ctx, subnet, timeout):
+    """Scan a local subnet for Meural canvases."""
+    _ensure_logging(ctx)
+    from frameart.meural.discovery import discover_subnet
+
+    click.echo(f"Scanning {subnet}.0/24 for Meural canvases...")
+    devices = discover_subnet(subnet, timeout=timeout)
+
+    if not devices:
+        click.secho("No Meural canvases found.", fg="yellow")
+        return
+
+    click.echo(f"Found {len(devices)} Meural canvas(es):\n")
+    for d in devices:
+        click.echo(
+            f"  {d.ip:<16} {d.model:<20} {d.name} "
+            f"[{d.orientation}]"
+        )
+
+
+def _resolve_meural(settings, meural_name, meural_ip):
+    """Helper to resolve a MeuralProfile from CLI args."""
+    from frameart.config import MeuralProfile
+
+    profile = None
+    if meural_name and meural_name in settings.meurals:
+        profile = settings.meurals[meural_name]
+    elif meural_ip:
+        profile = MeuralProfile(ip=meural_ip)
+    elif len(settings.meurals) == 1:
+        profile = next(iter(settings.meurals.values()))
+
+    if profile is None:
+        click.secho(
+            "No Meural specified. Use --meural or --meural-ip.", fg="red", err=True,
+        )
+        sys.exit(1)
+    return profile
 
 
 # --- list (artifacts) --------------------------------------------------------

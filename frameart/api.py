@@ -23,6 +23,11 @@ TV and gallery:
     GET  /jobs                  — list recent jobs (artifacts on disk)
     GET  /jobs/{job_id}/image   — serve the final processed image
 
+Meural:
+    GET  /meural/status         — check Meural canvas connection
+    POST /meural/display        — display an image on the Meural canvas
+    POST /meural/generate-and-display — generate and display on Meural
+
 Misc:
     GET  /                      — web UI
     GET  /styles                — available style presets
@@ -47,7 +52,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="FrameArt",
     version=__version__,
-    description="Generate AI artwork and display it on Samsung Frame TVs.",
+    description="Generate AI artwork and display it on Samsung Frame TVs and Meural canvases.",
 )
 
 
@@ -119,6 +124,7 @@ class JobResponse(BaseModel):
     final_path: str | None = None
     content_id: str | None = None
     tv_switched: bool = False
+    meural_displayed: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
     timings: dict[str, float] = Field(default_factory=dict)
     error: str | None = None
@@ -182,6 +188,47 @@ class TVCleanupResponse(BaseModel):
     error: str | None = None
 
 
+class MeuralDisplayRequest(BaseModel):
+    """Request body for displaying an image on a Meural canvas."""
+
+    image_path: str = Field(..., description="Path to the image file to display.")
+    meural: str | None = Field(None, description="Meural profile name from config.")
+    meural_ip: str | None = Field(None, description="Meural IP address.")
+    duration: int = Field(
+        0,
+        ge=0,
+        description="Seconds to display before returning to playlist (0 = stay indefinitely).",
+    )
+
+
+class MeuralGenerateAndDisplayRequest(GenerateRequest):
+    """Request body for generate + display on Meural."""
+
+    meural: str | None = Field(None, description="Meural profile name from config.")
+    meural_ip: str | None = Field(None, description="Meural IP address.")
+    orientation: str = Field(
+        "vertical", description="Canvas orientation: vertical or horizontal.",
+    )
+    duration: int = Field(
+        0,
+        ge=0,
+        description="Seconds to display before returning to playlist (0 = stay indefinitely).",
+    )
+
+
+class MeuralStatusResponse(BaseModel):
+    """Response for Meural status check."""
+
+    reachable: bool
+    sleeping: bool = False
+    orientation: str | None = None
+    current_gallery: str | None = None
+    current_item: str | None = None
+    device_name: str | None = None
+    device_model: str | None = None
+    error: str | None = None
+
+
 class HealthResponse(BaseModel):
     """Response for health check."""
 
@@ -216,6 +263,7 @@ def _pipeline_result_to_response(result) -> JobResponse:
         final_path=str(result.final_path) if result.final_path else None,
         content_id=result.content_id,
         tv_switched=result.tv_switched,
+        meural_displayed=result.meural_displayed,
         metadata=result.metadata,
         timings=result.timings,
         error=result.error,
@@ -407,6 +455,96 @@ def tv_cleanup(req: TVCleanupRequest):
         skipped_favourites=result.skipped_favourites,
         error=result.error,
     )
+    if result.error:
+        raise HTTPException(status_code=500, detail=resp.model_dump())
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# Routes — Meural canvas
+# ---------------------------------------------------------------------------
+
+
+@app.get("/meural/status", response_model=MeuralStatusResponse)
+def meural_status(
+    meural: str | None = Query(None, description="Meural profile name from config."),
+    meural_ip: str | None = Query(None, description="Meural IP address."),
+):
+    """Check the status of a Meural canvas."""
+    from frameart.config import MeuralProfile
+    from frameart.meural.controller import get_status
+
+    settings = _settings()
+    profile = None
+    if meural and meural in settings.meurals:
+        profile = settings.meurals[meural]
+    elif meural_ip:
+        profile = MeuralProfile(ip=meural_ip)
+    elif len(settings.meurals) == 1:
+        profile = next(iter(settings.meurals.values()))
+
+    if profile is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No Meural specified. Pass ?meural=<name> or ?meural_ip=<ip>, "
+            "or configure exactly one Meural in config.yaml.",
+        )
+
+    status = get_status(profile)
+    return MeuralStatusResponse(
+        reachable=status.reachable,
+        sleeping=status.sleeping,
+        orientation=status.orientation,
+        current_gallery=status.current_gallery,
+        current_item=status.current_item,
+        device_name=status.device_name,
+        device_model=status.device_model,
+        error=status.error,
+    )
+
+
+@app.post("/meural/display", response_model=JobResponse)
+def meural_display(req: MeuralDisplayRequest):
+    """Display an image on the Meural canvas via the local postcard API."""
+    from frameart.pipeline import run_meural_apply
+
+    settings = _settings()
+    result = run_meural_apply(
+        settings,
+        req.image_path,
+        meural_name=req.meural,
+        meural_ip=req.meural_ip,
+        duration=req.duration,
+    )
+    resp = _pipeline_result_to_response(result)
+    if result.error:
+        raise HTTPException(status_code=500, detail=resp.model_dump())
+    return resp
+
+
+@app.post("/meural/generate-and-display", response_model=JobResponse)
+def meural_generate_and_display(req: MeuralGenerateAndDisplayRequest):
+    """Generate an image and display it on the Meural canvas."""
+    from frameart.pipeline import run_meural_generate_and_apply
+
+    settings = _settings()
+    result = run_meural_generate_and_apply(
+        settings,
+        req.prompt,
+        style=req.style,
+        provider_name=req.provider,
+        model=req.model,
+        upscaler_name=req.upscaler,
+        negative_prompt=req.negative_prompt,
+        seed=req.seed,
+        steps=req.steps,
+        guidance=req.guidance,
+        meural_name=req.meural,
+        meural_ip=req.meural_ip,
+        orientation=req.orientation,
+        duration=req.duration,
+    )
+    resp = _pipeline_result_to_response(result)
     if result.error:
         raise HTTPException(status_code=500, detail=resp.model_dump())
     return resp

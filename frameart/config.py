@@ -67,6 +67,15 @@ class TVProfile(BaseModel):
     ssl: bool = True
 
 
+class MeuralProfile(BaseModel):
+    """Configuration for a Netgear Meural canvas."""
+
+    ip: str
+    port: int = 80
+    orientation: str = "vertical"  # "vertical" or "horizontal"
+    name: str = ""
+
+
 class ProviderConfig(BaseModel):
     """Configuration for an image generation provider."""
 
@@ -105,6 +114,9 @@ class Settings(BaseSettings):
 
     # TVs — keyed by profile name
     tvs: dict[str, TVProfile] = Field(default_factory=dict)
+
+    # Meural canvases — keyed by profile name
+    meurals: dict[str, MeuralProfile] = Field(default_factory=dict)
 
     # Provider configs — keyed by provider name
     providers: dict[str, ProviderConfig] = Field(default_factory=dict)

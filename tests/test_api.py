@@ -27,6 +27,7 @@ class FakePipelineResult:
     final_path: Path | None = Path("/tmp/fakejob/final.png")
     content_id: str | None = "MY_ART_001"
     tv_switched: bool = True
+    meural_displayed: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
     timings: dict[str, float] = field(default_factory=lambda: {"generation_ms": 5000.0})
     error: str | None = None
@@ -399,6 +400,94 @@ class TestTVCleanup:
         resp = client.post("/tv/cleanup", json={"keep": 5})
         assert resp.status_code == 400
 
+
+# ---------------------------------------------------------------------------
+# GET /meural/status
+# ---------------------------------------------------------------------------
+
+class TestMeuralStatus:
+    @patch("frameart.api._settings")
+    @patch("frameart.meural.controller.get_status")
+    def test_with_meural_ip(self, mock_status, mock_settings):
+        settings = MagicMock()
+        settings.meurals = {}
+        mock_settings.return_value = settings
+
+        mock_status.return_value = MagicMock(
+            reachable=True,
+            sleeping=False,
+            orientation="vertical",
+            current_gallery="5",
+            current_item="42",
+            device_name="Office",
+            device_model="MC327",
+            error=None,
+        )
+
+        resp = client.get("/meural/status?meural_ip=192.168.1.50")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["reachable"] is True
+        assert data["orientation"] == "vertical"
+
+    @patch("frameart.api._settings")
+    def test_no_meural_returns_400(self, mock_settings):
+        settings = MagicMock()
+        settings.meurals = {}
+        mock_settings.return_value = settings
+
+        resp = client.get("/meural/status")
+        assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# POST /meural/display
+# ---------------------------------------------------------------------------
+
+class TestMeuralDisplay:
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_meural_apply")
+    def test_success(self, mock_run, mock_settings):
+        mock_settings.return_value = MagicMock()
+        mock_run.return_value = _fake_result(meural_displayed=True, tv_switched=False)
+
+        resp = client.post(
+            "/meural/display",
+            json={"image_path": "/tmp/test.png", "meural_ip": "192.168.1.50"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["meural_displayed"] is True
+
+
+# ---------------------------------------------------------------------------
+# POST /meural/generate-and-display
+# ---------------------------------------------------------------------------
+
+class TestMeuralGenerateAndDisplay:
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_meural_generate_and_apply")
+    def test_success(self, mock_run, mock_settings):
+        mock_settings.return_value = MagicMock()
+        mock_run.return_value = _fake_result(meural_displayed=True, tv_switched=False)
+
+        resp = client.post(
+            "/meural/generate-and-display",
+            json={
+                "prompt": "a sunset",
+                "meural_ip": "192.168.1.50",
+                "orientation": "vertical",
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["meural_displayed"] is True
+        mock_run.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# GET / — Web UI
+# ---------------------------------------------------------------------------
 
 class TestWebUI:
     def test_returns_html(self):
