@@ -8,10 +8,13 @@ FrameArt is a self-hosted tool that accepts a text description, generates an ima
 
 ## Features
 
-- **Multiple AI providers**: OpenAI DALL-E (working), Ollama/local models (working), Gemini and Anthropic (stubs)
+- **Multiple AI providers**: OpenAI DALL-E and Ollama/local models (pluggable registry)
 - **Automatic post-processing**: Smart crop to 16:9, upscale/downscale to 4K UHD
 - **Samsung Frame TV integration**: Upload art and switch display via WebSocket API
-- **HTTP API**: FastAPI server for programmatic access — perfect for voice agents and Home Assistant
+- **TV auto-discovery**: Find Frame TVs on your LAN automatically via UPnP/SSDP
+- **HTTP API**: FastAPI server with sync and async endpoints — ideal for voice agents and Home Assistant
+- **Async job queue**: Submit long-running generation jobs and poll for results
+- **Web UI**: Built-in dark-themed browser interface for generating art and browsing the gallery
 - **Style presets**: abstract, oil_painting, watercolor, kid_drawing, and more
 - **Pluggable upscalers**: Built-in Pillow LANCZOS, local HTTP (Real-ESRGAN), or remote services
 - **Artifact management**: Date-organized storage with full metadata tracking
@@ -105,6 +108,13 @@ frameart apply \
     --matte modern_black
 ```
 
+### Discover TVs on your network
+
+```bash
+frameart tv discover
+frameart tv discover --frame-only  # only show Frame TVs
+```
+
 ### Check TV status
 
 ```bash
@@ -166,18 +176,41 @@ frameart serve
 frameart serve --host 0.0.0.0 --port 8000
 ```
 
-Interactive API docs are available at `http://localhost:8000/docs` once the server is running.
+Interactive API docs are available at `http://localhost:8000/docs` and the web UI at `http://localhost:8000/` once the server is running.
 
 ### Endpoints
 
+**Sync** (block until complete):
+
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/generate-and-apply` | Full pipeline: prompt to TV display |
 | `POST` | `/generate` | Generate image only (no TV upload) |
+| `POST` | `/generate-and-apply` | Full pipeline: prompt to TV display |
 | `POST` | `/apply` | Upload an existing image to the TV |
+
+**Async** (return immediately, poll for results):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/async/generate` | Submit generation job, returns `{job_id}` |
+| `POST` | `/async/generate-and-apply` | Submit generate+apply job |
+| `POST` | `/async/apply` | Submit upload job |
+| `GET` | `/jobs/{job_id}/status` | Poll job progress and result |
+
+**TV and gallery**:
+
+| Method | Path | Description |
+|--------|------|-------------|
 | `GET` | `/tv/status` | Check TV connection and art mode |
+| `GET` | `/tv/discover` | Auto-discover Samsung TVs via SSDP |
 | `GET` | `/jobs` | List recent jobs |
 | `GET` | `/jobs/{job_id}/image` | Serve the final processed image |
+
+**Misc**:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/` | Web UI |
 | `GET` | `/styles` | List available style presets |
 | `GET` | `/health` | Liveness check |
 
@@ -236,6 +269,27 @@ curl http://localhost:8000/jobs?limit=5
 
 ```bash
 curl http://localhost:8000/jobs/120000-abc12345/image -o artwork.png
+```
+
+**Async generation** (returns immediately, poll for status):
+
+```bash
+# Submit job
+curl -X POST http://localhost:8000/async/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "a stormy sea, oil painting"}'
+# {"job_id":"143022-a1b2c3d4","status":"pending"}
+
+# Poll until complete
+curl http://localhost:8000/jobs/143022-a1b2c3d4/status
+# {"job_id":"143022-a1b2c3d4","status":"completed","result":{...}}
+```
+
+**Discover TVs on the network:**
+
+```bash
+curl http://localhost:8000/tv/discover
+# [{"ip":"192.168.1.100","name":"Living Room","model":"QN55LS03","frame_tv":true}]
 ```
 
 **Health check:**
@@ -490,18 +544,19 @@ ruff check frameart/ tests/
 ```
 frameart/
   cli.py              # Click CLI commands
-  api.py              # FastAPI HTTP server
+  api.py              # FastAPI HTTP server (sync + async endpoints)
+  jobs.py             # Async job queue (ThreadPoolExecutor, in-memory)
   pipeline.py         # Core orchestration: generate -> postprocess -> upload -> switch
   config.py           # Configuration management (YAML + env vars + CLI flags)
   postprocess.py      # 16:9 crop + 4K resize logic
   artifacts.py        # File storage and metadata
+  static/
+    index.html        # Web UI (single-page, no build step)
   providers/
     base.py           # ImageProvider interface
     registry.py       # Provider name -> class mapping
     openai_adapter.py # DALL-E integration
     ollama_adapter.py # Local model integration
-    gemini_adapter.py # Stub
-    anthropic_adapter.py # Stub
   upscalers/
     base.py           # Upscaler interface
     registry.py       # Upscaler name -> class mapping
@@ -510,33 +565,27 @@ frameart/
     remote_http.py    # Remote upscaler service
   tv/
     controller.py     # Samsung Frame TV: pair, upload, switch, status
+    discovery.py      # UPnP/SSDP auto-discovery
 ```
 
 ---
 
-## Known Limitations and Roadmap
+## Known Limitations
 
-### Missing Today
-
-- **No authentication on the HTTP API.** The server binds to `127.0.0.1` by default, but if you expose it on `0.0.0.0` there is no auth layer. For LAN-only use this is typically fine; for anything else, put it behind a reverse proxy with authentication (e.g., Caddy, nginx + basic auth, or Authelia).
+- **No authentication on the HTTP API.** The server binds to `127.0.0.1` by default. For LAN-only use this is typically fine; for anything else, put it behind a reverse proxy with authentication (e.g., Caddy, nginx + basic auth, or Authelia).
 - **No HTTPS on the API server.** Same recommendation: use a reverse proxy to terminate TLS.
-- **No background/async jobs.** Image generation (especially DALL-E 3) can take 15-30 seconds. The HTTP API blocks until the pipeline completes. Callers should set an appropriate timeout (120s recommended). A future version could add async job submission with polling.
-- **No rate limiting.** Each request triggers an AI provider API call. If the endpoint is exposed without rate limiting, it could rack up provider costs quickly.
+- **No rate limiting.** Each request triggers an AI provider API call. If exposed without rate limiting, it could rack up provider costs quickly.
 - **No image upload via HTTP multipart.** The `/apply` endpoint takes a filesystem path, not a file upload. This works for local and Docker-volume use cases but not for remote clients sending image bytes over HTTP.
-- **Gemini and Anthropic providers are stubs.** Only OpenAI and Ollama are fully implemented.
-- **No TV auto-discovery.** You must know the TV's IP address. Samsung TVs advertise via UPnP/SSDP, which could be used for zero-config discovery.
-- **No web UI.** The interactive docs at `/docs` work for testing, but there is no dedicated frontend.
+- **Async jobs are in-memory only.** They do not survive server restarts. Completed jobs are evicted after 200 entries to bound memory usage.
 
 ### Potential Future Work
 
-- Async job queue with `POST /jobs` returning a job ID and `GET /jobs/{id}` for polling
 - API key / bearer token authentication
 - HTTP multipart image upload for `/apply`
-- UPnP/SSDP TV auto-discovery
 - Webhook/callback on job completion
 - Scheduling (cron-like "change art every morning")
 - Multi-TV fan-out (upload to all TVs at once)
-- Web UI for prompt entry and gallery browsing
+- Additional image providers (Gemini, Anthropic, Stability AI)
 
 ---
 

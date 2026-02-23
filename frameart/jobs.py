@@ -2,6 +2,9 @@
 
 Jobs are stored in-memory and executed in a background thread pool.
 They do not survive server restarts (acceptable for v1).
+
+Completed/failed jobs are evicted after ``MAX_COMPLETED_JOBS`` to
+prevent unbounded memory growth.
 """
 
 from __future__ import annotations
@@ -16,6 +19,8 @@ from enum import Enum
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+MAX_COMPLETED_JOBS = 200
 
 
 class JobStatus(str, Enum):
@@ -42,14 +47,22 @@ class Job:
 
 
 class JobStore:
-    """Thread-safe in-memory job store with a background executor."""
+    """Thread-safe in-memory job store with a background executor.
 
-    def __init__(self, max_workers: int = 2) -> None:
+    Parameters
+    ----------
+    max_workers:
+        Number of threads available for running jobs concurrently.
+    max_completed:
+        Maximum number of finished (completed/failed) jobs to keep.
+        Oldest finished jobs are evicted when this limit is exceeded.
+    """
+
+    def __init__(self, max_workers: int = 2, max_completed: int = MAX_COMPLETED_JOBS) -> None:
         self._jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
-
-    # -- public API ----------------------------------------------------------
+        self._max_completed = max_completed
 
     def submit(
         self,
@@ -83,7 +96,21 @@ class JobStore:
             jobs = sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
         return jobs[:limit]
 
-    # -- internal ------------------------------------------------------------
+    def _evict_old_jobs(self) -> None:
+        """Remove oldest finished jobs when the store exceeds the limit.
+
+        Must be called while holding ``self._lock``.
+        """
+        finished = [
+            j for j in self._jobs.values()
+            if j.status in (JobStatus.completed, JobStatus.failed)
+        ]
+        if len(finished) <= self._max_completed:
+            return
+        finished.sort(key=lambda j: j.created_at)
+        to_remove = len(finished) - self._max_completed
+        for job in finished[:to_remove]:
+            self._jobs.pop(job.id, None)
 
     def _run(
         self,
@@ -96,7 +123,6 @@ class JobStore:
         job.started_at = time.monotonic()
         try:
             result = func(*args, **kwargs)
-            # If the pipeline result has an error field, treat it as failure
             if hasattr(result, "error") and result.error:
                 job.status = JobStatus.failed
                 job.error = result.error
@@ -109,6 +135,8 @@ class JobStore:
             logger.exception("Job %s failed: %s", job.id, exc)
         finally:
             job.completed_at = time.monotonic()
+            with self._lock:
+                self._evict_old_jobs()
 
 
 # Module-level singleton used by the API server.

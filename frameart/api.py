@@ -1,23 +1,31 @@
 """FrameArt HTTP API — FastAPI server for generating and uploading art.
 
-Start with:
+Start with::
+
     frameart serve
     frameart serve --host 0.0.0.0 --port 8000
 
-Endpoints:
-    POST /generate-and-apply  — generate image from prompt, upload to TV
-    POST /generate            — generate image only (no TV upload)
-    POST /apply               — upload an existing image to the TV
-    GET  /tv/status           — check TV connection and art mode
-    GET  /tv/discover         — auto-discover Samsung TVs on the LAN
-    GET  /jobs                — list recent jobs (artifacts on disk)
-    GET  /jobs/{job_id}       — get detailed job status (async queue)
-    GET  /jobs/{job_id}/image — serve the final image for a job
-    POST /async/generate      — async: return immediately, poll /jobs/{id}
-    POST /async/generate-and-apply — async variant
-    POST /async/apply         — async variant
-    GET  /                    — web UI
-    GET  /health              — liveness check
+Endpoints (sync):
+    POST /generate              — generate image only (no TV upload)
+    POST /generate-and-apply    — generate, upload to TV, switch display
+    POST /apply                 — upload an existing image to the TV
+
+Endpoints (async — return immediately, poll for results):
+    POST /async/generate            — returns {job_id, status}
+    POST /async/generate-and-apply  — same, with TV upload
+    POST /async/apply               — same, upload-only
+    GET  /jobs/{job_id}/status      — poll job progress and result
+
+TV and gallery:
+    GET  /tv/status             — check TV connection and art mode
+    GET  /tv/discover           — auto-discover Samsung TVs via SSDP
+    GET  /jobs                  — list recent jobs (artifacts on disk)
+    GET  /jobs/{job_id}/image   — serve the final processed image
+
+Misc:
+    GET  /                      — web UI
+    GET  /styles                — available style presets
+    GET  /health                — liveness check
 """
 
 from __future__ import annotations

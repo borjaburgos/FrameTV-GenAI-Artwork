@@ -678,14 +678,3 @@ def list_art(profile: TVProfile) -> list[dict[str, Any]]:
     return art.available()
 
 
-def delete_art(profile: TVProfile, content_id: str) -> bool:
-    """Delete an artwork from the TV by content_id."""
-    try:
-        tv = _connect(profile)
-        art = tv.art()
-        art.delete(content_id)
-        logger.info("Deleted content_id=%s", content_id)
-        return True
-    except Exception as e:
-        logger.error("Failed to delete %s: %s", content_id, e)
-        return False

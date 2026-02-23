@@ -78,3 +78,25 @@ class TestJobStore:
         assert j is not None
         assert j.status == JobStatus.failed
         assert j.error == "provider timeout"
+
+    def test_evicts_oldest_completed_jobs(self):
+        """Old completed jobs are evicted when max_completed is exceeded."""
+        store = JobStore(max_workers=1, max_completed=2)
+
+        for i in range(4):
+            store.submit(f"ev-{i}", lambda: 1)
+
+        # Wait for all to finish
+        for _ in range(100):
+            all_done = all(
+                (j := store.get(f"ev-{i}")) is None
+                or j.status in (JobStatus.completed, JobStatus.failed)
+                for i in range(4)
+            )
+            if all_done:
+                break
+            time.sleep(0.05)
+
+        # At most max_completed (2) finished jobs should remain
+        remaining = [j for j in store.list_jobs() if j.status == JobStatus.completed]
+        assert len(remaining) <= 2

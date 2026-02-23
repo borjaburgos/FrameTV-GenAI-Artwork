@@ -13,8 +13,6 @@ class TestProviderRegistry:
         providers = available_providers()
         assert "openai" in providers
         assert "ollama" in providers
-        assert "gemini" in providers
-        assert "anthropic" in providers
 
     def test_get_provider_openai(self):
         provider = get_provider("openai")
@@ -29,18 +27,6 @@ class TestProviderRegistry:
     def test_get_unknown_provider(self):
         with pytest.raises(KeyError, match="Unknown provider"):
             get_provider("nonexistent")
-
-
-class TestStubProviders:
-    def test_gemini_not_implemented(self):
-        provider = get_provider("gemini")
-        with pytest.raises(NotImplementedError):
-            provider.generate("test prompt")
-
-    def test_anthropic_not_implemented(self):
-        provider = get_provider("anthropic")
-        with pytest.raises(NotImplementedError):
-            provider.generate("test prompt")
 
 
 class TestGeneratedImage:
