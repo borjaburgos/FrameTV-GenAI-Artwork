@@ -299,15 +299,111 @@ def _art_upload(
     file_type: str = "jpg",
     matte: str = "shadowbox_polar",
 ) -> str:
-    """Upload an image via the Samsung art WebSocket API.
+    """Upload an image to a Samsung Frame TV and return the content_id.
 
-    This reimplements ``art.upload()`` from samsungtvws to include the
-    ``request_id`` field in the ``send_image`` request.  The upstream
-    xchwarze library omits this field, which causes Samsung Frame TVs
-    to return error -1 on many firmware versions.  The fix is taken from
-    the NickWaterton fork (see xchwarze/samsung-tv-ws-api#130).
+    Detects the TV's art-API version and picks the right transport:
 
-    Returns the ``content_id`` assigned by the TV.
+    * **API 0.97** (2018/2019 Frame TVs) — the image is packed into a
+      single WebSocket *binary* frame together with a compact JSON
+      header.  These TVs do **not** support the D2D socket handshake
+      and return ``error -1`` if you try.
+    * **Newer APIs** (2020 +) — the traditional D2D socket flow is
+      used: a ``send_image`` text request, then a TCP socket transfer.
+
+    The API-0.97 path was reverse-engineered from SmartThings traffic
+    and upstreamed in ``xchwarze/samsung-tv-ws-api#181``.
+    """
+    # Ensure the WebSocket is open before anything else
+    if not art.connection:
+        art.open()
+
+    # ---- Detect API version ----
+    api_version: str | None = None
+    try:
+        api_version = art.get_api_version()
+        logger.info("TV art API version: %s", api_version)
+    except Exception as exc:
+        logger.debug("Could not query API version (%s), assuming modern API", exc)
+
+    if api_version == "0.97":
+        return _upload_ws_binary(art, file_bytes, file_type, matte)
+    return _upload_d2d_socket(art, file_bytes, file_type, matte)
+
+
+# ---------------------------------------------------------------------------
+# API 0.97 — WebSocket binary frame upload (2018/2019 Frame TVs)
+# ---------------------------------------------------------------------------
+
+def _upload_ws_binary(
+    art,
+    file_bytes: bytes,
+    file_type: str,
+    matte: str,
+) -> str:
+    """Upload via a single WebSocket binary frame (API 0.97).
+
+    Wire format:
+        [uint16-BE header_len] [JSON header (utf-8)] [raw image bytes]
+
+    The JSON header is an ``ms.channel.emit`` envelope wrapping the
+    ``send_image`` request.  SmartThings sends ``"JPEG"`` (uppercase)
+    for the ``file_type`` field.
+    """
+    upload_id = str(uuid.uuid4())
+
+    # SmartThings sends uppercase file types for API 0.97
+    ft = file_type.lower()
+    ft_hdr = "JPEG" if ft in ("jpg", "jpeg") else ft.upper()
+
+    inner: dict[str, Any] = {
+        "request": "send_image",
+        "file_type": ft_hdr,
+        "matte_id": matte or "none",
+        "id": upload_id,
+    }
+    outer: dict[str, Any] = {
+        "method": "ms.channel.emit",
+        "params": {
+            "data": json.dumps(inner),
+            "to": "host",
+            "event": "art_app_request",
+        },
+    }
+
+    header = json.dumps(outer, separators=(",", ":")).encode("utf-8")
+    if len(header) > 0xFFFF:
+        raise ValueError("Upload header too large for uint16 length prefix")
+
+    payload = len(header).to_bytes(2, "big") + header + file_bytes
+
+    assert art.connection
+    logger.info(
+        "Uploading via WS binary (API 0.97): header=%d bytes, image=%d bytes",
+        len(header), len(file_bytes),
+    )
+    art.connection.send_binary(payload)
+
+    # Wait for the TV to confirm
+    result = _wait_for_art_event(art, "image_added", upload_id, "send_image")
+    content_id: str = result["content_id"]
+    logger.info("Upload complete (API 0.97), content_id=%s", content_id)
+    return content_id
+
+
+# ---------------------------------------------------------------------------
+# Modern API — D2D socket upload (2020+ Frame TVs)
+# ---------------------------------------------------------------------------
+
+def _upload_d2d_socket(
+    art,
+    file_bytes: bytes,
+    file_type: str,
+    matte: str,
+) -> str:
+    """Upload via a D2D TCP socket handshake (modern API).
+
+    Includes ``request_id`` in the ``send_image`` request, which is
+    required by many firmware versions (NickWaterton fork fix).
     """
     file_size = len(file_bytes)
     file_type = file_type.lower()
@@ -330,16 +426,9 @@ def _art_upload(
         "image_date": date,
         "matte_id": matte,
         "file_size": file_size,
-        # Some firmware versions require the category to be specified
-        # for user-uploaded content.
-        "category": "MY-C0004",
     }
 
-    # Ensure the WebSocket is open
-    if not art.connection:
-        art.open()
-
-    logger.debug("Sending send_image request: %s", json.dumps(request_data))
+    logger.debug("Sending send_image request (D2D): %s", json.dumps(request_data))
     art.send_command(ArtChannelEmitCommand.art_app_request(request_data))
 
     # ---- Wait for "ready_to_use" d2d response ----
