@@ -1,6 +1,8 @@
 # Running FrameArt in an LXC Container
 
-This guide covers running FrameArt directly in a Debian/Ubuntu-based LXC container on Proxmox.
+This guide covers running FrameArt directly in a Debian/Ubuntu-based LXC container on Proxmox. LXC containers are lighter weight than full VMs and are a great fit for a dedicated, single-purpose FrameArt deployment.
+
+For full OS isolation or GPU passthrough (e.g., for local Ollama models), see [VM.md](VM.md).
 
 ## Prerequisites
 
@@ -62,8 +64,8 @@ cd FrameTV-GenAI-Artwork
 python3 -m venv ~/.venv/frameart
 source ~/.venv/frameart/bin/activate
 
-# Install
-pip install .
+# Install with API dependencies
+pip install ".[api]"
 ```
 
 ### 5. Configure
@@ -91,7 +93,7 @@ tvs:
 export OPENAI_API_KEY="sk-..."
 ```
 
-## Usage
+## CLI Usage
 
 ```bash
 # Activate the virtual environment
@@ -107,7 +109,67 @@ frameart generate-and-apply \
     --tv my_frame
 ```
 
-## Running as a systemd service (optional)
+## HTTP API Server
+
+Start the API server so external systems (Home Assistant, Siri, etc.) can trigger art generation over the network:
+
+```bash
+source ~/.venv/frameart/bin/activate
+
+# Start on all interfaces
+frameart serve --host 0.0.0.0 --port 8000
+```
+
+Then from any machine on the network:
+
+```bash
+# Health check
+curl http://<LXC_IP>:8000/health
+
+# Generate and display art
+curl -X POST http://<LXC_IP>:8000/generate-and-apply \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "a serene Japanese garden at sunset"}'
+
+# Interactive API docs
+# Open http://<LXC_IP>:8000/docs in a browser
+```
+
+## Running as a systemd Service
+
+### API server (persistent, starts on boot)
+
+Create `/etc/systemd/system/frameart-api.service`:
+
+```ini
+[Unit]
+Description=FrameArt API Server
+After=network.target
+
+[Service]
+Type=simple
+User=frameart
+WorkingDirectory=/home/frameart/FrameTV-GenAI-Artwork
+Environment=FRAMEART_DATA_DIR=/data/frameart
+Environment=OPENAI_API_KEY=sk-...
+ExecStart=/home/frameart/.venv/frameart/bin/frameart serve --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+systemctl daemon-reload
+systemctl enable --now frameart-api
+systemctl status frameart-api
+
+# Check logs
+journalctl -u frameart-api -f
+```
+
+### Scheduled art changes (optional)
 
 Create `/etc/systemd/system/frameart.service`:
 
@@ -162,9 +224,11 @@ systemctl enable --now frameart.timer
 - Port 8001 (WS) and 8002 (WSS) must be reachable from the container to the TV.
 - If using a bridged network (`vmbr0`), no extra configuration is needed.
 - If using a NAT or routed setup, ensure the TV subnet is routable.
+- If you want to reach the API from outside the LAN, set up port forwarding or a reverse proxy on the Proxmox host.
 
 ## Troubleshooting
 
 - **"Connection refused" to TV**: Check that the TV is on and reachable (`ping <TV_IP>`). Ensure ports 8001/8002 are not blocked.
 - **Pillow build fails**: Make sure `libjpeg62-turbo-dev` and `zlib1g-dev` are installed before `pip install`.
 - **Permission denied on /data/frameart**: Ensure the directory is owned by the `frameart` user.
+- **API not reachable from other machines**: Check that you passed `--host 0.0.0.0` and that no firewall is blocking port 8000 in the container or on the Proxmox host.

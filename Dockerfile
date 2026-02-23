@@ -21,8 +21,8 @@ RUN pip install --no-cache-dir . 2>/dev/null || true
 COPY frameart/ frameart/
 COPY config.example.yaml .
 
-# Install the package
-RUN pip install --no-cache-dir .
+# Install the package with API dependencies (FastAPI + uvicorn)
+RUN pip install --no-cache-dir ".[api]"
 
 # Data volume
 RUN mkdir -p /data/frameart && chown -R frameart:frameart /data/frameart
@@ -32,6 +32,8 @@ VOLUME /data/frameart
 USER frameart
 
 ENV FRAMEART_DATA_DIR=/data/frameart
+
+EXPOSE 8000
 
 ENTRYPOINT ["frameart"]
 CMD ["--help"]
