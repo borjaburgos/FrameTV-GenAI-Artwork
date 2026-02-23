@@ -19,6 +19,7 @@ Endpoints (async — return immediately, poll for results):
 TV and gallery:
     GET  /tv/status             — check TV connection and art mode
     GET  /tv/discover           — auto-discover Samsung TVs via SSDP
+    POST /tv/cleanup            — delete old user-uploaded artworks
     GET  /jobs                  — list recent jobs (artifacts on disk)
     GET  /jobs/{job_id}/image   — serve the final processed image
 
@@ -76,6 +77,17 @@ class GenerateAndApplyRequest(GenerateRequest):
     tv_ip: str | None = Field(None, description="TV IP address (overrides profile).")
     matte: str = Field("none", description="Matte style (e.g., modern_black, none).")
     no_switch: bool = Field(False, description="Upload but don't switch displayed art.")
+    cleanup_keep: int | None = Field(
+        None,
+        description="After upload, keep N user artworks on TV and delete the rest. "
+        "Omit or null to disable cleanup.",
+    )
+    cleanup_order: str = Field(
+        "oldest_first", description="Delete oldest_first or newest_first.",
+    )
+    cleanup_include_favourites: bool = Field(
+        False, description="Also delete favourited artworks during cleanup.",
+    )
 
 
 class ApplyRequest(BaseModel):
@@ -85,6 +97,17 @@ class ApplyRequest(BaseModel):
     tv: str | None = Field(None, description="TV profile name from config.")
     tv_ip: str | None = Field(None, description="TV IP address.")
     matte: str = Field("none", description="Matte style.")
+    cleanup_keep: int | None = Field(
+        None,
+        description="After upload, keep N user artworks on TV and delete the rest. "
+        "Omit or null to disable cleanup.",
+    )
+    cleanup_order: str = Field(
+        "oldest_first", description="Delete oldest_first or newest_first.",
+    )
+    cleanup_include_favourites: bool = Field(
+        False, description="Also delete favourited artworks during cleanup.",
+    )
 
 
 class JobResponse(BaseModel):
@@ -135,6 +158,28 @@ class DiscoveredTVResponse(BaseModel):
     name: str
     model: str
     frame_tv: bool
+
+
+class TVCleanupRequest(BaseModel):
+    """Request body for TV artwork cleanup."""
+
+    tv: str | None = Field(None, description="TV profile name from config.")
+    tv_ip: str | None = Field(None, description="TV IP address.")
+    keep: int = Field(20, ge=0, description="Number of user artworks to keep.")
+    delete_all: bool = Field(False, description="Delete ALL user-uploaded artworks.")
+    order: str = Field("oldest_first", description="Delete oldest_first or newest_first.")
+    include_favourites: bool = Field(
+        False, description="Also delete favourited artworks.",
+    )
+
+
+class TVCleanupResponse(BaseModel):
+    """Response for TV artwork cleanup."""
+
+    deleted: list[str]
+    kept: int
+    skipped_favourites: int
+    error: str | None = None
 
 
 class HealthResponse(BaseModel):
@@ -239,6 +284,9 @@ def generate_and_apply(req: GenerateAndApplyRequest):
         tv_ip=req.tv_ip,
         matte=req.matte,
         no_switch=req.no_switch,
+        cleanup_keep=req.cleanup_keep,
+        cleanup_order=req.cleanup_order,
+        cleanup_include_favourites=req.cleanup_include_favourites,
     )
     resp = _pipeline_result_to_response(result)
     if result.error:
@@ -258,6 +306,9 @@ def apply_image(req: ApplyRequest):
         tv_name=req.tv,
         tv_ip=req.tv_ip,
         matte=req.matte,
+        cleanup_keep=req.cleanup_keep,
+        cleanup_order=req.cleanup_order,
+        cleanup_include_favourites=req.cleanup_include_favourites,
     )
     resp = _pipeline_result_to_response(result)
     if result.error:
@@ -313,6 +364,52 @@ def tv_discover(
         DiscoveredTVResponse(ip=tv.ip, name=tv.name, model=tv.model, frame_tv=tv.frame_tv)
         for tv in tvs
     ]
+
+
+@app.post("/tv/cleanup", response_model=TVCleanupResponse)
+def tv_cleanup(req: TVCleanupRequest):
+    """Delete old user-uploaded artworks from the TV to free space.
+
+    Only deletes user-uploaded images (content_id starting with MY_).
+    Samsung Art Store items and built-in artwork are never touched.
+    Favourited artworks are protected by default.
+    """
+    from frameart.config import TVProfile
+    from frameart.tv.cleanup import cleanup_artworks
+
+    settings = _settings()
+    profile = None
+    if req.tv and req.tv in settings.tvs:
+        profile = settings.tvs[req.tv]
+    elif req.tv_ip:
+        profile = TVProfile(ip=req.tv_ip)
+    elif len(settings.tvs) == 1:
+        profile = next(iter(settings.tvs.values()))
+
+    if profile is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No TV specified. Pass tv or tv_ip in the request body, "
+            "or configure exactly one TV in config.yaml.",
+        )
+
+    result = cleanup_artworks(
+        profile,
+        keep=req.keep,
+        delete_all=req.delete_all,
+        order=req.order,
+        include_favourites=req.include_favourites,
+    )
+
+    resp = TVCleanupResponse(
+        deleted=result.deleted,
+        kept=result.kept,
+        skipped_favourites=result.skipped_favourites,
+        error=result.error,
+    )
+    if result.error:
+        raise HTTPException(status_code=500, detail=resp.model_dump())
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +542,9 @@ def async_generate_and_apply(req: GenerateAndApplyRequest):
             "tv_ip": req.tv_ip,
             "matte": req.matte,
             "no_switch": req.no_switch,
+            "cleanup_keep": req.cleanup_keep,
+            "cleanup_order": req.cleanup_order,
+            "cleanup_include_favourites": req.cleanup_include_favourites,
         },
         request_summary={
             "type": "generate-and-apply",
@@ -474,6 +574,9 @@ def async_apply(req: ApplyRequest):
             "tv_name": req.tv,
             "tv_ip": req.tv_ip,
             "matte": req.matte,
+            "cleanup_keep": req.cleanup_keep,
+            "cleanup_order": req.cleanup_order,
+            "cleanup_include_favourites": req.cleanup_include_favourites,
         },
         request_summary={"type": "apply", "image_path": req.image_path},
     )

@@ -167,14 +167,31 @@ def generate(ctx, prompt, style, provider, model, upscaler, negative_prompt, see
 @click.option("--tv", type=str, default=None, help="TV profile name from config.")
 @click.option("--tv-ip", type=str, default=None, help="TV IP address.")
 @click.option("--matte", type=str, default="none", help="Matte style (e.g., modern_black).")
+@click.option(
+    "--cleanup-keep", type=int, default=None,
+    help="After upload, keep N user artworks on TV and delete the rest (default: disabled).",
+)
+@click.option(
+    "--cleanup-order", type=click.Choice(["oldest_first", "newest_first"]),
+    default="oldest_first", help="Which artworks to delete first during cleanup.",
+)
+@click.option(
+    "--cleanup-include-favourites", is_flag=True,
+    help="Also delete favourited artworks during cleanup.",
+)
 @click.pass_context
-def apply(ctx, image, tv, tv_ip, matte):
+def apply(ctx, image, tv, tv_ip, matte, cleanup_keep, cleanup_order, cleanup_include_favourites):
     """Upload an existing image to the Frame TV and switch to it."""
     _ensure_logging(ctx)
     from frameart.pipeline import run_apply
 
     settings = ctx.obj["settings"]
-    result = run_apply(settings, image, tv_name=tv, tv_ip=tv_ip, matte=matte)
+    result = run_apply(
+        settings, image, tv_name=tv, tv_ip=tv_ip, matte=matte,
+        cleanup_keep=cleanup_keep,
+        cleanup_order=cleanup_order,
+        cleanup_include_favourites=cleanup_include_favourites,
+    )
     _print_result(result)
     sys.exit(1 if result.error else 0)
 
@@ -205,10 +222,23 @@ def apply(ctx, image, tv, tv_ip, matte):
 @click.option("--no-upload", is_flag=True, help="Generate + postprocess but skip upload.")
 @click.option("--no-switch", is_flag=True, help="Upload but don't switch displayed art.")
 @click.option("--dry-run", is_flag=True, help="Alias for --no-upload.")
+@click.option(
+    "--cleanup-keep", type=int, default=None,
+    help="After upload, keep N user artworks on TV and delete the rest (default: disabled).",
+)
+@click.option(
+    "--cleanup-order", type=click.Choice(["oldest_first", "newest_first"]),
+    default="oldest_first", help="Which artworks to delete first during cleanup.",
+)
+@click.option(
+    "--cleanup-include-favourites", is_flag=True,
+    help="Also delete favourited artworks during cleanup.",
+)
 @click.pass_context
 def generate_and_apply(
     ctx, prompt, style, provider, model, upscaler, negative_prompt,
     seed, steps, guidance, tv, tv_ip, matte, no_upload, no_switch, dry_run,
+    cleanup_keep, cleanup_order, cleanup_include_favourites,
 ):
     """Generate an image and display it on the Frame TV."""
     _ensure_logging(ctx)
@@ -231,6 +261,9 @@ def generate_and_apply(
         matte=matte,
         no_upload=no_upload or dry_run,
         no_switch=no_switch,
+        cleanup_keep=cleanup_keep,
+        cleanup_order=cleanup_order,
+        cleanup_include_favourites=cleanup_include_favourites,
     )
     _print_result(result)
     sys.exit(1 if result.error else 0)
@@ -430,6 +463,102 @@ def tv_list_art(ctx, tv_name, tv_ip):
     except Exception as e:
         click.secho(f"Failed to list art: {e}", fg="red", err=True)
         sys.exit(1)
+
+
+@tv.command("cleanup")
+@_debug_option
+@_verbose_option
+@click.option("--tv", "tv_name", type=str, default=None, help="TV profile name.")
+@click.option("--tv-ip", type=str, default=None, help="TV IP address.")
+@click.option("--keep", type=int, default=20, help="Number of user artworks to keep (default: 20).")
+@click.option("--delete-all", is_flag=True, help="Delete ALL user-uploaded artworks.")
+@click.option(
+    "--order", type=click.Choice(["oldest_first", "newest_first"]),
+    default="oldest_first", help="Which artworks to delete first.",
+)
+@click.option(
+    "--include-favourites", is_flag=True,
+    help="Also delete favourited artworks (default: protect them).",
+)
+@click.option("--dry-run", is_flag=True, help="Show what would be deleted without deleting.")
+@click.pass_context
+def tv_cleanup(ctx, tv_name, tv_ip, keep, delete_all, order, include_favourites, dry_run):
+    """Delete old user-uploaded artworks from the Frame TV.
+
+    Only removes artworks uploaded by the user (content_id starting with MY_).
+    Samsung Art Store items and built-in art are never touched.
+    Favourited artworks are protected by default.
+    """
+    _ensure_logging(ctx)
+    from frameart.config import TVProfile
+    from frameart.tv.cleanup import cleanup_artworks
+
+    settings = ctx.obj["settings"]
+
+    profile = None
+    if tv_name and tv_name in settings.tvs:
+        profile = settings.tvs[tv_name]
+    elif tv_ip:
+        profile = TVProfile(ip=tv_ip)
+    elif len(settings.tvs) == 1:
+        profile = next(iter(settings.tvs.values()))
+
+    if profile is None:
+        click.secho("No TV specified. Use --tv or --tv-ip.", fg="red", err=True)
+        sys.exit(1)
+
+    if dry_run:
+        # List what would be cleaned up without actually deleting
+        from frameart.tv.cleanup import _is_favourite, _is_user_upload
+        from frameart.tv.controller import list_art
+
+        try:
+            artworks = list_art(profile)
+        except Exception as e:
+            click.secho(f"Failed to list art: {e}", fg="red", err=True)
+            sys.exit(1)
+
+        user_art = [a for a in artworks if _is_user_upload(a)]
+        favs = [a for a in user_art if _is_favourite(a)]
+        if include_favourites:
+            candidates = user_art
+        else:
+            candidates = [a for a in user_art if not _is_favourite(a)]
+        candidates.sort(key=lambda a: a.get("content_id", ""))
+
+        if delete_all:
+            to_delete = candidates
+        elif len(candidates) <= keep:
+            to_delete = []
+        elif order == "oldest_first":
+            to_delete = candidates[: len(candidates) - keep]
+        else:
+            to_delete = candidates[keep:]
+
+        click.echo(f"Total artworks on TV: {len(artworks)}")
+        click.echo(f"User-uploaded: {len(user_art)}")
+        click.echo(f"Favourites: {len(favs)} (protected: {not include_favourites})")
+        click.echo(f"Would delete: {len(to_delete)}")
+        for a in to_delete:
+            fav = " [favourite]" if _is_favourite(a) else ""
+            click.echo(f"  {a.get('content_id', '?')}{fav}")
+        return
+
+    result = cleanup_artworks(
+        profile, keep=keep, delete_all=delete_all,
+        order=order, include_favourites=include_favourites,
+    )
+
+    if result.error:
+        click.secho(f"Cleanup error: {result.error}", fg="red", err=True)
+        sys.exit(1)
+
+    click.echo(f"Deleted {len(result.deleted)} artwork(s), kept {result.kept}.")
+    if result.skipped_favourites:
+        click.echo(f"Protected {result.skipped_favourites} favourite(s).")
+    if result.deleted:
+        for cid in result.deleted:
+            click.echo(f"  Deleted: {cid}")
 
 
 # --- list (artifacts) --------------------------------------------------------

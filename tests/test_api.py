@@ -376,6 +376,30 @@ class TestJobStatusNotFound:
 # GET / — Web UI
 # ---------------------------------------------------------------------------
 
+class TestTVCleanup:
+    @patch("frameart.tv.cleanup.cleanup_artworks")
+    @patch("frameart.api.load_settings")
+    def test_cleanup_success(self, mock_settings, mock_cleanup):
+        from frameart.tv.cleanup import CleanupResult
+
+        mock_settings.return_value = MagicMock(tvs={})
+        mock_cleanup.return_value = CleanupResult(
+            deleted=["MY_F0001", "MY_F0002"], kept=3, skipped_favourites=1,
+        )
+        resp = client.post("/tv/cleanup", json={"tv_ip": "1.2.3.4", "keep": 3})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["deleted"] == ["MY_F0001", "MY_F0002"]
+        assert data["kept"] == 3
+        assert data["skipped_favourites"] == 1
+
+    @patch("frameart.api.load_settings")
+    def test_cleanup_no_tv_returns_400(self, mock_settings):
+        mock_settings.return_value = MagicMock(tvs={})
+        resp = client.post("/tv/cleanup", json={"keep": 5})
+        assert resp.status_code == 400
+
+
 class TestWebUI:
     def test_returns_html(self):
         resp = client.get("/")

@@ -17,6 +17,7 @@ FrameArt is a self-hosted tool that accepts a text description, generates an ima
 - **Web UI**: Built-in dark-themed browser interface for generating art and browsing the gallery
 - **Style presets**: abstract, oil_painting, watercolor, kid_drawing, and more
 - **Pluggable upscalers**: Built-in Pillow LANCZOS, local HTTP (Real-ESRGAN), or remote services
+- **TV artwork cleanup**: Auto-delete old uploads to prevent the TV from running out of space (protects favourites)
 - **Artifact management**: Date-organized storage with full metadata tracking
 - **2018-2025 Frame TV support**: Automatic API version detection (0.97 binary upload for older models, D2D socket for newer ones)
 - **Docker, LXC, and VM support**: Run anywhere on your home network
@@ -115,6 +116,34 @@ frameart tv discover
 frameart tv discover --frame-only  # only show Frame TVs
 ```
 
+### Clean up old artworks on the TV
+
+```bash
+# Keep the 20 newest user uploads, delete the rest
+frameart tv cleanup --tv livingroom_frame --keep 20
+
+# Delete ALL user-uploaded artworks
+frameart tv cleanup --tv-ip 192.168.1.100 --delete-all
+
+# Delete newest first instead of oldest first
+frameart tv cleanup --keep 10 --order newest_first
+
+# Also delete favourited artworks (protected by default)
+frameart tv cleanup --keep 5 --include-favourites
+
+# Preview without deleting
+frameart tv cleanup --keep 10 --dry-run
+```
+
+Auto-cleanup after generation (optional):
+
+```bash
+frameart generate-and-apply \
+    --prompt "a sunset over the ocean" \
+    --tv livingroom_frame \
+    --cleanup-keep 20
+```
+
 ### Check TV status
 
 ```bash
@@ -203,6 +232,7 @@ Interactive API docs are available at `http://localhost:8000/docs` and the web U
 |--------|------|-------------|
 | `GET` | `/tv/status` | Check TV connection and art mode |
 | `GET` | `/tv/discover` | Auto-discover Samsung TVs via SSDP |
+| `POST` | `/tv/cleanup` | Delete old user-uploaded artworks from the TV |
 | `GET` | `/jobs` | List recent jobs |
 | `GET` | `/jobs/{job_id}/image` | Serve the final processed image |
 
@@ -566,6 +596,7 @@ frameart/
   tv/
     controller.py     # Samsung Frame TV: pair, upload, switch, status
     discovery.py      # UPnP/SSDP auto-discovery
+    cleanup.py        # Delete old user-uploaded artworks
 ```
 
 ---

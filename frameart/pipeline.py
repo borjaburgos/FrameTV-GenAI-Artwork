@@ -115,6 +115,31 @@ def _resolve_tv_profile(
     return None
 
 
+def _run_cleanup(
+    profile: TVProfile,
+    keep: int,
+    *,
+    order: str = "oldest_first",
+    include_favourites: bool = False,
+) -> None:
+    """Run TV artwork cleanup, logging but not raising on failure."""
+    from frameart.tv.cleanup import cleanup_artworks
+
+    try:
+        result = cleanup_artworks(
+            profile, keep=keep, order=order, include_favourites=include_favourites,
+        )
+        if result.error:
+            logger.warning("TV cleanup warning: %s", result.error)
+        elif result.deleted:
+            logger.info(
+                "TV cleanup: deleted %d artwork(s), kept %d",
+                len(result.deleted), result.kept,
+            )
+    except Exception as exc:
+        logger.warning("TV cleanup failed (non-fatal): %s", exc)
+
+
 def run_generate(
     settings: Settings,
     prompt: str,
@@ -205,6 +230,9 @@ def run_apply(
     tv_name: str | None = None,
     tv_ip: str | None = None,
     matte: str = "none",
+    cleanup_keep: int | None = None,
+    cleanup_order: str = "oldest_first",
+    cleanup_include_favourites: bool = False,
 ) -> PipelineResult:
     """Upload an existing image to the TV and switch to it.
 
@@ -265,6 +293,14 @@ def run_apply(
         }
         save_metadata(job_dir, result.metadata)
 
+        # Optional cleanup of old artworks on the TV
+        if cleanup_keep is not None:
+            _run_cleanup(
+                profile, cleanup_keep,
+                order=cleanup_order,
+                include_favourites=cleanup_include_favourites,
+            )
+
     except Exception as e:
         result.error = str(e)
         logger.error("Pipeline apply failed: %s", e)
@@ -289,6 +325,9 @@ def run_generate_and_apply(
     matte: str = "none",
     no_upload: bool = False,
     no_switch: bool = False,
+    cleanup_keep: int | None = None,
+    cleanup_order: str = "oldest_first",
+    cleanup_include_favourites: bool = False,
 ) -> PipelineResult:
     """Full pipeline: generate → postprocess → upload → switch display."""
     # Generate + postprocess
@@ -349,5 +388,13 @@ def run_generate_and_apply(
     })
     result.metadata["timings"] = result.timings
     save_metadata(result.job_dir, result.metadata)
+
+    # Optional cleanup of old artworks on the TV
+    if cleanup_keep is not None:
+        _run_cleanup(
+            profile, cleanup_keep,
+            order=cleanup_order,
+            include_favourites=cleanup_include_favourites,
+        )
 
     return result
