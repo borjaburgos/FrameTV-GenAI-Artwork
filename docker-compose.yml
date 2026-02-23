@@ -1,0 +1,52 @@
+services:
+  # One-shot CLI commands: docker compose run --rm frameart <command>
+  frameart:
+    build: .
+    container_name: frameart
+    volumes:
+      - frameart_data:/data/frameart
+      # Mount config if you have one:
+      # - ./config.yaml:/app/config.yaml:ro
+    environment:
+      - FRAMEART_DATA_DIR=/data/frameart
+      # Provider API keys — set these in your .env file or shell:
+      # - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    # Host networking is recommended for Samsung TV discovery/control
+    # on the same subnet. Uncomment if needed:
+    # network_mode: host
+    restart: "no"
+    # Override the entrypoint command as needed:
+    # command: ["generate-and-apply", "--prompt", "a sunset over the ocean", "--tv-ip", "192.168.1.100"]
+
+  # Long-running HTTP API server: docker compose up -d frameart-api
+  frameart-api:
+    build: .
+    container_name: frameart-api
+    command: ["serve", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - frameart_data:/data/frameart
+      # Mount config if you have one:
+      # - ./config.yaml:/app/config.yaml:ro
+    environment:
+      - FRAMEART_DATA_DIR=/data/frameart
+      # Provider API keys — set these in your .env file or shell:
+      # - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    # Host networking is required for Samsung TV WebSocket control.
+    # When using host networking, the "ports" mapping above is ignored
+    # (the server binds directly to the host's port 8000).
+    # network_mode: host
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  frameart_data:
+    driver: local

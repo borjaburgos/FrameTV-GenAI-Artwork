@@ -1,0 +1,57 @@
+# FrameArt configuration example
+# Copy to config.yaml and edit to match your environment.
+
+# Where artifacts, logs, and secrets are stored
+data_dir: /data/frameart
+
+# Default image generation provider: openai | ollama | gemini | anthropic
+default_provider: openai
+# default_model: dall-e-3  # provider-specific model ID
+
+# Default upscaler: none | local_http | remote_http
+default_upscaler: none
+
+# Logging
+log_level: INFO
+# log_file: /data/frameart/logs/frameart.log
+
+# Pipeline defaults
+# default_style: abstract
+auto_aspect_hint: true
+
+# --- TV profiles -------------------------------------------------------------
+tvs:
+  livingroom_frame:
+    ip: "192.168.1.100"
+    port: 8002
+    name: "FrameArt"
+    # token_file: /data/frameart/secrets/livingroom.token
+    ssl: true
+  # bedroom_frame:
+  #   ip: "192.168.1.101"
+
+# --- Provider configurations -------------------------------------------------
+providers:
+  openai:
+    # api_key is read from OPENAI_API_KEY env var (preferred) or set here
+    # api_key: "sk-..."
+    model: "dall-e-3"
+    timeout: 120
+  ollama:
+    base_url: "http://localhost:11434"
+    model: "sdxl"
+    timeout: 300
+  # gemini:
+  #   api_key: "..."
+  #   model: "imagen-3"
+  # anthropic:
+  #   api_key: "..."
+
+# --- Upscaler configurations ------------------------------------------------
+upscalers:
+  local_http:
+    base_url: "http://localhost:7860"
+    timeout: 120
+  # remote_http:
+  #   base_url: "https://api.example.com/upscale"
+  #   api_key: "..."
