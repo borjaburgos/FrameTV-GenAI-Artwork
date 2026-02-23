@@ -502,5 +502,33 @@ def cleanup(ctx, older_than, dry_run):
     click.echo(f"{action} {removed} job(s) older than {older_than} days.")
 
 
+# --- serve (HTTP API) --------------------------------------------------------
+
+
+@main.command()
+@_debug_option
+@_verbose_option
+@click.option("--host", type=str, default="127.0.0.1", help="Bind address (default: 127.0.0.1).")
+@click.option("--port", type=int, default=8000, help="Port (default: 8000).")
+@click.pass_context
+def serve(ctx, host, port):
+    """Start the HTTP API server (requires `pip install frameart[api]`)."""
+    _ensure_logging(ctx)
+
+    try:
+        from frameart.api import run_server
+    except ImportError as e:
+        click.secho(
+            f"Missing API dependencies: {e}\n"
+            "Install with: pip install frameart[api]",
+            fg="red", err=True,
+        )
+        sys.exit(1)
+
+    click.echo(f"Starting FrameArt API server on {host}:{port}")
+    click.echo(f"  Docs: http://{host}:{port}/docs")
+    run_server(host=host, port=port)
+
+
 if __name__ == "__main__":
     main()
