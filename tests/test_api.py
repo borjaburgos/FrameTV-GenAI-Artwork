@@ -307,6 +307,125 @@ class TestTVDiscover:
 
 
 # ---------------------------------------------------------------------------
+# GET /tv/art
+# ---------------------------------------------------------------------------
+
+class TestTVListArt:
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.list_art_deduplicated")
+    def test_returns_deduplicated_list(self, mock_list, mock_settings):
+        settings = MagicMock()
+        settings.tvs = {}
+        mock_settings.return_value = settings
+
+        mock_list.return_value = [
+            {"content_id": "MY_F0001", "is_favourite": True},
+            {"content_id": "MY_F0002", "is_favourite": False},
+        ]
+
+        resp = client.get("/tv/art?tv_ip=192.168.1.100")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 2
+        assert data[0]["content_id"] == "MY_F0001"
+        assert data[0]["is_favourite"] is True
+        assert data[1]["is_favourite"] is False
+
+    @patch("frameart.api._settings")
+    def test_no_tv_returns_400(self, mock_settings):
+        settings = MagicMock()
+        settings.tvs = {}
+        mock_settings.return_value = settings
+
+        resp = client.get("/tv/art")
+        assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# POST /tv/art/delete
+# ---------------------------------------------------------------------------
+
+class TestTVDeleteArt:
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.delete_art")
+    @patch("frameart.tv.controller.list_art_deduplicated")
+    def test_skips_favorites_by_default(self, mock_list, mock_delete, mock_settings):
+        settings = MagicMock()
+        settings.tvs = {}
+        mock_settings.return_value = settings
+
+        mock_list.return_value = [
+            {"content_id": "MY_F0001", "is_favourite": True},
+            {"content_id": "MY_F0002", "is_favourite": False},
+        ]
+        mock_delete.return_value = True
+
+        resp = client.post("/tv/art/delete", json={
+            "content_ids": ["MY_F0001", "MY_F0002"],
+            "tv_ip": "192.168.1.100",
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "MY_F0001" in data["skipped_favorites"]
+        assert "MY_F0002" in data["deleted"]
+        mock_delete.assert_called_once_with(mock_delete.call_args[0][0], ["MY_F0002"])
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.delete_art")
+    @patch("frameart.tv.controller.list_art_deduplicated")
+    def test_include_favorites(self, mock_list, mock_delete, mock_settings):
+        settings = MagicMock()
+        settings.tvs = {}
+        mock_settings.return_value = settings
+
+        mock_list.return_value = [
+            {"content_id": "MY_F0001", "is_favourite": True},
+        ]
+        mock_delete.return_value = True
+
+        resp = client.post("/tv/art/delete", json={
+            "content_ids": ["MY_F0001"],
+            "tv_ip": "192.168.1.100",
+            "include_favorites": True,
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["skipped_favorites"] == []
+        assert "MY_F0001" in data["deleted"]
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.list_art_deduplicated")
+    def test_all_favorites_skipped_returns_empty(self, mock_list, mock_settings):
+        settings = MagicMock()
+        settings.tvs = {}
+        mock_settings.return_value = settings
+
+        mock_list.return_value = [
+            {"content_id": "MY_F0001", "is_favourite": True},
+        ]
+
+        resp = client.post("/tv/art/delete", json={
+            "content_ids": ["MY_F0001"],
+            "tv_ip": "192.168.1.100",
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["deleted"] == []
+        assert data["skipped_favorites"] == ["MY_F0001"]
+
+    @patch("frameart.api._settings")
+    def test_no_tv_returns_400(self, mock_settings):
+        settings = MagicMock()
+        settings.tvs = {}
+        mock_settings.return_value = settings
+
+        resp = client.post("/tv/art/delete", json={
+            "content_ids": ["MY_F0001"],
+        })
+        assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
 # POST /async/generate + GET /jobs/{id}/status
 # ---------------------------------------------------------------------------
 

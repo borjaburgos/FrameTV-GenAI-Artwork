@@ -443,9 +443,35 @@ def switch_art(profile: TVProfile, content_id: str) -> bool:
 
 
 def list_art(profile: TVProfile) -> list[dict[str, Any]]:
-    """List all artworks available on the TV."""
+    """List all artworks available on the TV (raw, includes duplicates across categories)."""
     art = _connect_art(profile)
     return art.available()
+
+
+def list_art_deduplicated(profile: TVProfile) -> list[dict[str, Any]]:
+    """List artworks on the TV, deduplicated with ``is_favourite`` annotated.
+
+    The TV returns each artwork once per category:
+    MY-C0002 = user uploads, MY-C0003 = all, MY-C0004 = favourites.
+    This function deduplicates by ``content_id`` and adds a boolean
+    ``is_favourite`` key based on MY-C0004 membership.
+    """
+    raw = list_art(profile)
+
+    fav_ids: set[str] = set()
+    for item in raw:
+        if item.get("category_id") == "MY-C0004":
+            fav_ids.add(item.get("content_id", ""))
+
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for item in raw:
+        cid = item.get("content_id", "")
+        if cid and cid not in seen:
+            seen.add(cid)
+            unique.append({**item, "is_favourite": cid in fav_ids})
+
+    return unique
 
 
 def get_matte_list(profile: TVProfile) -> list[dict[str, Any]]:
@@ -462,6 +488,30 @@ def get_matte_list(profile: TVProfile) -> list[dict[str, Any]]:
         return result.get("matte_types", [])
     # Fallback for unexpected return types
     return result
+
+
+def delete_art(profile: TVProfile, content_ids: list[str]) -> bool:
+    """Delete artworks from the TV by content ID.
+
+    Parameters
+    ----------
+    profile:
+        TV connection profile.
+    content_ids:
+        List of content IDs to delete (e.g., ``["MY_F0006", "MY_F0007"]``).
+
+    Returns
+    -------
+    True on success, False on failure.
+    """
+    art = _connect_art(profile)
+    try:
+        art.delete_list(content_ids)
+        logger.info("Deleted %d artwork(s): %s", len(content_ids), ", ".join(content_ids))
+        return True
+    except Exception as e:
+        logger.error("Failed to delete artwork(s): %s", e)
+        return False
 
 
 def change_matte(profile: TVProfile, content_id: str, matte_id: str) -> bool:

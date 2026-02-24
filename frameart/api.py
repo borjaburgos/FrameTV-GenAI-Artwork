@@ -19,6 +19,8 @@ Endpoints (async — return immediately, poll for results):
 TV and gallery:
     GET  /tv/status             — check TV connection and art mode
     GET  /tv/discover           — auto-discover Samsung TVs via SSDP
+    GET  /tv/art                — list artworks on TV (deduplicated, with favourites)
+    POST /tv/art/delete         — delete artworks (skips favourites by default)
     GET  /jobs                  — list recent jobs (artifacts on disk)
     GET  /jobs/{job_id}/image   — serve the final processed image
 
@@ -141,6 +143,32 @@ class DiscoveredTVResponse(BaseModel):
     name: str
     model: str
     frame_tv: bool
+
+
+class TVArtItem(BaseModel):
+    """A single artwork on the TV."""
+
+    content_id: str
+    is_favourite: bool = False
+
+
+class DeleteArtRequest(BaseModel):
+    """Request body for deleting artworks from the TV."""
+
+    content_ids: list[str] = Field(..., description="Content IDs to delete.")
+    tv: str | None = Field(None, description="TV profile name from config.")
+    tv_ip: str | None = Field(None, description="TV IP address.")
+    include_favorites: bool = Field(
+        False, description="Also delete favourited artworks (skipped by default)."
+    )
+
+
+class DeleteArtResponse(BaseModel):
+    """Response for TV art deletion."""
+
+    deleted: list[str] = Field(default_factory=list)
+    skipped_favorites: list[str] = Field(default_factory=list)
+    error: str | None = None
 
 
 class HealthResponse(BaseModel):
@@ -319,6 +347,89 @@ def tv_discover(
         DiscoveredTVResponse(ip=tv.ip, name=tv.name, model=tv.model, frame_tv=tv.frame_tv)
         for tv in tvs
     ]
+
+
+# ---------------------------------------------------------------------------
+# Routes — TV art management
+# ---------------------------------------------------------------------------
+
+
+def _resolve_tv_profile(tv: str | None, tv_ip: str | None):
+    """Resolve a TVProfile from query params / request body, or raise 400."""
+    from frameart.config import TVProfile
+
+    settings = _settings()
+    profile = None
+    if tv and tv in settings.tvs:
+        profile = settings.tvs[tv]
+    elif tv_ip:
+        profile = TVProfile(ip=tv_ip)
+    elif len(settings.tvs) == 1:
+        profile = next(iter(settings.tvs.values()))
+
+    if profile is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No TV specified. Pass ?tv=<name> or ?tv_ip=<ip>, "
+            "or configure exactly one TV in config.yaml.",
+        )
+    return profile
+
+
+@app.get("/tv/art", response_model=list[TVArtItem])
+def tv_list_art(
+    tv: str | None = Query(None, description="TV profile name from config."),
+    tv_ip: str | None = Query(None, description="TV IP address."),
+):
+    """List artworks on the Frame TV (deduplicated, with favourite flag)."""
+    from frameart.tv.controller import list_art_deduplicated
+
+    profile = _resolve_tv_profile(tv, tv_ip)
+    artworks = list_art_deduplicated(profile)
+    return [
+        TVArtItem(
+            content_id=a.get("content_id", "unknown"),
+            is_favourite=a.get("is_favourite", False),
+        )
+        for a in artworks
+    ]
+
+
+@app.post("/tv/art/delete", response_model=DeleteArtResponse)
+def tv_delete_art(req: DeleteArtRequest):
+    """Delete artworks from the Frame TV.
+
+    Favourited artworks are skipped by default.  Set ``include_favorites``
+    to ``true`` to delete them as well.
+    """
+    from frameart.tv.controller import delete_art, list_art_deduplicated
+
+    profile = _resolve_tv_profile(req.tv, req.tv_ip)
+    ids = list(req.content_ids)
+    skipped: list[str] = []
+
+    if not req.include_favorites:
+        try:
+            artworks = list_art_deduplicated(profile)
+            fav_ids = {a["content_id"] for a in artworks if a.get("is_favourite")}
+        except Exception:
+            fav_ids = set()
+
+        skipped = [cid for cid in ids if cid in fav_ids]
+        ids = [cid for cid in ids if cid not in fav_ids]
+
+    if not ids:
+        return DeleteArtResponse(deleted=[], skipped_favorites=skipped)
+
+    if delete_art(profile, ids):
+        return DeleteArtResponse(deleted=ids, skipped_favorites=skipped)
+
+    raise HTTPException(
+        status_code=500,
+        detail=DeleteArtResponse(
+            deleted=[], skipped_favorites=skipped, error="Failed to delete artwork(s)."
+        ).model_dump(),
+    )
 
 
 # ---------------------------------------------------------------------------

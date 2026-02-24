@@ -411,7 +411,7 @@ def tv_list_art(ctx, tv_name, tv_ip):
     """List artworks on the Frame TV."""
     _ensure_logging(ctx)
     from frameart.config import TVProfile
-    from frameart.tv.controller import list_art
+    from frameart.tv.controller import list_art_deduplicated
 
     settings = ctx.obj["settings"]
 
@@ -428,13 +428,93 @@ def tv_list_art(ctx, tv_name, tv_ip):
         sys.exit(1)
 
     try:
-        artworks = list_art(profile)
+        artworks = list_art_deduplicated(profile)
         click.echo(f"Found {len(artworks)} artwork(s):")
         for art in artworks:
             cid = art.get("content_id", "unknown")
-            click.echo(f"  {cid}")
+            fav = " \u2665" if art.get("is_favourite") else ""
+            click.echo(f"  {cid}{fav}")
     except Exception as e:
         click.secho(f"Failed to list art: {e}", fg="red", err=True)
+        sys.exit(1)
+
+
+@tv.command("delete-art")
+@_debug_option
+@_verbose_option
+@click.option("--tv", "tv_name", type=str, default=None, help="TV profile name.")
+@click.option("--tv-ip", type=str, default=None, help="TV IP address.")
+@click.option(
+    "--include-favorites",
+    is_flag=True,
+    default=False,
+    help="Also delete favourited artworks (skipped by default).",
+)
+@click.argument("content_ids", nargs=-1, required=True)
+@click.pass_context
+def tv_delete_art(ctx, tv_name, tv_ip, include_favorites, content_ids):
+    """Delete artworks from the Frame TV by content ID.
+
+    Favourited artworks are skipped by default. Pass --include-favorites
+    to delete them as well.
+
+    Pass one or more content IDs (use 'frameart tv list-art' to find them).
+
+    \b
+    Examples:
+      frameart tv delete-art MY_F0006
+      frameart tv delete-art MY_F0006 MY_F0007 MY_F0008
+      frameart tv delete-art --include-favorites MY_F0006
+    """
+    _ensure_logging(ctx)
+    from frameart.config import TVProfile
+    from frameart.tv.controller import delete_art, list_art_deduplicated
+
+    settings = ctx.obj["settings"]
+
+    profile = None
+    if tv_name and tv_name in settings.tvs:
+        profile = settings.tvs[tv_name]
+    elif tv_ip:
+        profile = TVProfile(ip=tv_ip)
+    elif len(settings.tvs) == 1:
+        profile = next(iter(settings.tvs.values()))
+
+    if profile is None:
+        click.secho("No TV specified. Use --tv or --tv-ip.", fg="red", err=True)
+        sys.exit(1)
+
+    ids = list(content_ids)
+
+    # Filter out favourites unless explicitly requested
+    if not include_favorites:
+        try:
+            artworks = list_art_deduplicated(profile)
+            fav_ids = {a["content_id"] for a in artworks if a.get("is_favourite")}
+        except Exception:
+            fav_ids = set()
+
+        skipped = [cid for cid in ids if cid in fav_ids]
+        ids = [cid for cid in ids if cid not in fav_ids]
+
+        if skipped:
+            click.secho(
+                f"Skipping {len(skipped)} favourite(s): {', '.join(skipped)}  "
+                f"(use --include-favorites to delete)",
+                fg="yellow",
+                err=True,
+            )
+
+    if not ids:
+        click.echo("Nothing to delete.")
+        return
+
+    click.echo(f"Deleting {len(ids)} artwork(s) from TV: {', '.join(ids)}")
+
+    if delete_art(profile, ids):
+        click.secho(f"Deleted {len(ids)} artwork(s).", fg="green")
+    else:
+        click.secho("Failed to delete artwork(s).", fg="red", err=True)
         sys.exit(1)
 
 
