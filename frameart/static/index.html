@@ -67,6 +67,8 @@
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .gallery-item .info .meta { font-size: .75rem; color: var(--muted); margin-top: .2rem; }
   .gallery-item .actions { padding: 0 .8rem .6rem; display: flex; gap: .5rem; flex-wrap: wrap; }
+  .gallery-item .select-row { display: flex; align-items: center; gap: .5rem; margin-bottom: .4rem; }
+  .gallery-item .select-row input[type="checkbox"] { width: auto; margin: 0; }
 
   /* --- TV cards --- */
   .tv-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
@@ -176,7 +178,12 @@
 <div class="panel" id="panel-gallery">
   <div class="section-heading">
     <h2>Recent Artwork</h2>
-    <button class="btn btn-secondary" id="btn-refresh-gallery">Refresh</button>
+    <div class="btn-group">
+      <button class="btn btn-secondary" id="btn-refresh-gallery">Refresh</button>
+      <button class="btn btn-secondary" id="btn-gallery-select-all">Select All</button>
+      <button class="btn btn-secondary" id="btn-gallery-clear-selection">Clear</button>
+      <button class="btn btn-danger" id="btn-gallery-delete-selected" disabled>Delete Selected</button>
+    </div>
   </div>
   <div class="gallery" id="gallery-grid"></div>
   <div class="empty" id="gallery-empty" style="display:none;">No artwork generated yet.</div>
@@ -261,6 +268,7 @@
   let knownTVs = [];
   let selectedTVArtIds = new Set();
   let loadedTVArtById = {};
+  let selectedGalleryJobIds = new Set();
 
   function addTVs(tvs, source) {
     for (const tv of tvs) {
@@ -445,9 +453,75 @@
   // =========================================================================
   // Gallery
   // =========================================================================
+  function updateDeleteGalleryButton() {
+    const btn = document.getElementById('btn-gallery-delete-selected');
+    const n = selectedGalleryJobIds.size;
+    btn.disabled = n === 0;
+    btn.textContent = n > 0 ? ('Delete Selected (' + n + ')') : 'Delete Selected';
+  }
+
+  function bindGallerySelectionHandlers() {
+    const items = document.querySelectorAll('.gallery-select-item');
+    items.forEach((item) => {
+      item.addEventListener('change', (e) => {
+        const checkbox = e.target;
+        const jobId = checkbox.dataset.jobId;
+        if (!jobId) return;
+        if (checkbox.checked) selectedGalleryJobIds.add(jobId);
+        else selectedGalleryJobIds.delete(jobId);
+        updateDeleteGalleryButton();
+      });
+    });
+  }
+
+  function setAllGallerySelections(checked) {
+    document.querySelectorAll('.gallery-select-item').forEach((el) => {
+      const jobId = el.dataset.jobId;
+      if (!jobId) return;
+      el.checked = checked;
+      if (checked) selectedGalleryJobIds.add(jobId);
+      else selectedGalleryJobIds.delete(jobId);
+    });
+    updateDeleteGalleryButton();
+  }
+
+  async function deleteSelectedGalleryJobs() {
+    const selectedIds = Array.from(selectedGalleryJobIds);
+    if (!selectedIds.length) return;
+
+    if (!confirm('Delete ' + selectedIds.length + ' selected artwork item(s) from host storage?')) return;
+
+    const btn = document.getElementById('btn-gallery-delete-selected');
+    btn.disabled = true;
+
+    try {
+      const resp = await fetch('/jobs/delete', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ job_ids: selectedIds }),
+      });
+      if (!resp.ok) throw new Error('Server returned ' + resp.status);
+      const data = await resp.json();
+      if (data.failed && Object.keys(data.failed).length) {
+        alert('Some items failed to delete: ' + Object.keys(data.failed).join(', '));
+      }
+      if (data.not_found && data.not_found.length) {
+        alert('Some items were not found: ' + data.not_found.join(', '));
+      }
+      selectedGalleryJobIds = new Set();
+      updateDeleteGalleryButton();
+      await loadGallery();
+    } catch (e) {
+      alert('Failed to delete selected artwork: ' + e.message);
+      updateDeleteGalleryButton();
+    }
+  }
+
   async function loadGallery() {
     const grid = document.getElementById('gallery-grid');
     const empty = document.getElementById('gallery-empty');
+    selectedGalleryJobIds = new Set();
+    updateDeleteGalleryButton();
     try {
       const resp = await fetch('/jobs?limit=50');
       const jobs = await resp.json();
@@ -462,6 +536,10 @@
                onclick="showPreview('${esc(j.job_id)}')"
                onerror="this.style.display='none'">
           <div class="info">
+            <label class="select-row">
+              <input type="checkbox" class="gallery-select-item" data-job-id="${esc(j.job_id)}">
+              <span>Select</span>
+            </label>
             <div class="prompt">${promptText}</div>
             <div class="meta">${esc(j.provider || '')} ${j.content_id ? '&middot; on TV' : ''}</div>
           </div>
@@ -472,10 +550,14 @@
           </div>
         </div>`;
       }).join('');
+      bindGallerySelectionHandlers();
     } catch (e) { grid.innerHTML = '<div class="empty">Failed to load gallery.</div>'; }
   }
 
   document.getElementById('btn-refresh-gallery').addEventListener('click', loadGallery);
+  document.getElementById('btn-gallery-select-all').addEventListener('click', () => setAllGallerySelections(true));
+  document.getElementById('btn-gallery-clear-selection').addEventListener('click', () => setAllGallerySelections(false));
+  document.getElementById('btn-gallery-delete-selected').addEventListener('click', deleteSelectedGalleryJobs);
 
   window.showPreview = function(jobId) {
     const modal = document.getElementById('modal');
