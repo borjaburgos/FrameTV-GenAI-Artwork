@@ -429,10 +429,27 @@ def tv_list_art(ctx, tv_name, tv_ip):
 
     try:
         artworks = list_art(profile)
-        click.echo(f"Found {len(artworks)} artwork(s):")
-        for art in artworks:
+
+        # The TV returns each artwork once per category (MY-C0002 = uploads,
+        # MY-C0003 = all, MY-C0004 = favourites).  Deduplicate by content_id
+        # and detect favourites from MY-C0004 membership.
+        fav_ids: set[str] = set()
+        for item in artworks:
+            if item.get("category_id") == "MY-C0004":
+                fav_ids.add(item.get("content_id", ""))
+
+        seen: set[str] = set()
+        unique: list[dict] = []
+        for item in artworks:
+            cid = item.get("content_id", "unknown")
+            if cid not in seen:
+                seen.add(cid)
+                unique.append(item)
+
+        click.echo(f"Found {len(unique)} artwork(s):")
+        for art in unique:
             cid = art.get("content_id", "unknown")
-            fav = " \u2665" if art.get("is_favourite") == "on" else ""
+            fav = " \u2665" if cid in fav_ids else ""
             click.echo(f"  {cid}{fav}")
     except Exception as e:
         click.secho(f"Failed to list art: {e}", fg="red", err=True)
