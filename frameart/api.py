@@ -19,10 +19,14 @@ Endpoints (async — return immediately, poll for results):
 TV and gallery:
     GET  /tv/status             — check TV connection and art mode
     GET  /tv/discover           — auto-discover Samsung TVs via SSDP
+    GET  /tv/configured         — list pre-configured TVs from config
     GET  /tv/art                — list artworks on TV (deduplicated, with favourites)
     POST /tv/art/delete         — delete artworks (skips favourites by default)
+    POST /tv/art/matte          — change matte on an artwork
+    GET  /tv/mattes             — list matte styles supported by the TV
     GET  /jobs                  — list recent jobs (artifacts on disk)
     GET  /jobs/{job_id}/image   — serve the final processed image
+    POST /jobs/{job_id}/apply   — upload a previously generated job to TV
 
 Misc:
     GET  /                      — web UI
@@ -169,6 +173,23 @@ class DeleteArtResponse(BaseModel):
     deleted: list[str] = Field(default_factory=list)
     skipped_favorites: list[str] = Field(default_factory=list)
     error: str | None = None
+
+
+class ChangeMatteRequest(BaseModel):
+    """Request body for changing the matte on a TV artwork."""
+
+    content_id: str = Field(..., description="Content ID of the artwork.")
+    matte_id: str = Field(..., description="Matte ID to apply (see GET /tv/mattes).")
+    tv: str | None = Field(None, description="TV profile name from config.")
+    tv_ip: str | None = Field(None, description="TV IP address.")
+
+
+class ConfiguredTVResponse(BaseModel):
+    """A pre-configured TV from config.yaml."""
+
+    name: str
+    ip: str
+    port: int = 8002
 
 
 class HealthResponse(BaseModel):
@@ -432,6 +453,39 @@ def tv_delete_art(req: DeleteArtRequest):
     )
 
 
+@app.post("/tv/art/matte")
+def tv_change_matte(req: ChangeMatteRequest):
+    """Change the matte/frame style on an artwork already on the TV."""
+    from frameart.tv.controller import change_matte
+
+    profile = _resolve_tv_profile(req.tv, req.tv_ip)
+    if change_matte(profile, req.content_id, req.matte_id):
+        return {"ok": True, "content_id": req.content_id, "matte_id": req.matte_id}
+    raise HTTPException(status_code=500, detail="Failed to change matte.")
+
+
+@app.get("/tv/mattes")
+def tv_mattes(
+    tv: str | None = Query(None, description="TV profile name from config."),
+    tv_ip: str | None = Query(None, description="TV IP address."),
+):
+    """List matte styles supported by the TV."""
+    from frameart.tv.controller import get_matte_list
+
+    profile = _resolve_tv_profile(tv, tv_ip)
+    return get_matte_list(profile)
+
+
+@app.get("/tv/configured", response_model=list[ConfiguredTVResponse])
+def tv_configured():
+    """List TVs pre-configured in config.yaml."""
+    settings = _settings()
+    return [
+        ConfiguredTVResponse(name=name, ip=profile.ip, port=profile.port)
+        for name, profile in settings.tvs.items()
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Routes — artifact-based jobs
 # ---------------------------------------------------------------------------
@@ -476,6 +530,41 @@ def get_job_image(job_id: str):
     if not matches:
         raise HTTPException(status_code=404, detail=f"No image found for job {job_id}")
     return FileResponse(matches[0], media_type="image/png")
+
+
+class JobApplyRequest(BaseModel):
+    """Request body for uploading a previously generated job's image to a TV."""
+
+    tv: str | None = Field(None, description="TV profile name from config.")
+    tv_ip: str | None = Field(None, description="TV IP address.")
+    matte: str = Field(
+        "shadowbox_polar",
+        description="Matte style (e.g., shadowbox_polar, shadowbox_noir, none).",
+    )
+
+
+@app.post("/jobs/{job_id}/apply", response_model=JobResponse)
+def apply_job_to_tv(job_id: str, req: JobApplyRequest):
+    """Upload a previously generated job's image to a TV."""
+    from frameart.pipeline import run_apply
+
+    settings = _settings()
+    artifacts_dir = settings.data_dir / "artifacts"
+    matches = list(artifacts_dir.rglob(f"{job_id}/final.png"))
+    if not matches:
+        raise HTTPException(status_code=404, detail=f"No image found for job {job_id}")
+
+    result = run_apply(
+        settings,
+        str(matches[0]),
+        tv_name=req.tv,
+        tv_ip=req.tv_ip,
+        matte=req.matte,
+    )
+    resp = _pipeline_result_to_response(result)
+    if result.error:
+        raise HTTPException(status_code=500, detail=resp.model_dump())
+    return resp
 
 
 # ---------------------------------------------------------------------------
