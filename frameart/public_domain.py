@@ -325,6 +325,51 @@ def _rijks_fetch_object(client: httpx.Client, artwork_id: str) -> dict[str, Any]
     return data if isinstance(data, dict) else {}
 
 
+def _rijks_search_candidates(
+    client: httpx.Client,
+    query: str,
+    max_candidates: int,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Search Rijks by supported fields and return unique object IDs + summaries."""
+    seen: set[str] = set()
+    candidates: list[tuple[str, dict[str, Any]]] = []
+
+    for field in ("title", "creator", "description", "type"):
+        resp = client.get(
+            RIJKS_SEARCH_API_BASE,
+            params={
+                field: query,
+                "imageAvailable": "true",
+            },
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        items = payload.get("orderedItems") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            continue
+
+        for raw_item in items:
+            if isinstance(raw_item, dict):
+                summary = raw_item
+                raw_id = raw_item.get("id")
+            elif isinstance(raw_item, str):
+                summary = {}
+                raw_id = raw_item
+            else:
+                continue
+
+            artwork_id = _rijks_artwork_id(raw_id)
+            if not artwork_id or artwork_id in seen:
+                continue
+
+            seen.add(artwork_id)
+            candidates.append((artwork_id, summary))
+            if len(candidates) >= max_candidates:
+                return candidates
+
+    return candidates
+
+
 def search_artworks(source: str, query: str, limit: int = 20) -> list[dict[str, Any]]:
     """Search public-domain artworks for a source and query."""
     q = query.strip()
@@ -396,31 +441,14 @@ def search_artworks(source: str, query: str, limit: int = 20) -> list[dict[str, 
             return [item for item in items if item is not None][:limit]
 
         # Rijksmuseum Data Services (keyless)
-        resp = client.get(
-            RIJKS_SEARCH_API_BASE,
-            params={
-                "query": q,
-                "imageAvailable": "true",
-                "pageSize": min(max(limit * 4, 20), 100),
-            },
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-        data = payload.get("results") or payload.get("items") or []
+        data = _rijks_search_candidates(client, q, max(limit * 4, 40))
         results: list[dict[str, Any]] = []
-        for obj in data:
-            if not isinstance(obj, dict):
-                continue
-            if obj.get("imageAvailable") is False:
-                continue
-            artwork_id = _rijks_artwork_id(obj.get("id"))
-            if not artwork_id:
-                continue
+        for artwork_id, summary in data:
             try:
                 detail = _rijks_fetch_object(client, artwork_id)
             except Exception:
                 continue
-            item = _rijks_object_to_item(artwork_id, obj, detail)
+            item = _rijks_object_to_item(artwork_id, summary, detail)
             if not item:
                 continue
             results.append(item)
