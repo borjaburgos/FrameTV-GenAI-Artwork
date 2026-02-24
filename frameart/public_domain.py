@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 from pathlib import Path
 from typing import Any
@@ -12,7 +11,8 @@ import httpx
 MET_API_BASE = "https://collectionapi.metmuseum.org/public/collection/v1"
 AIC_API_BASE = "https://api.artic.edu/api/v1"
 CMA_API_BASE = "https://openaccess-api.clevelandart.org/api"
-RIJKS_API_BASE = "https://www.rijksmuseum.nl/api/en/collection"
+RIJKS_SEARCH_API_BASE = "https://data.rijksmuseum.nl/search/collection"
+RIJKS_ID_BASE = "https://id.rijksmuseum.nl"
 
 
 def _http_client() -> httpx.Client:
@@ -29,15 +29,6 @@ def _http_client() -> httpx.Client:
 
 def _safe_filename(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "_", value).strip("._") or "item"
-
-
-def _rijks_api_key() -> str:
-    key = os.environ.get("FRAMEART_RIJKS_API_KEY") or os.environ.get("RIJKS_API_KEY")
-    if key:
-        return key
-    raise ValueError(
-        "Rijksmuseum API key not configured. Set FRAMEART_RIJKS_API_KEY (or RIJKS_API_KEY)."
-    )
 
 
 def _met_object_to_item(obj: dict[str, Any]) -> dict[str, Any] | None:
@@ -173,48 +164,111 @@ def _cma_object_to_item(obj: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def _rijks_image_urls(obj: dict[str, Any]) -> tuple[str | None, str | None]:
-    web_image = obj.get("webImage") if isinstance(obj.get("webImage"), dict) else {}
-    header_image = obj.get("headerImage") if isinstance(obj.get("headerImage"), dict) else {}
-    image_url = web_image.get("url") if isinstance(web_image.get("url"), str) else None
-    thumb_url = header_image.get("url") if isinstance(header_image.get("url"), str) else None
-    if image_url and not thumb_url:
-        thumb_url = image_url
-    return image_url, thumb_url
-
-
-def _rijks_object_to_item(obj: dict[str, Any]) -> dict[str, Any] | None:
-    artwork_id = str(obj.get("objectNumber", "")).strip()
-    if not artwork_id:
+def _rijks_artwork_id(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
         return None
+    if raw.startswith("http://") or raw.startswith("https://"):
+        raw = raw.rstrip("/").split("/")[-1]
+    return raw or None
 
-    image_url, thumb_url = _rijks_image_urls(obj)
+
+def _rijks_id_url(artwork_id: str) -> str:
+    return f"{RIJKS_ID_BASE}/{artwork_id}"
+
+
+def _collect_strings(value: Any, out: list[str]) -> None:
+    if isinstance(value, str):
+        out.append(value)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _collect_strings(item, out)
+        return
+    if isinstance(value, dict):
+        for nested in value.values():
+            _collect_strings(nested, out)
+
+
+def _is_image_url(url: str) -> bool:
+    lowered = url.lower()
+    if not (lowered.startswith("http://") or lowered.startswith("https://")):
+        return False
+    return any(
+        token in lowered
+        for token in (".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".jp2", "/iiif/")
+    )
+
+
+def _rijks_image_urls(linked_art_obj: dict[str, Any]) -> tuple[str | None, str | None]:
+    strings: list[str] = []
+    _collect_strings(linked_art_obj, strings)
+    image_urls: list[str] = []
+    seen: set[str] = set()
+    for value in strings:
+        if value in seen:
+            continue
+        seen.add(value)
+        if _is_image_url(value):
+            image_urls.append(value)
+    if not image_urls:
+        return None, None
+    return image_urls[0], image_urls[0]
+
+
+def _rijks_artists(summary_obj: dict[str, Any]) -> str | None:
+    artists = summary_obj.get("artists")
+    if isinstance(artists, list):
+        names: list[str] = []
+        for artist in artists:
+            if isinstance(artist, str) and artist:
+                names.append(artist)
+            elif isinstance(artist, dict):
+                name = artist.get("name")
+                if isinstance(name, str) and name:
+                    names.append(name)
+        if names:
+            return ", ".join(dict.fromkeys(names))
+    return None
+
+
+def _rijks_date(summary_obj: dict[str, Any]) -> str | None:
+    date = summary_obj.get("dating")
+    if isinstance(date, str) and date:
+        return date
+    if isinstance(date, dict):
+        for key in ("label", "name", "period", "year"):
+            value = date.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def _rijks_object_to_item(
+    artwork_id: str,
+    summary_obj: dict[str, Any],
+    linked_art_obj: dict[str, Any],
+) -> dict[str, Any] | None:
+    image_url, thumb_url = _rijks_image_urls(linked_art_obj)
     if not image_url:
         return None
 
-    principal = obj.get("principalMaker")
-    if not isinstance(principal, str) or not principal:
-        principal = obj.get("principalOrFirstMaker")
-    artist = principal if isinstance(principal, str) and principal else None
+    title = summary_obj.get("title")
+    if not isinstance(title, str) or not title:
+        title = linked_art_obj.get("_label")
+    if not isinstance(title, str) or not title:
+        title = f"Rijksmuseum Artwork {artwork_id}"
 
-    dating = obj.get("dating") if isinstance(obj.get("dating"), dict) else {}
-    date = dating.get("presentingDate")
-    if not isinstance(date, str) or not date:
-        date = obj.get("longTitle")
-    if not isinstance(date, str) or not date:
-        date = None
-
-    links = obj.get("links") if isinstance(obj.get("links"), dict) else {}
-    source_url = links.get("web")
+    source_url = linked_art_obj.get("id")
     if not isinstance(source_url, str) or not source_url:
-        source_url = f"https://www.rijksmuseum.nl/en/collection/{artwork_id}"
+        source_url = _rijks_id_url(artwork_id)
 
     return {
         "source": "rijks",
         "artwork_id": artwork_id,
-        "title": obj.get("title") or f"Rijksmuseum Artwork {artwork_id}",
-        "artist": artist,
-        "date": date,
+        "title": title,
+        "artist": _rijks_artists(summary_obj),
+        "date": _rijks_date(summary_obj),
         "image_url": image_url,
         "thumbnail_url": thumb_url,
         "license": "Public Domain",
@@ -255,10 +309,20 @@ def _cma_fetch_object(client: httpx.Client, artwork_id: str) -> dict[str, Any]:
 
 
 def _rijks_fetch_object(client: httpx.Client, artwork_id: str) -> dict[str, Any]:
-    key = _rijks_api_key()
-    resp = client.get(f"{RIJKS_API_BASE}/{artwork_id}", params={"key": key})
+    url = _rijks_id_url(artwork_id)
+    resp = client.get(url, headers={"Accept": "application/ld+json"})
     resp.raise_for_status()
-    return resp.json().get("artObject", {})
+    try:
+        data = resp.json()
+    except ValueError:
+        fallback = client.get(
+            url,
+            params={"_profile": "la", "_mediatype": "application/ld+json"},
+            headers={"Accept": "application/ld+json"},
+        )
+        fallback.raise_for_status()
+        data = fallback.json()
+    return data if isinstance(data, dict) else {}
 
 
 def search_artworks(source: str, query: str, limit: int = 20) -> list[dict[str, Any]]:
@@ -331,22 +395,38 @@ def search_artworks(source: str, query: str, limit: int = 20) -> list[dict[str, 
             items = [_cma_object_to_item(obj) for obj in data if isinstance(obj, dict)]
             return [item for item in items if item is not None][:limit]
 
-        # Rijksmuseum
-        key = _rijks_api_key()
+        # Rijksmuseum Data Services (keyless)
         resp = client.get(
-            RIJKS_API_BASE,
+            RIJKS_SEARCH_API_BASE,
             params={
-                "key": key,
-                "q": q,
-                "imgonly": "True",
-                "ps": min(max(limit, 1), 100),
-                "s": "relevance",
+                "query": q,
+                "imageAvailable": "true",
+                "pageSize": min(max(limit * 4, 20), 100),
             },
         )
         resp.raise_for_status()
-        data = resp.json().get("artObjects") or []
-        items = [_rijks_object_to_item(obj) for obj in data if isinstance(obj, dict)]
-        return [item for item in items if item is not None][:limit]
+        payload = resp.json()
+        data = payload.get("results") or payload.get("items") or []
+        results: list[dict[str, Any]] = []
+        for obj in data:
+            if not isinstance(obj, dict):
+                continue
+            if obj.get("imageAvailable") is False:
+                continue
+            artwork_id = _rijks_artwork_id(obj.get("id"))
+            if not artwork_id:
+                continue
+            try:
+                detail = _rijks_fetch_object(client, artwork_id)
+            except Exception:
+                continue
+            item = _rijks_object_to_item(artwork_id, obj, detail)
+            if not item:
+                continue
+            results.append(item)
+            if len(results) >= limit:
+                break
+        return results
 
 
 def get_artwork(source: str, artwork_id: str) -> dict[str, Any]:
@@ -366,8 +446,11 @@ def get_artwork(source: str, artwork_id: str) -> dict[str, Any]:
             obj = _cma_fetch_object(client, artwork_id)
             item = _cma_object_to_item(obj)
         else:
-            obj = _rijks_fetch_object(client, artwork_id)
-            item = _rijks_object_to_item(obj)
+            normalized_id = _rijks_artwork_id(artwork_id)
+            if not normalized_id:
+                raise ValueError("Invalid Rijksmuseum artwork ID.")
+            obj = _rijks_fetch_object(client, normalized_id)
+            item = _rijks_object_to_item(normalized_id, {}, obj)
 
     if not item:
         raise ValueError("Artwork is unavailable or not public domain.")
