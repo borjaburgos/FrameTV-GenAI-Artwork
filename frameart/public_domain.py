@@ -200,9 +200,11 @@ def _is_image_url(url: str) -> bool:
     )
 
 
-def _rijks_image_urls(linked_art_obj: dict[str, Any]) -> tuple[str | None, str | None]:
+def _rijks_image_urls(*sources: dict[str, Any]) -> tuple[str | None, str | None]:
     strings: list[str] = []
-    _collect_strings(linked_art_obj, strings)
+    for source in sources:
+        if isinstance(source, dict):
+            _collect_strings(source, strings)
     image_urls: list[str] = []
     seen: set[str] = set()
     for value in strings:
@@ -249,7 +251,7 @@ def _rijks_object_to_item(
     summary_obj: dict[str, Any],
     linked_art_obj: dict[str, Any],
 ) -> dict[str, Any] | None:
-    image_url, thumb_url = _rijks_image_urls(linked_art_obj)
+    image_url, thumb_url = _rijks_image_urls(linked_art_obj, summary_obj)
     if not image_url:
         return None
 
@@ -333,25 +335,41 @@ def _rijks_search_candidates(
     """Search Rijks by supported fields and return unique object IDs + summaries."""
     seen: set[str] = set()
     candidates: list[tuple[str, dict[str, Any]]] = []
+    last_error: Exception | None = None
+    query_variants = [
+        {"query": query, "imageAvailable": "true"},
+        {"title": query, "imageAvailable": "true"},
+        {"creator": query, "imageAvailable": "true"},
+        {"description": query, "imageAvailable": "true"},
+        {"type": query, "imageAvailable": "true"},
+        {"q": query, "imageAvailable": "true"},
+    ]
 
-    for field in ("title", "creator", "description", "type"):
-        resp = client.get(
-            RIJKS_SEARCH_API_BASE,
-            params={
-                field: query,
-                "imageAvailable": "true",
-            },
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-        items = payload.get("orderedItems") if isinstance(payload, dict) else None
-        if not isinstance(items, list):
+    for params in query_variants:
+        try:
+            resp = client.get(RIJKS_SEARCH_API_BASE, params=params)
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as exc:
+            last_error = exc
             continue
+
+        items: list[Any] = []
+        if isinstance(payload, dict):
+            ordered = payload.get("orderedItems")
+            results = payload.get("results")
+            generic_items = payload.get("items")
+            if isinstance(ordered, list):
+                items = ordered
+            elif isinstance(results, list):
+                items = results
+            elif isinstance(generic_items, list):
+                items = generic_items
 
         for raw_item in items:
             if isinstance(raw_item, dict):
                 summary = raw_item
-                raw_id = raw_item.get("id")
+                raw_id = raw_item.get("id") or raw_item.get("@id")
             elif isinstance(raw_item, str):
                 summary = {}
                 raw_id = raw_item
@@ -367,6 +385,8 @@ def _rijks_search_candidates(
             if len(candidates) >= max_candidates:
                 return candidates
 
+    if not candidates and last_error:
+        raise last_error
     return candidates
 
 
@@ -444,10 +464,11 @@ def search_artworks(source: str, query: str, limit: int = 20) -> list[dict[str, 
         data = _rijks_search_candidates(client, q, max(limit * 4, 40))
         results: list[dict[str, Any]] = []
         for artwork_id, summary in data:
+            detail: dict[str, Any] = {}
             try:
                 detail = _rijks_fetch_object(client, artwork_id)
             except Exception:
-                continue
+                detail = {}
             item = _rijks_object_to_item(artwork_id, summary, detail)
             if not item:
                 continue
