@@ -6,7 +6,8 @@
 <title>FrameArt</title>
 <style>
   :root { --bg: #111; --surface: #1a1a1a; --border: #333; --text: #e0e0e0;
-          --muted: #888; --accent: #6c8; --accent2: #4af; --err: #e55; }
+          --muted: #888; --accent: #6c8; --accent2: #4af; --err: #e55;
+          --warn: #eb4; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
          background: var(--bg); color: var(--text); min-height: 100vh; }
@@ -41,6 +42,8 @@
   .btn:hover { opacity: .85; }
   .btn:disabled { opacity: .4; cursor: not-allowed; }
   .btn-secondary { background: var(--border); color: var(--text); }
+  .btn-small { padding: .4rem .8rem; font-size: .8rem; }
+  .btn-danger { background: var(--err); color: #fff; }
 
   /* --- Status / results --- */
   .status-bar { margin-top: 1rem; padding: .8rem 1rem; border-radius: 6px;
@@ -56,12 +59,14 @@
   .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
              gap: 1rem; }
   .gallery-item { background: var(--surface); border-radius: 8px; overflow: hidden;
-                  border: 1px solid var(--border); cursor: pointer; }
-  .gallery-item img { width: 100%; aspect-ratio: 16/9; object-fit: cover; display: block; }
+                  border: 1px solid var(--border); }
+  .gallery-item img { width: 100%; aspect-ratio: 16/9; object-fit: cover; display: block;
+                      cursor: pointer; }
   .gallery-item .info { padding: .6rem .8rem; }
   .gallery-item .info .prompt { font-size: .85rem; color: var(--text);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .gallery-item .info .meta { font-size: .75rem; color: var(--muted); margin-top: .2rem; }
+  .gallery-item .actions { padding: 0 .8rem .6rem; display: flex; gap: .5rem; flex-wrap: wrap; }
 
   /* --- TV cards --- */
   .tv-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
@@ -74,14 +79,46 @@
            font-weight: 600; }
   .badge-frame { background: rgba(102,204,136,.15); color: var(--accent); }
   .badge-samsung { background: rgba(68,170,255,.15); color: var(--accent2); }
+  .badge-config { background: rgba(255,255,255,.1); color: var(--muted); }
 
   .empty { text-align: center; color: var(--muted); padding: 3rem 1rem; }
 
-  /* --- Preview modal --- */
+  /* --- TV Art grid --- */
+  .tv-art-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+                 gap: .8rem; margin-top: 1rem; }
+  .tv-art-item { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+                 padding: .8rem; display: flex; flex-direction: column; gap: .5rem; }
+  .tv-art-item .art-select-row { display: flex; align-items: center; gap: .5rem; }
+  .tv-art-item .art-select-row input[type="checkbox"] { width: auto; margin: 0; }
+  .tv-art-item .art-thumb-wrap { width: 100%; aspect-ratio: 16/9; border-radius: 6px;
+                                 overflow: hidden; background: #121212; border: 1px solid var(--border);
+                                 position: relative; }
+  .tv-art-item .art-thumb { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .tv-art-item .art-thumb-fallback { position: absolute; inset: 0; display: none; align-items: center;
+                                     justify-content: center; color: var(--muted); font-size: .8rem; }
+  .tv-art-item .art-id { font-family: monospace; font-size: .85rem; }
+  .tv-art-item .art-fav { color: var(--warn); font-size: .8rem; }
+  .tv-art-item .art-actions { display: flex; gap: .4rem; flex-wrap: wrap; }
+
+  /* --- Matte modal --- */
   .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.85);
                    z-index: 100; justify-content: center; align-items: center; }
   .modal-overlay.visible { display: flex; }
   .modal-overlay img { max-width: 95vw; max-height: 90vh; border-radius: 8px; }
+  .modal-dialog { background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+                  padding: 1.5rem; min-width: 320px; max-width: 90vw; }
+  .modal-dialog h3 { margin-bottom: 1rem; font-size: 1.1rem; }
+  .modal-dialog .modal-actions { display: flex; gap: .5rem; justify-content: flex-end;
+                                 margin-top: 1rem; }
+
+  /* --- Section heading --- */
+  .section-heading { display: flex; justify-content: space-between; align-items: center;
+                     margin-bottom: 1rem; }
+  .section-heading h2 { font-size: 1.1rem; }
+  .section-heading .btn-group { display: flex; gap: .5rem; }
+
+  /* --- TV Art section within TVs tab --- */
+  .tv-art-section { margin-top: 2rem; padding-top: 1.5rem; border-top: 1px solid var(--border); }
 </style>
 </head>
 <body>
@@ -137,8 +174,8 @@
 
 <!-- ===== Gallery ===== -->
 <div class="panel" id="panel-gallery">
-  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
-    <h2 style="font-size:1.1rem;">Recent Artwork</h2>
+  <div class="section-heading">
+    <h2>Recent Artwork</h2>
     <button class="btn btn-secondary" id="btn-refresh-gallery">Refresh</button>
   </div>
   <div class="gallery" id="gallery-grid"></div>
@@ -147,23 +184,155 @@
 
 <!-- ===== TVs ===== -->
 <div class="panel" id="panel-tvs">
-  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
-    <h2 style="font-size:1.1rem;">Discovered TVs</h2>
+  <div class="section-heading">
+    <h2>TVs</h2>
     <button class="btn btn-secondary" id="btn-discover">Scan Network</button>
   </div>
   <div id="tv-list"></div>
-  <div class="empty" id="tv-empty">Click "Scan Network" to find Samsung TVs on your LAN.</div>
+  <div class="empty" id="tv-empty">Loading configured TVs...</div>
+
+  <!-- TV Art sub-section -->
+  <div class="tv-art-section" id="tv-art-section" style="display:none;">
+    <div class="section-heading">
+      <h2>Art on TV</h2>
+      <div class="btn-group">
+        <select id="tv-art-select" style="width:auto; margin-bottom:0;"></select>
+        <button class="btn btn-secondary btn-small" id="btn-load-art">Load Art</button>
+        <button class="btn btn-danger btn-small" id="btn-delete-selected" disabled>Delete Selected</button>
+      </div>
+    </div>
+    <div class="tv-art-grid" id="tv-art-grid"></div>
+    <div class="empty" id="tv-art-empty" style="display:none;">Select a TV and click "Load Art".</div>
+  </div>
 </div>
 </div>
 
-<!-- Preview modal -->
+<!-- Preview modal (for gallery images) -->
 <div class="modal-overlay" id="modal">
   <img id="modal-img" src="">
 </div>
 
+<!-- Matte modal -->
+<div class="modal-overlay" id="matte-modal">
+  <div class="modal-dialog">
+    <h3>Change Matte</h3>
+    <p style="font-size:.85rem; color:var(--muted); margin-bottom:.8rem;">
+      Artwork: <strong id="matte-content-id"></strong>
+    </p>
+    <label for="matte-select">Matte Style</label>
+    <select id="matte-select"><option value="">Loading...</option></select>
+    <div class="modal-actions">
+      <button class="btn btn-secondary btn-small" id="btn-matte-cancel">Cancel</button>
+      <button class="btn btn-small" id="btn-matte-apply">Apply</button>
+    </div>
+  </div>
+</div>
+
+<!-- Upload-to-TV modal (for gallery items) -->
+<div class="modal-overlay" id="upload-modal">
+  <div class="modal-dialog">
+    <h3>Upload to TV</h3>
+    <p style="font-size:.85rem; color:var(--muted); margin-bottom:.8rem;">
+      Job: <strong id="upload-job-id"></strong>
+    </p>
+    <label for="upload-tv-select">TV</label>
+    <select id="upload-tv-select"></select>
+    <label for="upload-matte-select">Matte Style</label>
+    <select id="upload-matte-select">
+      <option value="none">none (default)</option>
+      <option value="shadowbox_polar">shadowbox_polar</option>
+    </select>
+    <div class="modal-actions">
+      <button class="btn btn-secondary btn-small" id="btn-upload-cancel">Cancel</button>
+      <button class="btn btn-small" id="btn-upload-apply">Upload</button>
+    </div>
+    <div class="status-bar" id="upload-status" style="margin-top:.8rem;">
+      <div class="value" id="upload-status-text"></div>
+    </div>
+  </div>
+</div>
+
 <script>
 (function() {
-  // --- Tabs ---
+  // =========================================================================
+  // State: known TVs (merged from configured + discovered)
+  // =========================================================================
+  // Each entry: { ip, name, source ('config'|'discovered'), model?, frame_tv? }
+  let knownTVs = [];
+  let selectedTVArtIds = new Set();
+  let loadedTVArtById = {};
+
+  function addTVs(tvs, source) {
+    for (const tv of tvs) {
+      if (!knownTVs.some(k => k.ip === tv.ip)) {
+        knownTVs.push({ ...tv, source });
+      }
+    }
+    refreshTVSelects();
+    renderTVList();
+  }
+
+  function refreshTVSelects() {
+    // Update all TV <select> elements throughout the UI
+    const selectors = ['tv-select', 'tv-art-select', 'upload-tv-select'];
+    for (const id of selectors) {
+      const sel = document.getElementById(id);
+      if (!sel) continue;
+      const prev = sel.value;
+      if (id === 'tv-select') {
+        sel.innerHTML = '<option value="">Generate only (no TV)</option>';
+      } else {
+        sel.innerHTML = '';
+      }
+      for (const tv of knownTVs) {
+        const opt = document.createElement('option');
+        opt.value = tv.ip;
+        const label = tv.name + ' (' + tv.ip + ')';
+        opt.textContent = label;
+        sel.appendChild(opt);
+      }
+      // Restore previous selection if still valid
+      if (prev && [...sel.options].some(o => o.value === prev)) {
+        sel.value = prev;
+      }
+    }
+    // Show the TV art section once we have TVs
+    const artSection = document.getElementById('tv-art-section');
+    if (knownTVs.length > 0) artSection.style.display = 'block';
+  }
+
+  function renderTVList() {
+    const list = document.getElementById('tv-list');
+    const empty = document.getElementById('tv-empty');
+    if (!knownTVs.length) {
+      list.innerHTML = '';
+      empty.textContent = 'No TVs found. Click "Scan Network" or configure TVs in config.yaml.';
+      empty.style.display = 'block';
+      return;
+    }
+    empty.style.display = 'none';
+    list.innerHTML = knownTVs.map(t => {
+      let badgeClass = 'badge-config';
+      let badgeText = 'Configured';
+      if (t.source === 'discovered') {
+        badgeClass = t.frame_tv ? 'badge-frame' : 'badge-samsung';
+        badgeText = t.frame_tv ? 'Frame TV' : 'Samsung TV';
+      }
+      const detail = t.model ? (t.model + ' &middot; ' + t.ip) : t.ip;
+      return `
+        <div class="tv-card">
+          <div class="tv-info">
+            <div class="tv-name">${esc(t.name)}</div>
+            <div class="tv-detail">${detail}</div>
+          </div>
+          <span class="badge ${badgeClass}">${badgeText}</span>
+        </div>`;
+    }).join('');
+  }
+
+  // =========================================================================
+  // Tabs
+  // =========================================================================
   const tabs = document.querySelectorAll('.tabs button');
   const panels = document.querySelectorAll('.panel');
   tabs.forEach(btn => {
@@ -176,17 +345,31 @@
     });
   });
 
-  // --- Load styles ---
+  // =========================================================================
+  // Startup: load styles + configured TVs in parallel
+  // =========================================================================
   fetch('/styles').then(r => r.json()).then(styles => {
     const sel = document.getElementById('style');
-    for (const [key, desc] of Object.entries(styles)) {
+    for (const [key] of Object.entries(styles)) {
       const opt = document.createElement('option');
       opt.value = key; opt.textContent = key.replace(/_/g, ' ');
       sel.appendChild(opt);
     }
   }).catch(() => {});
 
-  // --- Status helpers ---
+  // Load pre-configured TVs on startup
+  fetch('/tv/configured').then(r => r.json()).then(configured => {
+    addTVs(configured.map(c => ({
+      ip: c.ip, name: c.name, model: null, frame_tv: true,
+    })), 'config');
+  }).catch(() => {
+    document.getElementById('tv-empty').textContent =
+      'No configured TVs. Click "Scan Network" to find Samsung TVs.';
+  });
+
+  // =========================================================================
+  // Status helpers
+  // =========================================================================
   const statusBar = document.getElementById('gen-status');
   const statusText = document.getElementById('gen-status-text');
   function showStatus(msg, cls) {
@@ -194,7 +377,9 @@
     statusText.textContent = msg;
   }
 
-  // --- Generate ---
+  // =========================================================================
+  // Generate
+  // =========================================================================
   const btnGen = document.getElementById('btn-generate');
   btnGen.addEventListener('click', async () => {
     const prompt = document.getElementById('prompt').value.trim();
@@ -229,14 +414,14 @@
   });
 
   function pollJob(jobId) {
-    showStatus('Job ' + jobId + ' — running...');
+    showStatus('Job ' + jobId + ' \u2014 running...');
     const interval = setInterval(async () => {
       try {
         const resp = await fetch('/jobs/' + jobId + '/status');
         if (!resp.ok) { clearInterval(interval); showStatus('Lost track of job.', 'error'); btnGen.disabled = false; return; }
         const data = await resp.json();
         if (data.status === 'pending' || data.status === 'running') {
-          showStatus('Job ' + jobId + ' — ' + data.status + '...');
+          showStatus('Job ' + jobId + ' \u2014 ' + data.status + '...');
           return;
         }
         clearInterval(interval);
@@ -257,7 +442,9 @@
     }, 2000);
   }
 
-  // --- Gallery ---
+  // =========================================================================
+  // Gallery
+  // =========================================================================
   async function loadGallery() {
     const grid = document.getElementById('gallery-grid');
     const empty = document.getElementById('gallery-empty');
@@ -266,18 +453,29 @@
       const jobs = await resp.json();
       if (!jobs.length) { grid.innerHTML = ''; empty.style.display = 'block'; return; }
       empty.style.display = 'none';
-      grid.innerHTML = jobs.map(j => `
-        <div class="gallery-item" onclick="showPreview('${j.job_id}')">
-          <img src="/jobs/${j.job_id}/image" alt="${(j.prompt || '').substring(0,40)}" loading="lazy"
+      grid.innerHTML = jobs.map(j => {
+        const promptText = esc(j.prompt || j.job_id);
+        const promptShort = esc((j.prompt || '').substring(0, 40));
+        return `
+        <div class="gallery-item">
+          <img src="/jobs/${esc(j.job_id)}/image" alt="${promptShort}" loading="lazy"
+               onclick="showPreview('${esc(j.job_id)}')"
                onerror="this.style.display='none'">
           <div class="info">
-            <div class="prompt">${j.prompt || j.job_id}</div>
-            <div class="meta">${j.provider || ''} ${j.content_id ? '&middot; on TV' : ''}</div>
+            <div class="prompt">${promptText}</div>
+            <div class="meta">${esc(j.provider || '')} ${j.content_id ? '&middot; on TV' : ''}</div>
           </div>
-        </div>
-      `).join('');
+          <div class="actions">
+            <button class="btn btn-secondary btn-small"
+                    onclick="openUploadModal('${esc(j.job_id)}', '${esc(j.prompt || j.job_id)}')">
+              Upload to TV</button>
+          </div>
+        </div>`;
+      }).join('');
     } catch (e) { grid.innerHTML = '<div class="empty">Failed to load gallery.</div>'; }
   }
+
+  document.getElementById('btn-refresh-gallery').addEventListener('click', loadGallery);
 
   window.showPreview = function(jobId) {
     const modal = document.getElementById('modal');
@@ -288,7 +486,81 @@
     this.classList.remove('visible');
   });
 
-  // --- TV Discovery ---
+  // =========================================================================
+  // Upload-to-TV modal (from gallery)
+  // =========================================================================
+  let uploadJobId = null;
+
+  window.openUploadModal = function(jobId, promptLabel) {
+    uploadJobId = jobId;
+    document.getElementById('upload-job-id').textContent = promptLabel;
+    document.getElementById('upload-status').classList.remove('visible');
+
+    // Populate TV select with known TVs
+    refreshTVSelects();
+
+    if (!knownTVs.length) {
+      document.getElementById('upload-status').className = 'status-bar visible error';
+      document.getElementById('upload-status-text').textContent =
+        'No TVs available. Configure one or use Scan Network first.';
+    }
+
+    // Try to load mattes for the first TV
+    loadMattesForSelect('upload-matte-select', knownTVs[0]?.ip);
+
+    document.getElementById('upload-modal').classList.add('visible');
+  };
+
+  document.getElementById('btn-upload-cancel').addEventListener('click', () => {
+    document.getElementById('upload-modal').classList.remove('visible');
+  });
+
+  document.getElementById('upload-tv-select').addEventListener('change', (e) => {
+    loadMattesForSelect('upload-matte-select', e.target.value);
+  });
+
+  document.getElementById('btn-upload-apply').addEventListener('click', async () => {
+    const tvIp = document.getElementById('upload-tv-select').value;
+    const matte = document.getElementById('upload-matte-select').value || 'none';
+    const statusEl = document.getElementById('upload-status');
+    const statusTextEl = document.getElementById('upload-status-text');
+
+    if (!tvIp) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Please select a TV.';
+      return;
+    }
+
+    const btn = document.getElementById('btn-upload-apply');
+    btn.disabled = true;
+    statusEl.className = 'status-bar visible';
+    statusTextEl.textContent = 'Uploading...';
+
+    try {
+      const resp = await fetch('/jobs/' + uploadJobId + '/apply', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ tv_ip: tvIp, matte: matte }),
+      });
+
+      btn.disabled = false;
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.detail || 'Server returned ' + resp.status);
+      }
+
+      statusEl.className = 'status-bar visible done';
+      statusTextEl.textContent = 'Uploaded successfully!';
+    } catch (e) {
+      btn.disabled = false;
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Failed: ' + e.message;
+    }
+  });
+
+  // =========================================================================
+  // TV Discovery
+  // =========================================================================
   const btnDiscover = document.getElementById('btn-discover');
   btnDiscover.addEventListener('click', async () => {
     const list = document.getElementById('tv-list');
@@ -301,33 +573,278 @@
       const resp = await fetch('/tv/discover?timeout=4');
       const tvs = await resp.json();
       btnDiscover.disabled = false;
-      if (!tvs.length) { list.innerHTML = ''; empty.textContent = 'No Samsung TVs found.'; empty.style.display = 'block'; return; }
-
-      // Populate TV select in Generate tab
-      const tvSel = document.getElementById('tv-select');
-      tvSel.innerHTML = '<option value="">Generate only (no TV)</option>';
-      tvs.forEach(t => {
-        const opt = document.createElement('option');
-        opt.value = t.ip; opt.textContent = t.name + ' (' + t.ip + ')' + (t.frame_tv ? ' [Frame]' : '');
-        tvSel.appendChild(opt);
-      });
-
-      list.innerHTML = tvs.map(t => `
-        <div class="tv-card">
-          <div class="tv-info">
-            <div class="tv-name">${t.name}</div>
-            <div class="tv-detail">${t.model} &middot; ${t.ip}</div>
-          </div>
-          <span class="badge ${t.frame_tv ? 'badge-frame' : 'badge-samsung'}">
-            ${t.frame_tv ? 'Frame TV' : 'Samsung TV'}
-          </span>
-        </div>
-      `).join('');
+      if (!tvs.length && !knownTVs.length) {
+        list.innerHTML = '';
+        empty.textContent = 'No Samsung TVs found on network.';
+        empty.style.display = 'block';
+        return;
+      }
+      addTVs(tvs, 'discovered');
     } catch (e) {
       btnDiscover.disabled = false;
       list.innerHTML = '<div class="empty">Discovery failed: ' + e.message + '</div>';
     }
   });
+
+  // =========================================================================
+  // TV Art — list art on TV
+  // =========================================================================
+  document.getElementById('tv-art-select').addEventListener('change', () => {
+    selectedTVArtIds = new Set();
+    loadedTVArtById = {};
+    updateDeleteSelectedButton();
+    document.getElementById('tv-art-grid').innerHTML = '';
+    const empty = document.getElementById('tv-art-empty');
+    empty.textContent = 'Select a TV and click "Load Art".';
+    empty.style.display = 'block';
+  });
+  document.getElementById('btn-load-art').addEventListener('click', loadTVArt);
+  document.getElementById('btn-delete-selected').addEventListener('click', deleteSelectedTVArt);
+
+  function updateDeleteSelectedButton() {
+    const btn = document.getElementById('btn-delete-selected');
+    const n = selectedTVArtIds.size;
+    btn.disabled = n === 0;
+    btn.textContent = n > 0 ? ('Delete Selected (' + n + ')') : 'Delete Selected';
+  }
+
+  async function loadTVArt() {
+    const tvIp = document.getElementById('tv-art-select').value;
+    const grid = document.getElementById('tv-art-grid');
+    const empty = document.getElementById('tv-art-empty');
+
+    selectedTVArtIds = new Set();
+    loadedTVArtById = {};
+    updateDeleteSelectedButton();
+
+    if (!tvIp) {
+      empty.textContent = 'Please select a TV.';
+      empty.style.display = 'block';
+      grid.innerHTML = '';
+      return;
+    }
+
+    grid.innerHTML = '<div class="empty">Loading artwork from TV...</div>';
+    empty.style.display = 'none';
+
+    try {
+      const resp = await fetch('/tv/art?tv_ip=' + encodeURIComponent(tvIp));
+      if (!resp.ok) throw new Error('Server returned ' + resp.status);
+      const artworks = await resp.json();
+
+      if (!artworks.length) {
+        grid.innerHTML = '';
+        empty.textContent = 'No artwork on this TV.';
+        empty.style.display = 'block';
+        return;
+      }
+
+      loadedTVArtById = Object.fromEntries(artworks.map(a => [a.content_id, a]));
+
+      grid.innerHTML = artworks.map(a => `
+        <div class="tv-art-item">
+          <label class="art-select-row">
+            <input type="checkbox" class="tv-art-select-item" data-content-id="${esc(a.content_id)}">
+            <span class="art-id">${esc(a.content_id)}</span>
+            ${a.is_favourite ? '<span class="art-fav">\u2665 favourite</span>' : ''}
+          </label>
+          <div class="art-thumb-wrap">
+            <img class="art-thumb"
+                 src="/tv/art/thumbnail?tv_ip=${encodeURIComponent(tvIp)}&content_id=${encodeURIComponent(a.content_id)}"
+                 alt="Thumbnail ${esc(a.content_id)}"
+                 loading="lazy"
+                 onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
+            <div class="art-thumb-fallback">No thumbnail</div>
+          </div>
+          <div class="art-actions">
+            <button class="btn btn-secondary btn-small"
+                    onclick="openMatteModal('${esc(a.content_id)}', '${esc(tvIp)}')">
+              Change Matte</button>
+            <button class="btn btn-danger btn-small"
+                    onclick="deleteTVArt('${esc(a.content_id)}', '${esc(tvIp)}', ${a.is_favourite})">
+              Delete</button>
+          </div>
+        </div>
+      `).join('');
+
+      grid.querySelectorAll('.tv-art-select-item').forEach(el => {
+        el.addEventListener('change', (e) => {
+          const checkbox = e.target;
+          const cid = checkbox.dataset.contentId;
+          if (!cid) return;
+          if (checkbox.checked) {
+            selectedTVArtIds.add(cid);
+          } else {
+            selectedTVArtIds.delete(cid);
+          }
+          updateDeleteSelectedButton();
+        });
+      });
+    } catch (e) {
+      grid.innerHTML = '<div class="empty">Failed to load art: ' + esc(e.message) + '</div>';
+    }
+  }
+
+  // =========================================================================
+  // Delete TV Art
+  // =========================================================================
+  window.deleteTVArt = async function(contentId, tvIp, isFav) {
+    const msg = isFav
+      ? 'This artwork is favourited. Delete anyway? (content: ' + contentId + ')'
+      : 'Delete artwork ' + contentId + ' from TV?';
+    if (!confirm(msg)) return;
+
+    try {
+      const resp = await fetch('/tv/art/delete', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          content_ids: [contentId],
+          tv_ip: tvIp,
+          include_favorites: isFav,
+        }),
+      });
+      if (!resp.ok) throw new Error('Server returned ' + resp.status);
+      const data = await resp.json();
+      if (data.deleted.length) {
+        loadTVArt(); // Refresh the list
+      } else if (data.skipped_favorites.length) {
+        alert('Artwork was skipped because it is a favourite.');
+      }
+    } catch (e) {
+      alert('Failed to delete: ' + e.message);
+    }
+  };
+
+  async function deleteSelectedTVArt() {
+    const tvIp = document.getElementById('tv-art-select').value;
+    const selectedIds = Array.from(selectedTVArtIds);
+    if (!tvIp || !selectedIds.length) return;
+
+    const favCount = selectedIds.filter(cid => loadedTVArtById[cid]?.is_favourite).length;
+    const msg = favCount
+      ? ('Delete ' + selectedIds.length + ' selected artworks? This includes ' + favCount + ' favourite(s).')
+      : ('Delete ' + selectedIds.length + ' selected artworks from TV?');
+    if (!confirm(msg)) return;
+
+    const btn = document.getElementById('btn-delete-selected');
+    btn.disabled = true;
+
+    try {
+      const resp = await fetch('/tv/art/delete', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          content_ids: selectedIds,
+          tv_ip: tvIp,
+          include_favorites: favCount > 0,
+        }),
+      });
+      if (!resp.ok) throw new Error('Server returned ' + resp.status);
+      const data = await resp.json();
+      if (data.deleted.length) {
+        await loadTVArt();
+      }
+      if (data.skipped_favorites.length) {
+        alert('Some favourites were skipped: ' + data.skipped_favorites.join(', '));
+      }
+    } catch (e) {
+      alert('Failed to delete selected artwork: ' + e.message);
+    } finally {
+      updateDeleteSelectedButton();
+    }
+  }
+
+  // =========================================================================
+  // Change Matte modal
+  // =========================================================================
+  let matteContentId = null;
+  let matteTvIp = null;
+
+  window.openMatteModal = async function(contentId, tvIp) {
+    matteContentId = contentId;
+    matteTvIp = tvIp;
+    document.getElementById('matte-content-id').textContent = contentId;
+    document.getElementById('matte-modal').classList.add('visible');
+
+    loadMattesForSelect('matte-select', tvIp);
+  };
+
+  async function loadMattesForSelect(selectId, tvIp) {
+    const sel = document.getElementById(selectId);
+    if (!tvIp) return;
+
+    sel.innerHTML = '<option value="">Loading...</option>';
+    try {
+      const resp = await fetch('/tv/mattes?tv_ip=' + encodeURIComponent(tvIp));
+      if (!resp.ok) throw new Error('Failed to load');
+      const mattes = await resp.json();
+      sel.innerHTML = '';
+      if (!mattes.length) {
+        sel.innerHTML = '<option value="none">none</option>' +
+                        '<option value="shadowbox_polar">shadowbox_polar</option>';
+        return;
+      }
+      for (const m of mattes) {
+        const id = m.matte_id || m;
+        const opt = document.createElement('option');
+        opt.value = id;
+        opt.textContent = id;
+        sel.appendChild(opt);
+      }
+    } catch {
+      sel.innerHTML = '<option value="none">none</option>' +
+                      '<option value="shadowbox_polar">shadowbox_polar</option>' +
+                      '<option value="shadowbox_noir">shadowbox_noir</option>';
+    }
+  }
+
+  document.getElementById('btn-matte-cancel').addEventListener('click', () => {
+    document.getElementById('matte-modal').classList.remove('visible');
+  });
+
+  document.getElementById('btn-matte-apply').addEventListener('click', async () => {
+    const matteId = document.getElementById('matte-select').value;
+    if (!matteId) return;
+
+    const btn = document.getElementById('btn-matte-apply');
+    btn.disabled = true;
+
+    try {
+      const resp = await fetch('/tv/art/matte', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          content_id: matteContentId,
+          matte_id: matteId,
+          tv_ip: matteTvIp,
+        }),
+      });
+      if (!resp.ok) throw new Error('Server returned ' + resp.status);
+      document.getElementById('matte-modal').classList.remove('visible');
+    } catch (e) {
+      alert('Failed to change matte: ' + e.message);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  // Close modals on overlay click (but not dialog click)
+  document.getElementById('matte-modal').addEventListener('click', function(e) {
+    if (e.target === this) this.classList.remove('visible');
+  });
+  document.getElementById('upload-modal').addEventListener('click', function(e) {
+    if (e.target === this) this.classList.remove('visible');
+  });
+
+  // =========================================================================
+  // Helpers
+  // =========================================================================
+  function esc(str) {
+    const el = document.createElement('span');
+    el.textContent = str || '';
+    return el.innerHTML;
+  }
 })();
 </script>
 </body>

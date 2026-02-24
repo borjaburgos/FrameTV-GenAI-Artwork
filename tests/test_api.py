@@ -162,7 +162,7 @@ class TestGenerateAndApply:
 
     @patch("frameart.api._settings")
     @patch("frameart.pipeline.run_generate_and_apply")
-    def test_default_matte_is_shadowbox_polar(self, mock_run, mock_settings):
+    def test_default_matte_is_none(self, mock_run, mock_settings):
         mock_settings.return_value = MagicMock()
         mock_run.return_value = _fake_result()
 
@@ -171,7 +171,7 @@ class TestGenerateAndApply:
             json={"prompt": "test without explicit matte"},
         )
         assert resp.status_code == 200
-        assert mock_run.call_args.kwargs["matte"] == "shadowbox_polar"
+        assert mock_run.call_args.kwargs["matte"] == "none"
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +195,7 @@ class TestApply:
 
     @patch("frameart.api._settings")
     @patch("frameart.pipeline.run_apply")
-    def test_default_matte_is_shadowbox_polar(self, mock_run, mock_settings):
+    def test_default_matte_is_none(self, mock_run, mock_settings):
         mock_settings.return_value = MagicMock()
         mock_run.return_value = _fake_result()
 
@@ -204,7 +204,7 @@ class TestApply:
             json={"image_path": "/tmp/test.png", "tv_ip": "192.168.1.50"},
         )
         assert resp.status_code == 200
-        assert mock_run.call_args.kwargs["matte"] == "shadowbox_polar"
+        assert mock_run.call_args.kwargs["matte"] == "none"
 
     def test_missing_image_path_returns_422(self):
         resp = client.post("/apply", json={"tv_ip": "192.168.1.50"})
@@ -342,6 +342,36 @@ class TestTVListArt:
 
 
 # ---------------------------------------------------------------------------
+# GET /tv/art/thumbnail
+# ---------------------------------------------------------------------------
+
+class TestTVArtThumbnail:
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.get_art_thumbnail")
+    def test_returns_thumbnail_bytes(self, mock_thumb, mock_settings):
+        settings = MagicMock()
+        settings.tvs = {}
+        mock_settings.return_value = settings
+        mock_thumb.return_value = b"\xff\xd8\xff\xd9"
+
+        resp = client.get("/tv/art/thumbnail?tv_ip=192.168.1.100&content_id=MY_F0001")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"] == "image/jpeg"
+        assert resp.content == b"\xff\xd8\xff\xd9"
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.get_art_thumbnail")
+    def test_returns_404_when_unavailable(self, mock_thumb, mock_settings):
+        settings = MagicMock()
+        settings.tvs = {}
+        mock_settings.return_value = settings
+        mock_thumb.return_value = None
+
+        resp = client.get("/tv/art/thumbnail?tv_ip=192.168.1.100&content_id=MY_F0001")
+        assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
 # POST /tv/art/delete
 # ---------------------------------------------------------------------------
 
@@ -423,6 +453,164 @@ class TestTVDeleteArt:
             "content_ids": ["MY_F0001"],
         })
         assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# POST /tv/art/matte
+# ---------------------------------------------------------------------------
+
+class TestTVChangeMatte:
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.change_matte")
+    def test_success(self, mock_change, mock_settings):
+        settings = MagicMock()
+        settings.tvs = {}
+        mock_settings.return_value = settings
+        mock_change.return_value = True
+
+        resp = client.post("/tv/art/matte", json={
+            "content_id": "MY_F0001",
+            "matte_id": "shadowbox_noir",
+            "tv_ip": "192.168.1.100",
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["content_id"] == "MY_F0001"
+        assert data["matte_id"] == "shadowbox_noir"
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.change_matte")
+    def test_failure_returns_500(self, mock_change, mock_settings):
+        settings = MagicMock()
+        settings.tvs = {}
+        mock_settings.return_value = settings
+        mock_change.return_value = False
+
+        resp = client.post("/tv/art/matte", json={
+            "content_id": "MY_F0001",
+            "matte_id": "shadowbox_noir",
+            "tv_ip": "192.168.1.100",
+        })
+        assert resp.status_code == 500
+
+    @patch("frameart.api._settings")
+    def test_no_tv_returns_400(self, mock_settings):
+        settings = MagicMock()
+        settings.tvs = {}
+        mock_settings.return_value = settings
+
+        resp = client.post("/tv/art/matte", json={
+            "content_id": "MY_F0001",
+            "matte_id": "shadowbox_noir",
+        })
+        assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# GET /tv/mattes
+# ---------------------------------------------------------------------------
+
+class TestTVMattes:
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.get_matte_list")
+    def test_returns_mattes(self, mock_mattes, mock_settings):
+        settings = MagicMock()
+        settings.tvs = {}
+        mock_settings.return_value = settings
+        mock_mattes.return_value = [
+            {"matte_id": "shadowbox_polar"},
+            {"matte_id": "shadowbox_noir"},
+        ]
+
+        resp = client.get("/tv/mattes?tv_ip=192.168.1.100")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 2
+        assert data[0]["matte_id"] == "shadowbox_polar"
+
+    @patch("frameart.api._settings")
+    def test_no_tv_returns_400(self, mock_settings):
+        settings = MagicMock()
+        settings.tvs = {}
+        mock_settings.return_value = settings
+
+        resp = client.get("/tv/mattes")
+        assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# GET /tv/configured
+# ---------------------------------------------------------------------------
+
+class TestTVConfigured:
+    @patch("frameart.api._settings")
+    def test_returns_configured_tvs(self, mock_settings):
+        from frameart.config import TVProfile
+
+        settings = MagicMock()
+        settings.tvs = {
+            "living_room": TVProfile(ip="192.168.1.50", name="LivingRoom"),
+            "bedroom": TVProfile(ip="192.168.1.51", name="Bedroom"),
+        }
+        mock_settings.return_value = settings
+
+        resp = client.get("/tv/configured")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 2
+        assert data[0]["name"] == "living_room"
+        assert data[0]["ip"] == "192.168.1.50"
+
+    @patch("frameart.api._settings")
+    def test_empty(self, mock_settings):
+        settings = MagicMock()
+        settings.tvs = {}
+        mock_settings.return_value = settings
+
+        resp = client.get("/tv/configured")
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+
+# ---------------------------------------------------------------------------
+# POST /jobs/{job_id}/apply
+# ---------------------------------------------------------------------------
+
+class TestJobApply:
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_apply")
+    def test_success(self, mock_run, mock_settings):
+        import tempfile
+
+        settings = MagicMock()
+        # Create a temp file to simulate the artifact
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifacts = Path(tmpdir) / "artifacts" / "2025" / "01" / "01" / "test-job"
+            artifacts.mkdir(parents=True)
+            (artifacts / "final.png").write_bytes(b"fakepng")
+            settings.data_dir = Path(tmpdir)
+            mock_settings.return_value = settings
+            mock_run.return_value = _fake_result()
+
+            resp = client.post(
+                "/jobs/test-job/apply",
+                json={"tv_ip": "192.168.1.100", "matte": "shadowbox_polar"},
+            )
+            assert resp.status_code == 200
+            assert resp.json()["content_id"] == "MY_ART_001"
+
+    @patch("frameart.api._settings")
+    def test_not_found(self, mock_settings):
+        settings = MagicMock()
+        settings.data_dir = Path("/tmp/nonexistent_frameart_test")
+        mock_settings.return_value = settings
+
+        resp = client.post(
+            "/jobs/nonexistent/apply",
+            json={"tv_ip": "192.168.1.100"},
+        )
+        assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------

@@ -342,7 +342,7 @@ def upload_image(
 
     # Pass the matte through as-is; callers are responsible for providing
     # a valid matte_id (use ``get_matte_list`` to discover supported values).
-    effective_matte = matte or "shadowbox_polar"
+    effective_matte = matte or "none"
 
     # Validate image bytes before attempting upload
     if len(upload_bytes) < 100:
@@ -472,6 +472,22 @@ def list_art_deduplicated(profile: TVProfile) -> list[dict[str, Any]]:
             unique.append({**item, "is_favourite": cid in fav_ids})
 
     return unique
+
+
+def get_art_thumbnail(profile: TVProfile, content_id: str) -> bytes | None:
+    """Fetch thumbnail bytes for a TV artwork content ID.
+
+    Returns ``None`` if the TV does not provide a thumbnail for the content.
+    """
+    art = _connect_art(profile)
+    try:
+        data = art.get_thumbnail(content_id)
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data)
+        return None
+    except Exception as e:
+        logger.warning("Failed to fetch thumbnail for %s: %s", content_id, e)
+        return None
 
 
 def get_matte_list(profile: TVProfile) -> list[dict[str, Any]]:
