@@ -25,6 +25,7 @@ TV and gallery:
     POST /tv/art/matte          — change matte on an artwork
     GET  /tv/mattes             — list matte styles supported by the TV
     GET  /jobs                  — list recent jobs (artifacts on disk)
+    POST /jobs/delete           — delete generated jobs from host artifacts
     GET  /jobs/{job_id}/image   — serve the final processed image
     POST /jobs/{job_id}/apply   — upload a previously generated job to TV
 
@@ -37,6 +38,7 @@ Misc:
 from __future__ import annotations
 
 import logging
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -206,6 +208,20 @@ class JobSummary(BaseModel):
     prompt: str | None = None
     provider: str | None = None
     content_id: str | None = None
+
+
+class DeleteJobsRequest(BaseModel):
+    """Request body for deleting locally stored generated jobs."""
+
+    job_ids: list[str] = Field(..., description="Job IDs to delete from host artifacts.")
+
+
+class DeleteJobsResponse(BaseModel):
+    """Response for host artifact deletion."""
+
+    deleted: list[str] = Field(default_factory=list)
+    not_found: list[str] = Field(default_factory=list)
+    failed: dict[str, str] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -534,6 +550,36 @@ def list_jobs(limit: int = Query(20, ge=1, le=200, description="Max jobs to retu
         except Exception:
             jobs.append(JobSummary(job_id=meta_path.parent.name))
     return jobs
+
+
+@app.post("/jobs/delete", response_model=DeleteJobsResponse)
+def delete_jobs(req: DeleteJobsRequest):
+    """Delete generated job artifacts from the host filesystem."""
+    settings = _settings()
+    artifacts_dir = settings.data_dir / "artifacts"
+
+    if not artifacts_dir.exists():
+        return DeleteJobsResponse(deleted=[], not_found=list(req.job_ids), failed={})
+
+    deleted: list[str] = []
+    not_found: list[str] = []
+    failed: dict[str, str] = {}
+
+    for job_id in req.job_ids:
+        meta_matches = list(artifacts_dir.rglob(f"{job_id}/meta.json"))
+        if not meta_matches:
+            not_found.append(job_id)
+            continue
+
+        job_dirs = {m.parent for m in meta_matches}
+        try:
+            for job_dir in job_dirs:
+                shutil.rmtree(job_dir)
+            deleted.append(job_id)
+        except Exception as e:
+            failed[job_id] = str(e)
+
+    return DeleteJobsResponse(deleted=deleted, not_found=not_found, failed=failed)
 
 
 @app.get("/jobs/{job_id}/image")

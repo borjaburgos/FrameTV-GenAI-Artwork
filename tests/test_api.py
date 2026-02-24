@@ -279,6 +279,67 @@ class TestGetJobImage:
 
 
 # ---------------------------------------------------------------------------
+# POST /jobs/delete
+# ---------------------------------------------------------------------------
+
+class TestDeleteJobs:
+    @patch("frameart.api._settings")
+    def test_deletes_existing_job_dir(self, mock_settings):
+        import tempfile
+
+        settings = MagicMock()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job_dir = Path(tmpdir) / "artifacts" / "2025" / "01" / "01" / "test-job"
+            job_dir.mkdir(parents=True)
+            (job_dir / "meta.json").write_text('{"job_id":"test-job"}')
+            (job_dir / "final.png").write_bytes(b"fakepng")
+            settings.data_dir = Path(tmpdir)
+            mock_settings.return_value = settings
+
+            resp = client.post("/jobs/delete", json={"job_ids": ["test-job"]})
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["deleted"] == ["test-job"]
+            assert data["not_found"] == []
+            assert data["failed"] == {}
+            assert not job_dir.exists()
+
+    @patch("frameart.api._settings")
+    def test_returns_not_found_for_missing_job(self, mock_settings):
+        settings = MagicMock()
+        settings.data_dir = Path("/tmp/nonexistent_frameart_test")
+        mock_settings.return_value = settings
+
+        resp = client.post("/jobs/delete", json={"job_ids": ["does-not-exist"]})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["deleted"] == []
+        assert data["not_found"] == ["does-not-exist"]
+        assert data["failed"] == {}
+
+    @patch("frameart.api._settings")
+    @patch("frameart.api.shutil")
+    def test_reports_failed_deletions(self, mock_shutil, mock_settings):
+        import tempfile
+
+        settings = MagicMock()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job_dir = Path(tmpdir) / "artifacts" / "2025" / "01" / "01" / "test-job"
+            job_dir.mkdir(parents=True)
+            (job_dir / "meta.json").write_text('{"job_id":"test-job"}')
+            settings.data_dir = Path(tmpdir)
+            mock_settings.return_value = settings
+            mock_shutil.rmtree.side_effect = OSError("permission denied")
+
+            resp = client.post("/jobs/delete", json={"job_ids": ["test-job"]})
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["deleted"] == []
+            assert data["not_found"] == []
+            assert "test-job" in data["failed"]
+
+
+# ---------------------------------------------------------------------------
 # GET /tv/discover
 # ---------------------------------------------------------------------------
 
