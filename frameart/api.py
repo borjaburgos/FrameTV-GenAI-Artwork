@@ -562,11 +562,31 @@ def catalog_search(
     try:
         items = search_artworks(source=source, query=q, limit=limit)
     except ValueError as e:
+        logger.warning("Catalog search bad request source=%s q=%r: %s", source, q, e)
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
+        logger.exception("Catalog search upstream failure source=%s q=%r", source, q)
         raise HTTPException(status_code=502, detail=f"Catalog search failed: {e}") from e
 
-    return [PublicDomainArtwork(**item) for item in items]
+    validated: list[PublicDomainArtwork] = []
+    dropped = 0
+    for item in items:
+        try:
+            validated.append(PublicDomainArtwork(**item))
+        except Exception as e:
+            dropped += 1
+            logger.warning(
+                "Dropping invalid catalog item source=%s q=%r error=%s item=%r",
+                source,
+                q,
+                e,
+                item,
+            )
+
+    if dropped:
+        logger.warning("Catalog search dropped %d invalid items source=%s q=%r", dropped, source, q)
+
+    return validated
 
 
 @app.post("/catalog/apply", response_model=JobResponse)

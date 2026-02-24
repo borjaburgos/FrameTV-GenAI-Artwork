@@ -671,6 +671,25 @@ class TestCatalogSearch:
         resp = client.get("/catalog/search?source=foo&q=test")
         assert resp.status_code == 400
 
+    @patch("frameart.public_domain.search_artworks")
+    def test_drops_invalid_items_instead_of_500(self, mock_search):
+        mock_search.return_value = [
+            {"source": "met", "artwork_id": "123"},  # missing required fields
+            {
+                "source": "met",
+                "artwork_id": "456",
+                "title": "Valid",
+                "image_url": "https://example.com/full.jpg",
+                "is_public_domain": True,
+            },
+        ]
+
+        resp = client.get("/catalog/search?source=met&q=valid")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["artwork_id"] == "456"
+
 
 class TestCatalogApply:
     @patch("frameart.api._settings")

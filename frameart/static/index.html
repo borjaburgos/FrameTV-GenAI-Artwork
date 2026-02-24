@@ -623,6 +623,20 @@
     publicStatusText.textContent = msg;
   }
 
+  async function readApiError(resp, fallbackPrefix) {
+    const contentType = resp.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+      const err = await resp.json().catch(() => ({}));
+      if (typeof err?.detail === 'string') return err.detail;
+      if (err?.detail && typeof err.detail === 'object') return JSON.stringify(err.detail);
+      if (typeof err?.error === 'string') return err.error;
+    }
+    const text = await resp.text().catch(() => '');
+    const trimmed = (text || '').trim();
+    if (trimmed) return trimmed.slice(0, 300);
+    return fallbackPrefix + ' ' + resp.status;
+  }
+
   function renderPublicResults(items) {
     const grid = document.getElementById('public-grid');
     const empty = document.getElementById('public-empty');
@@ -691,8 +705,8 @@
         '&q=' + encodeURIComponent(q) + '&limit=20'
       );
       if (!resp.ok) {
-        const err = await resp.json().catch(() => ({}));
-        throw new Error(err.detail || ('Server returned ' + resp.status));
+        const detail = await readApiError(resp, 'Server returned');
+        throw new Error(detail);
       }
       const items = await resp.json();
       renderPublicResults(items);
@@ -728,8 +742,8 @@
       });
       btn.disabled = false;
       if (!resp.ok) {
-        const err = await resp.json().catch(() => ({}));
-        throw new Error(err.detail || ('Server returned ' + resp.status));
+        const detail = await readApiError(resp, 'Server returned');
+        throw new Error(detail);
       }
 
       const data = await resp.json();
