@@ -1,31 +1,21 @@
 """Samsung Frame TV controller — upload art, switch display, manage pairing.
 
-Uses the ``samsungtvws`` library (xchwarze/samsung-tv-ws-api).
+Uses the ``samsungtvws`` library v3.x (xchwarze/samsung-tv-ws-api).
 """
 
 from __future__ import annotations
 
 import contextlib
 import io
-import json
 import logging
-import random
-import socket as _socket
-import ssl
 import time
-import uuid
 import warnings
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from PIL import Image
-from samsungtvws import SamsungTVWS
-from samsungtvws import exceptions as _tv_exc
-from samsungtvws.art import ArtChannelEmitCommand
-from samsungtvws.event import D2D_SERVICE_MESSAGE_EVENT
-from samsungtvws.helper import process_api_response
+from samsungtvws import SamsungTVArt, SamsungTVWS
 
 from frameart.config import TVProfile
 
@@ -89,23 +79,24 @@ def _token_path_for_ip(ip: str) -> str:
     return str(secrets_dir / f"{ip.replace('.', '_')}.token")
 
 
-def _connect(profile: TVProfile) -> SamsungTVWS:
-    """Create a SamsungTVWS connection from a TVProfile.
-
-    Always provides a token_file so that the samsungtvws library can persist
-    the pairing token received from the TV. Without a token_file, tokens are
-    only kept in-memory and lost between connections — which causes write
-    operations (like send_image) to fail with error -1.
-    """
+def _resolve_token_file(profile: TVProfile) -> str:
+    """Return the token file path for a profile, auto-discovering or creating as needed."""
     token_file = profile.token_file
-
-    # Auto-discover saved token or create a path for a new one
     if not token_file:
         token_file = _find_token_file(profile.ip)
     if not token_file:
         token_file = _token_path_for_ip(profile.ip)
-
     _ensure_token_dir(token_file)
+    return token_file
+
+
+def _connect(profile: TVProfile) -> SamsungTVWS:
+    """Create a SamsungTVWS connection from a TVProfile.
+
+    Used for REST-only operations (pairing, device info).  For art operations,
+    use ``_connect_art()`` instead.
+    """
+    token_file = _resolve_token_file(profile)
 
     logger.debug(
         "Connecting to %s:%d token_file=%s (exists=%s)",
@@ -113,6 +104,29 @@ def _connect(profile: TVProfile) -> SamsungTVWS:
     )
 
     return SamsungTVWS(
+        host=profile.ip,
+        port=profile.port,
+        token_file=token_file,
+        name=profile.name,
+        timeout=DEFAULT_TIMEOUT,
+    )
+
+
+def _connect_art(profile: TVProfile) -> SamsungTVArt:
+    """Create a SamsungTVArt connection from a TVProfile.
+
+    In samsungtvws v3.x, ``SamsungTVArt`` is a standalone class that handles
+    API version detection, upload transports (WS binary for API 0.97, D2D
+    socket for modern APIs), SSL, and request correlation internally.
+    """
+    token_file = _resolve_token_file(profile)
+
+    logger.debug(
+        "Connecting art to %s:%d token_file=%s (exists=%s)",
+        profile.ip, profile.port, token_file, Path(token_file).is_file(),
+    )
+
+    return SamsungTVArt(
         host=profile.ip,
         port=profile.port,
         token_file=token_file,
@@ -224,11 +238,11 @@ def get_status(profile: TVProfile) -> TVStatus:
     current_artwork = None
 
     def _query_art_mode():
-        art = tv.art()
+        art = _connect_art(profile)
         return art.get_artmode()
 
     def _query_current():
-        art = tv.art()
+        art = _connect_art(profile)
         return art.get_current()
 
     result, err = _run_with_timeout(_query_art_mode)
@@ -252,6 +266,9 @@ def get_status(profile: TVProfile) -> TVStatus:
         art_mode_on=art_mode_on,
         current_artwork=current_artwork,
     )
+
+
+# --- Image preparation -------------------------------------------------------
 
 
 def _prepare_image_for_tv(
@@ -289,254 +306,7 @@ def _prepare_image_for_tv(
     return image_bytes, file_type
 
 
-_UPLOAD_CHUNK = 64 * 1024  # 64 KB chunks for TCP socket transfer
-_ART_EVENT_TIMEOUT = 30  # seconds to wait for a TV art-app response
-
-
-def _art_upload(
-    art,
-    file_bytes: bytes,
-    file_type: str = "jpg",
-    matte: str = "shadowbox_polar",
-) -> str:
-    """Upload an image to a Samsung Frame TV and return the content_id.
-
-    Detects the TV's art-API version and picks the right transport:
-
-    * **API 0.97** (2018/2019 Frame TVs) — the image is packed into a
-      single WebSocket *binary* frame together with a compact JSON
-      header.  These TVs do **not** support the D2D socket handshake
-      and return ``error -1`` if you try.
-    * **Newer APIs** (2020 +) — the traditional D2D socket flow is
-      used: a ``send_image`` text request, then a TCP socket transfer.
-
-    The API-0.97 path was reverse-engineered from SmartThings traffic
-    and upstreamed in ``xchwarze/samsung-tv-ws-api#181``.
-    """
-    # Ensure the WebSocket is open before anything else
-    if not art.connection:
-        art.open()
-
-    # ---- Detect API version ----
-    api_version: str | None = None
-    try:
-        api_version = art.get_api_version()
-        logger.info("TV art API version: %s", api_version)
-    except Exception as exc:
-        logger.debug("Could not query API version (%s), assuming modern API", exc)
-
-    if api_version == "0.97":
-        return _upload_ws_binary(art, file_bytes, file_type, matte)
-    return _upload_d2d_socket(art, file_bytes, file_type, matte)
-
-
-# ---------------------------------------------------------------------------
-# API 0.97 — WebSocket binary frame upload (2018/2019 Frame TVs)
-# ---------------------------------------------------------------------------
-
-def _upload_ws_binary(
-    art,
-    file_bytes: bytes,
-    file_type: str,
-    matte: str,
-) -> str:
-    """Upload via a single WebSocket binary frame (API 0.97).
-
-    Wire format:
-        [uint16-BE header_len] [JSON header (utf-8)] [raw image bytes]
-
-    The JSON header is an ``ms.channel.emit`` envelope wrapping the
-    ``send_image`` request.  SmartThings sends ``"JPEG"`` (uppercase)
-    for the ``file_type`` field.
-    """
-    upload_id = str(uuid.uuid4())
-
-    # SmartThings sends uppercase file types for API 0.97
-    ft = file_type.lower()
-    ft_hdr = "JPEG" if ft in ("jpg", "jpeg") else ft.upper()
-
-    inner: dict[str, Any] = {
-        "request": "send_image",
-        "file_type": ft_hdr,
-        "matte_id": matte or "none",
-        "id": upload_id,
-    }
-    outer: dict[str, Any] = {
-        "method": "ms.channel.emit",
-        "params": {
-            "data": json.dumps(inner),
-            "to": "host",
-            "event": "art_app_request",
-        },
-    }
-
-    header = json.dumps(outer, separators=(",", ":")).encode("utf-8")
-    if len(header) > 0xFFFF:
-        raise ValueError("Upload header too large for uint16 length prefix")
-
-    payload = len(header).to_bytes(2, "big") + header + file_bytes
-
-    assert art.connection
-    logger.info(
-        "Uploading via WS binary (API 0.97): header=%d bytes, image=%d bytes",
-        len(header), len(file_bytes),
-    )
-    art.connection.send_binary(payload)
-
-    # Wait for the TV to confirm
-    result = _wait_for_art_event(art, "image_added", upload_id, "send_image")
-    content_id: str = result["content_id"]
-    logger.info("Upload complete (API 0.97), content_id=%s", content_id)
-    return content_id
-
-
-# ---------------------------------------------------------------------------
-# Modern API — D2D socket upload (2020+ Frame TVs)
-# ---------------------------------------------------------------------------
-
-def _upload_d2d_socket(
-    art,
-    file_bytes: bytes,
-    file_type: str,
-    matte: str,
-) -> str:
-    """Upload via a D2D TCP socket handshake (modern API).
-
-    Includes ``request_id`` in the ``send_image`` request, which is
-    required by many firmware versions (NickWaterton fork fix).
-    """
-    file_size = len(file_bytes)
-    file_type = file_type.lower()
-    if file_type == "jpeg":
-        file_type = "jpg"
-
-    request_uuid = str(uuid.uuid4())
-    date = datetime.now().strftime("%Y:%m:%d %H:%M:%S")
-
-    request_data: dict[str, Any] = {
-        "request": "send_image",
-        "file_type": file_type,
-        "request_id": request_uuid,
-        "id": request_uuid,
-        "conn_info": {
-            "d2d_mode": "socket",
-            "connection_id": random.randrange(4 * 1024 * 1024 * 1024),
-            "id": request_uuid,
-        },
-        "image_date": date,
-        "matte_id": matte,
-        "file_size": file_size,
-    }
-
-    logger.debug("Sending send_image request (D2D): %s", json.dumps(request_data))
-    art.send_command(ArtChannelEmitCommand.art_app_request(request_data))
-
-    # ---- Wait for "ready_to_use" d2d response ----
-    conn_info = _wait_for_art_event(
-        art, "ready_to_use", request_uuid, "send_image",
-    )
-    d2d_info = json.loads(conn_info["conn_info"])
-
-    # ---- Open TCP socket and send image data ----
-    art_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-    try:
-        art_sock.connect((d2d_info["ip"], int(d2d_info["port"])))
-        if d2d_info.get("secured", False):
-            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            art_sock = ctx.wrap_socket(art_sock)
-
-        header = json.dumps({
-            "num": 0,
-            "total": 1,
-            "fileLength": file_size,
-            "fileName": "frameart_upload",
-            "fileType": file_type,
-            "secKey": d2d_info["key"],
-            "version": "0.0.1",
-        })
-        art_sock.sendall(len(header).to_bytes(4, "big"))
-        art_sock.sendall(header.encode("ascii"))
-        for pos in range(0, file_size, _UPLOAD_CHUNK):
-            art_sock.sendall(file_bytes[pos : pos + _UPLOAD_CHUNK])
-    finally:
-        art_sock.close()
-
-    logger.debug("Image data sent, waiting for image_added confirmation")
-
-    # ---- Wait for "image_added" confirmation ----
-    result = _wait_for_art_event(art, "image_added", request_uuid, "send_image")
-    content_id: str = result["content_id"]
-    return content_id
-
-
-def _wait_for_art_event(
-    art,
-    expected_sub_event: str,
-    request_uuid: str,
-    request_name: str,
-    timeout: int = _ART_EVENT_TIMEOUT,
-) -> dict[str, Any]:
-    """Read WebSocket messages until we get the expected d2d sub-event.
-
-    Matches responses by ``request_id`` or ``id`` so stray events
-    (like ``clientDisconnect``) are silently skipped.
-
-    Raises ``TimeoutError`` if no matching response arrives within
-    *timeout* seconds.
-    """
-    import websocket as _ws_mod
-
-    assert art.connection
-    deadline = time.monotonic() + timeout
-    # Set socket-level timeout so recv() doesn't block forever
-    if hasattr(art.connection, "sock") and art.connection.sock:
-        art.connection.sock.settimeout(timeout)
-
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError(
-                f"Timed out after {timeout}s waiting for '{expected_sub_event}' "
-                f"response to `{request_name}`"
-            )
-        try:
-            raw = art.connection.recv()
-        except _ws_mod.WebSocketTimeoutException:
-            raise TimeoutError(
-                f"Timed out after {timeout}s waiting for '{expected_sub_event}' "
-                f"response to `{request_name}`"
-            ) from None
-
-        response = process_api_response(raw)
-        event = response.get("event", "*")
-        art._websocket_event(event, response)
-
-        if event != D2D_SERVICE_MESSAGE_EVENT:
-            logger.debug("Skipping non-d2d event: %s", event)
-            continue
-
-        data = json.loads(response["data"])
-        # Match by request_id or id to ignore responses for stale requests
-        resp_id = data.get("request_id", data.get("id"))
-        if resp_id != request_uuid:
-            logger.debug(
-                "Skipping d2d event for different request: %s (want %s)",
-                resp_id, request_uuid,
-            )
-            continue
-
-        sub_event = data.get("event", "*")
-        if sub_event == "error":
-            raise _tv_exc.ResponseError(
-                f"`{request_name}` request failed "
-                f"with error number {data.get('error_code', '?')}"
-            )
-        if sub_event == expected_sub_event:
-            return data
-
-        logger.debug("Skipping unexpected sub-event: %s (want %s)", sub_event, expected_sub_event)
+# --- Upload -------------------------------------------------------------------
 
 
 def upload_image(
@@ -556,7 +326,7 @@ def upload_image(
     file_type:
         'PNG' or 'JPEG'.
     matte:
-        Matte style (e.g., 'modern_black', 'none').
+        Matte style (e.g., 'shadowbox_polar', 'none').
 
     Returns
     -------
@@ -565,7 +335,7 @@ def upload_image(
     # Samsung TVs prefer JPEG and reject large PNGs
     upload_bytes, upload_type = _prepare_image_for_tv(image_bytes, file_type)
 
-    # Normalize file type for the TV API ("jpeg" -> "jpg" internally)
+    # Normalize file type for the TV API
     ft = upload_type.lower()
     if ft == "jpeg":
         ft = "jpg"
@@ -588,31 +358,29 @@ def upload_image(
         upload_type, len(upload_bytes) / 1024, ft, effective_matte,
     )
 
-    tv: SamsungTVWS | None = None
+    art: SamsungTVArt | None = None
 
     def _do_upload() -> str:
-        nonlocal tv
+        nonlocal art
         # Close any leftover connection from a previous attempt so we
         # don't pile up stale WebSocket clients on the TV.
-        if tv is not None:
+        if art is not None:
             with contextlib.suppress(Exception):
-                tv.close()
+                art.close()
 
-        tv = _connect(profile)
-        art = tv.art()
+        art = _connect_art(profile)
 
         logger.debug(
             "Upload details: host=%s port=%d size=%d bytes file_type=%s "
             "matte=%s token_file=%s",
             profile.ip, profile.port, len(upload_bytes), ft,
-            effective_matte, tv.token_file,
+            effective_matte, art.token_file,
         )
 
-        # Use our custom upload that includes `request_id` in the
-        # send_image request — required by many Samsung firmware versions.
-        # See: xchwarze/samsung-tv-ws-api#130
-        content_id = _art_upload(
-            art, upload_bytes, file_type=ft, matte=effective_matte,
+        # samsungtvws v3.x handles API version detection, WS binary (0.97),
+        # D2D socket (modern), SSL, request_id, and sendall internally.
+        content_id = art.upload(
+            file=upload_bytes, matte=effective_matte, file_type=ft,
         )
         logger.debug("TV returned content_id=%s", content_id)
         return content_id
@@ -640,9 +408,12 @@ def upload_image(
             )
         return UploadResult(content_id="", success=False, error=error_msg)
     finally:
-        if tv is not None:
+        if art is not None:
             with contextlib.suppress(Exception):
-                tv.close()
+                art.close()
+
+
+# --- Art management -----------------------------------------------------------
 
 
 def switch_art(profile: TVProfile, content_id: str) -> bool:
@@ -652,8 +423,7 @@ def switch_art(profile: TVProfile, content_id: str) -> bool:
     """
 
     def _do_switch() -> None:
-        tv = _connect(profile)
-        art = tv.art()
+        art = _connect_art(profile)
 
         # Try to enter art mode first
         try:
@@ -674,8 +444,7 @@ def switch_art(profile: TVProfile, content_id: str) -> bool:
 
 def list_art(profile: TVProfile) -> list[dict[str, Any]]:
     """List all artworks available on the TV."""
-    tv = _connect(profile)
-    art = tv.art()
+    art = _connect_art(profile)
     return art.available()
 
 
@@ -683,30 +452,16 @@ def get_matte_list(profile: TVProfile) -> list[dict[str, Any]]:
     """Query the TV for its supported matte types.
 
     Returns a list of dicts, each with at least a ``matte_id`` key.
-    The exact structure depends on the TV firmware.
-
-    The upstream ``samsungtvws`` library expects the key ``matte_type_list``
-    in the response, but API 0.97 (2018/2019 Frame TVs) returns the data
-    under ``matte_list`` instead.  We handle both variants here.
+    The samsungtvws v3.x library handles both ``matte_type_list`` (modern)
+    and ``matte_list`` (API 0.97) response keys internally.
     """
-    tv = _connect(profile)
-    art = tv.art()
-    try:
-        return art.get_matte_list()
-    except KeyError:
-        # API 0.97 returns "matte_list" instead of "matte_type_list".
-        # Fall back to a manual request using the same art channel.
-        logger.debug("Library get_matte_list() failed, trying 0.97 key")
-
-    response = art._send_art_request(
-        {"request": "get_matte_list"},
-        wait_for_event=D2D_SERVICE_MESSAGE_EVENT,
-    )
-    assert response
-    data = json.loads(response["data"])
-    # Try both key names
-    raw = data.get("matte_type_list") or data.get("matte_list", "[]")
-    return json.loads(raw)
+    art = _connect_art(profile)
+    result = art.get_matte_list()
+    # v3.x returns {"matte_types": [...], "matte_colors": [...]}
+    if isinstance(result, dict):
+        return result.get("matte_types", [])
+    # Fallback for unexpected return types
+    return result
 
 
 def change_matte(profile: TVProfile, content_id: str, matte_id: str) -> bool:
@@ -725,8 +480,7 @@ def change_matte(profile: TVProfile, content_id: str, matte_id: str) -> bool:
     -------
     True on success, False on failure.
     """
-    tv = _connect(profile)
-    art = tv.art()
+    art = _connect_art(profile)
     try:
         art.change_matte(content_id, matte_id)
         logger.info("Changed matte on %s to %s", content_id, matte_id)
@@ -734,5 +488,3 @@ def change_matte(profile: TVProfile, content_id: str, matte_id: str) -> bool:
     except Exception as e:
         logger.error("Failed to change matte: %s", e)
         return False
-
-

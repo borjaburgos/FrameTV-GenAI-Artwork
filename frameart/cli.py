@@ -260,7 +260,7 @@ def tv_status(ctx, tv_name, tv_ip):
     """Check the status of a Frame TV."""
     _ensure_logging(ctx)
     from frameart.config import TVProfile
-    from frameart.tv.controller import _connect, _run_with_timeout
+    from frameart.tv.controller import _connect, _connect_art, _run_with_timeout
 
     settings = ctx.obj["settings"]
 
@@ -306,7 +306,7 @@ def tv_status(ctx, tv_name, tv_ip):
 
     # Step 3: Art mode status (websocket — may time out)
     click.echo("  [3/4] Art mode status...", nl=False)
-    result, err = _run_with_timeout(lambda: tv.art().get_artmode())
+    result, err = _run_with_timeout(lambda: _connect_art(profile).get_artmode())
     if err:
         click.secho(f" unavailable ({err})", fg="yellow")
     else:
@@ -316,7 +316,7 @@ def tv_status(ctx, tv_name, tv_ip):
 
     # Step 4: Current artwork (websocket — may time out)
     click.echo("  [4/4] Current artwork...", nl=False)
-    result, err = _run_with_timeout(lambda: tv.art().get_current())
+    result, err = _run_with_timeout(lambda: _connect_art(profile).get_current())
     if err:
         click.secho(f" unavailable ({err})", fg="yellow")
     else:
