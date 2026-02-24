@@ -342,7 +342,7 @@ def upload_image(
 
     # Pass the matte through as-is; callers are responsible for providing
     # a valid matte_id (use ``get_matte_list`` to discover supported values).
-    effective_matte = matte or "shadowbox_polar"
+    effective_matte = matte or "none"
 
     # Validate image bytes before attempting upload
     if len(upload_bytes) < 100:

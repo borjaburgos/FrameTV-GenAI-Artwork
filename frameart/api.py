@@ -81,8 +81,8 @@ class GenerateAndApplyRequest(GenerateRequest):
     tv: str | None = Field(None, description="TV profile name from config.")
     tv_ip: str | None = Field(None, description="TV IP address (overrides profile).")
     matte: str = Field(
-        "shadowbox_polar",
-        description="Matte style (e.g., shadowbox_polar, shadowbox_noir, none).",
+        "none",
+        description="Matte style (e.g., none, shadowbox_polar, shadowbox_noir).",
     )
     no_switch: bool = Field(False, description="Upload but don't switch displayed art.")
 
@@ -94,7 +94,7 @@ class ApplyRequest(BaseModel):
     tv: str | None = Field(None, description="TV profile name from config.")
     tv_ip: str | None = Field(None, description="TV IP address.")
     matte: str = Field(
-        "shadowbox_polar",
+        "none",
         description="Matte style (run 'tv matte-list' to see options).",
     )
 
@@ -538,8 +538,8 @@ class JobApplyRequest(BaseModel):
     tv: str | None = Field(None, description="TV profile name from config.")
     tv_ip: str | None = Field(None, description="TV IP address.")
     matte: str = Field(
-        "shadowbox_polar",
-        description="Matte style (e.g., shadowbox_polar, shadowbox_noir, none).",
+        "none",
+        description="Matte style (e.g., none, shadowbox_polar, shadowbox_noir).",
     )
 
 

@@ -162,7 +162,7 @@ class TestGenerateAndApply:
 
     @patch("frameart.api._settings")
     @patch("frameart.pipeline.run_generate_and_apply")
-    def test_default_matte_is_shadowbox_polar(self, mock_run, mock_settings):
+    def test_default_matte_is_none(self, mock_run, mock_settings):
         mock_settings.return_value = MagicMock()
         mock_run.return_value = _fake_result()
 
@@ -171,7 +171,7 @@ class TestGenerateAndApply:
             json={"prompt": "test without explicit matte"},
         )
         assert resp.status_code == 200
-        assert mock_run.call_args.kwargs["matte"] == "shadowbox_polar"
+        assert mock_run.call_args.kwargs["matte"] == "none"
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +195,7 @@ class TestApply:
 
     @patch("frameart.api._settings")
     @patch("frameart.pipeline.run_apply")
-    def test_default_matte_is_shadowbox_polar(self, mock_run, mock_settings):
+    def test_default_matte_is_none(self, mock_run, mock_settings):
         mock_settings.return_value = MagicMock()
         mock_run.return_value = _fake_result()
 
@@ -204,7 +204,7 @@ class TestApply:
             json={"image_path": "/tmp/test.png", "tv_ip": "192.168.1.50"},
         )
         assert resp.status_code == 200
-        assert mock_run.call_args.kwargs["matte"] == "shadowbox_polar"
+        assert mock_run.call_args.kwargs["matte"] == "none"
 
     def test_missing_image_path_returns_422(self):
         resp = client.post("/apply", json={"tv_ip": "192.168.1.50"})

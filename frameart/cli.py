@@ -167,7 +167,7 @@ def generate(ctx, prompt, style, provider, model, upscaler, negative_prompt, see
 @click.option("--tv", type=str, default=None, help="TV profile name from config.")
 @click.option("--tv-ip", type=str, default=None, help="TV IP address.")
 @click.option(
-    "--matte", type=str, default="shadowbox_polar",
+    "--matte", type=str, default="none",
     help="Matte style (run 'frameart tv matte-list' to see options).",
 )
 @click.pass_context
@@ -205,7 +205,7 @@ def apply(ctx, image, tv, tv_ip, matte):
 @click.option("--tv", type=str, default=None, help="TV profile name from config.")
 @click.option("--tv-ip", type=str, default=None, help="TV IP address.")
 @click.option(
-    "--matte", type=str, default="shadowbox_polar",
+    "--matte", type=str, default="none",
     help="Matte style (run 'frameart tv matte-list' to see options).",
 )
 @click.option("--no-upload", is_flag=True, help="Generate + postprocess but skip upload.")

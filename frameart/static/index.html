@@ -230,8 +230,8 @@
     <select id="upload-tv-select"></select>
     <label for="upload-matte-select">Matte Style</label>
     <select id="upload-matte-select">
-      <option value="shadowbox_polar">shadowbox_polar (default)</option>
-      <option value="none">none</option>
+      <option value="none">none (default)</option>
+      <option value="shadowbox_polar">shadowbox_polar</option>
     </select>
     <div class="modal-actions">
       <button class="btn btn-secondary btn-small" id="btn-upload-cancel">Cancel</button>
@@ -510,7 +510,7 @@
 
   document.getElementById('btn-upload-apply').addEventListener('click', async () => {
     const tvIp = document.getElementById('upload-tv-select').value;
-    const matte = document.getElementById('upload-matte-select').value || 'shadowbox_polar';
+    const matte = document.getElementById('upload-matte-select').value || 'none';
     const statusEl = document.getElementById('upload-status');
     const statusTextEl = document.getElementById('upload-status-text');
 
@@ -685,8 +685,8 @@
       const mattes = await resp.json();
       sel.innerHTML = '';
       if (!mattes.length) {
-        sel.innerHTML = '<option value="shadowbox_polar">shadowbox_polar</option>' +
-                        '<option value="none">none</option>';
+        sel.innerHTML = '<option value="none">none</option>' +
+                        '<option value="shadowbox_polar">shadowbox_polar</option>';
         return;
       }
       for (const m of mattes) {
@@ -697,9 +697,9 @@
         sel.appendChild(opt);
       }
     } catch {
-      sel.innerHTML = '<option value="shadowbox_polar">shadowbox_polar</option>' +
-                      '<option value="shadowbox_noir">shadowbox_noir</option>' +
-                      '<option value="none">none</option>';
+      sel.innerHTML = '<option value="none">none</option>' +
+                      '<option value="shadowbox_polar">shadowbox_polar</option>' +
+                      '<option value="shadowbox_noir">shadowbox_noir</option>';
     }
   }
 
