@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,8 @@ AIC_API_BASE = "https://api.artic.edu/api/v1"
 CMA_API_BASE = "https://openaccess-api.clevelandart.org/api"
 RIJKS_SEARCH_API_BASE = "https://data.rijksmuseum.nl/search/collection"
 RIJKS_ID_BASE = "https://id.rijksmuseum.nl"
+
+logger = logging.getLogger(__name__)
 
 
 def _http_client() -> httpx.Client:
@@ -378,8 +381,14 @@ def _rijks_search_candidates(
             resp = client.get(RIJKS_SEARCH_API_BASE, params=params)
             resp.raise_for_status()
             payload = resp.json()
+            logger.info(
+                "Rijks search params=%s status=%s",
+                params,
+                resp.status_code,
+            )
         except Exception as exc:
             last_error = exc
+            logger.warning("Rijks search request failed params=%s error=%s", params, exc)
             continue
 
         items: list[Any] = []
@@ -387,6 +396,13 @@ def _rijks_search_candidates(
             ordered = payload.get("orderedItems")
             results = payload.get("results")
             generic_items = payload.get("items")
+            logger.info(
+                "Rijks payload keys=%s orderedItems=%s results=%s items=%s",
+                sorted(payload.keys()),
+                len(ordered) if isinstance(ordered, list) else "n/a",
+                len(results) if isinstance(results, list) else "n/a",
+                len(generic_items) if isinstance(generic_items, list) else "n/a",
+            )
             if isinstance(ordered, list):
                 items = ordered
             elif isinstance(results, list):
@@ -411,10 +427,18 @@ def _rijks_search_candidates(
             seen.add(artwork_id)
             candidates.append((artwork_id, summary))
             if len(candidates) >= max_candidates:
+                logger.info("Rijks candidate cap reached count=%d", len(candidates))
                 return candidates
 
     if not candidates and last_error:
+        logger.warning("Rijks search produced no candidates and last_error=%s", last_error)
         raise last_error
+    logger.info(
+        "Rijks search candidates query=%r count=%d sample_ids=%s",
+        query,
+        len(candidates),
+        [cid for cid, _ in candidates[:5]],
+    )
     return candidates
 
 
@@ -491,18 +515,30 @@ def search_artworks(source: str, query: str, limit: int = 20) -> list[dict[str, 
         # Rijksmuseum Data Services (keyless)
         data = _rijks_search_candidates(client, q, max(limit * 4, 40))
         results: list[dict[str, Any]] = []
+        dropped_no_image = 0
+        dropped_detail_error = 0
         for artwork_id, summary in data:
             detail: dict[str, Any] = {}
             try:
                 detail = _rijks_fetch_object(client, artwork_id)
             except Exception:
+                dropped_detail_error += 1
                 detail = {}
             item = _rijks_object_to_item(artwork_id, summary, detail)
             if not item:
+                dropped_no_image += 1
                 continue
             results.append(item)
             if len(results) >= limit:
                 break
+        logger.info(
+            "Rijks final query=%r candidates=%d returned=%d dropped_no_image=%d detail_errors=%d",
+            q,
+            len(data),
+            len(results),
+            dropped_no_image,
+            dropped_detail_error,
+        )
         return results
 
 
