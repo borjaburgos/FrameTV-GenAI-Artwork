@@ -665,8 +665,35 @@ class TestCatalogSearch:
         assert data[0]["artwork_id"] == "123"
 
     @patch("frameart.public_domain.search_artworks")
+    def test_returns_cma_results(self, mock_search):
+        mock_search.return_value = [
+            {
+                "source": "cma",
+                "artwork_id": "98765",
+                "title": "The Red Kerchief",
+                "artist": "Paul Klee",
+                "date": "1933",
+                "image_url": "https://images.clevelandart.org/test.jpg",
+                "thumbnail_url": "https://images.clevelandart.org/test-thumb.jpg",
+                "license": "CC0",
+                "attribution": "Cleveland Museum of Art",
+                "source_url": "https://www.clevelandart.org/art/98765",
+                "is_public_domain": True,
+            }
+        ]
+
+        resp = client.get("/catalog/search?source=cma&q=klee&limit=10")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["source"] == "cma"
+        assert data[0]["artwork_id"] == "98765"
+
+    @patch("frameart.public_domain.search_artworks")
     def test_bad_source_returns_400(self, mock_search):
-        mock_search.side_effect = ValueError("Unsupported source 'foo'.")
+        mock_search.side_effect = ValueError(
+            "Unsupported source 'foo'. Use 'met', 'aic', or 'cma'."
+        )
 
         resp = client.get("/catalog/search?source=foo&q=test")
         assert resp.status_code == 400
