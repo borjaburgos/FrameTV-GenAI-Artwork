@@ -88,6 +88,12 @@
                  gap: .8rem; margin-top: 1rem; }
   .tv-art-item { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
                  padding: .8rem; display: flex; flex-direction: column; gap: .5rem; }
+  .tv-art-item .art-thumb-wrap { width: 100%; aspect-ratio: 16/9; border-radius: 6px;
+                                 overflow: hidden; background: #121212; border: 1px solid var(--border);
+                                 position: relative; }
+  .tv-art-item .art-thumb { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .tv-art-item .art-thumb-fallback { position: absolute; inset: 0; display: none; align-items: center;
+                                     justify-content: center; color: var(--muted); font-size: .8rem; }
   .tv-art-item .art-id { font-family: monospace; font-size: .85rem; }
   .tv-art-item .art-fav { color: var(--warn); font-size: .8rem; }
   .tv-art-item .art-actions { display: flex; gap: .4rem; flex-wrap: wrap; }
@@ -609,6 +615,14 @@
 
       grid.innerHTML = artworks.map(a => `
         <div class="tv-art-item">
+          <div class="art-thumb-wrap">
+            <img class="art-thumb"
+                 src="/tv/art/thumbnail?tv_ip=${encodeURIComponent(tvIp)}&content_id=${encodeURIComponent(a.content_id)}"
+                 alt="Thumbnail ${esc(a.content_id)}"
+                 loading="lazy"
+                 onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
+            <div class="art-thumb-fallback">No thumbnail</div>
+          </div>
           <div>
             <span class="art-id">${esc(a.content_id)}</span>
             ${a.is_favourite ? '<span class="art-fav">\u2665 favourite</span>' : ''}

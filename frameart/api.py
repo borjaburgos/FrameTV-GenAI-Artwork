@@ -40,7 +40,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -414,6 +414,23 @@ def tv_list_art(
         )
         for a in artworks
     ]
+
+
+@app.get("/tv/art/thumbnail")
+def tv_art_thumbnail(
+    content_id: str = Query(..., description="Artwork content ID."),
+    tv: str | None = Query(None, description="TV profile name from config."),
+    tv_ip: str | None = Query(None, description="TV IP address."),
+):
+    """Fetch thumbnail bytes for an artwork on the Frame TV."""
+    from frameart.tv.controller import get_art_thumbnail
+
+    profile = _resolve_tv_profile(tv, tv_ip)
+    thumbnail = get_art_thumbnail(profile, content_id)
+    if thumbnail is None:
+        raise HTTPException(status_code=404, detail="Thumbnail not available.")
+
+    return Response(content=thumbnail, media_type="image/jpeg")
 
 
 @app.post("/tv/art/delete", response_model=DeleteArtResponse)

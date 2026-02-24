@@ -342,6 +342,36 @@ class TestTVListArt:
 
 
 # ---------------------------------------------------------------------------
+# GET /tv/art/thumbnail
+# ---------------------------------------------------------------------------
+
+class TestTVArtThumbnail:
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.get_art_thumbnail")
+    def test_returns_thumbnail_bytes(self, mock_thumb, mock_settings):
+        settings = MagicMock()
+        settings.tvs = {}
+        mock_settings.return_value = settings
+        mock_thumb.return_value = b"\xff\xd8\xff\xd9"
+
+        resp = client.get("/tv/art/thumbnail?tv_ip=192.168.1.100&content_id=MY_F0001")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"] == "image/jpeg"
+        assert resp.content == b"\xff\xd8\xff\xd9"
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.get_art_thumbnail")
+    def test_returns_404_when_unavailable(self, mock_thumb, mock_settings):
+        settings = MagicMock()
+        settings.tvs = {}
+        mock_settings.return_value = settings
+        mock_thumb.return_value = None
+
+        resp = client.get("/tv/art/thumbnail?tv_ip=192.168.1.100&content_id=MY_F0001")
+        assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
 # POST /tv/art/delete
 # ---------------------------------------------------------------------------
 

@@ -474,6 +474,22 @@ def list_art_deduplicated(profile: TVProfile) -> list[dict[str, Any]]:
     return unique
 
 
+def get_art_thumbnail(profile: TVProfile, content_id: str) -> bytes | None:
+    """Fetch thumbnail bytes for a TV artwork content ID.
+
+    Returns ``None`` if the TV does not provide a thumbnail for the content.
+    """
+    art = _connect_art(profile)
+    try:
+        data = art.get_thumbnail(content_id)
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data)
+        return None
+    except Exception as e:
+        logger.warning("Failed to fetch thumbnail for %s: %s", content_id, e)
+        return None
+
+
 def get_matte_list(profile: TVProfile) -> list[dict[str, Any]]:
     """Query the TV for its supported matte types.
 
