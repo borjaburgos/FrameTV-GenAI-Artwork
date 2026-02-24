@@ -684,10 +684,29 @@ def get_matte_list(profile: TVProfile) -> list[dict[str, Any]]:
 
     Returns a list of dicts, each with at least a ``matte_id`` key.
     The exact structure depends on the TV firmware.
+
+    The upstream ``samsungtvws`` library expects the key ``matte_type_list``
+    in the response, but API 0.97 (2018/2019 Frame TVs) returns the data
+    under ``matte_list`` instead.  We handle both variants here.
     """
     tv = _connect(profile)
     art = tv.art()
-    return art.get_matte_list()
+    try:
+        return art.get_matte_list()
+    except KeyError:
+        # API 0.97 returns "matte_list" instead of "matte_type_list".
+        # Fall back to a manual request using the same art channel.
+        logger.debug("Library get_matte_list() failed, trying 0.97 key")
+
+    response = art._send_art_request(
+        {"request": "get_matte_list"},
+        wait_for_event=D2D_SERVICE_MESSAGE_EVENT,
+    )
+    assert response
+    data = json.loads(response["data"])
+    # Try both key names
+    raw = data.get("matte_type_list") or data.get("matte_list", "[]")
+    return json.loads(raw)
 
 
 def change_matte(profile: TVProfile, content_id: str, matte_id: str) -> bool:
