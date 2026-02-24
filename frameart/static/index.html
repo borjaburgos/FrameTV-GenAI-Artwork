@@ -88,6 +88,8 @@
                  gap: .8rem; margin-top: 1rem; }
   .tv-art-item { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
                  padding: .8rem; display: flex; flex-direction: column; gap: .5rem; }
+  .tv-art-item .art-select-row { display: flex; align-items: center; gap: .5rem; }
+  .tv-art-item .art-select-row input[type="checkbox"] { width: auto; margin: 0; }
   .tv-art-item .art-thumb-wrap { width: 100%; aspect-ratio: 16/9; border-radius: 6px;
                                  overflow: hidden; background: #121212; border: 1px solid var(--border);
                                  position: relative; }
@@ -196,6 +198,7 @@
       <div class="btn-group">
         <select id="tv-art-select" style="width:auto; margin-bottom:0;"></select>
         <button class="btn btn-secondary btn-small" id="btn-load-art">Load Art</button>
+        <button class="btn btn-danger btn-small" id="btn-delete-selected" disabled>Delete Selected</button>
       </div>
     </div>
     <div class="tv-art-grid" id="tv-art-grid"></div>
@@ -256,6 +259,8 @@
   // =========================================================================
   // Each entry: { ip, name, source ('config'|'discovered'), model?, frame_tv? }
   let knownTVs = [];
+  let selectedTVArtIds = new Set();
+  let loadedTVArtById = {};
 
   function addTVs(tvs, source) {
     for (const tv of tvs) {
@@ -584,12 +589,33 @@
   // =========================================================================
   // TV Art — list art on TV
   // =========================================================================
+  document.getElementById('tv-art-select').addEventListener('change', () => {
+    selectedTVArtIds = new Set();
+    loadedTVArtById = {};
+    updateDeleteSelectedButton();
+    document.getElementById('tv-art-grid').innerHTML = '';
+    const empty = document.getElementById('tv-art-empty');
+    empty.textContent = 'Select a TV and click "Load Art".';
+    empty.style.display = 'block';
+  });
   document.getElementById('btn-load-art').addEventListener('click', loadTVArt);
+  document.getElementById('btn-delete-selected').addEventListener('click', deleteSelectedTVArt);
+
+  function updateDeleteSelectedButton() {
+    const btn = document.getElementById('btn-delete-selected');
+    const n = selectedTVArtIds.size;
+    btn.disabled = n === 0;
+    btn.textContent = n > 0 ? ('Delete Selected (' + n + ')') : 'Delete Selected';
+  }
 
   async function loadTVArt() {
     const tvIp = document.getElementById('tv-art-select').value;
     const grid = document.getElementById('tv-art-grid');
     const empty = document.getElementById('tv-art-empty');
+
+    selectedTVArtIds = new Set();
+    loadedTVArtById = {};
+    updateDeleteSelectedButton();
 
     if (!tvIp) {
       empty.textContent = 'Please select a TV.';
@@ -613,8 +639,15 @@
         return;
       }
 
+      loadedTVArtById = Object.fromEntries(artworks.map(a => [a.content_id, a]));
+
       grid.innerHTML = artworks.map(a => `
         <div class="tv-art-item">
+          <label class="art-select-row">
+            <input type="checkbox" class="tv-art-select-item" data-content-id="${esc(a.content_id)}">
+            <span class="art-id">${esc(a.content_id)}</span>
+            ${a.is_favourite ? '<span class="art-fav">\u2665 favourite</span>' : ''}
+          </label>
           <div class="art-thumb-wrap">
             <img class="art-thumb"
                  src="/tv/art/thumbnail?tv_ip=${encodeURIComponent(tvIp)}&content_id=${encodeURIComponent(a.content_id)}"
@@ -622,10 +655,6 @@
                  loading="lazy"
                  onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
             <div class="art-thumb-fallback">No thumbnail</div>
-          </div>
-          <div>
-            <span class="art-id">${esc(a.content_id)}</span>
-            ${a.is_favourite ? '<span class="art-fav">\u2665 favourite</span>' : ''}
           </div>
           <div class="art-actions">
             <button class="btn btn-secondary btn-small"
@@ -637,6 +666,20 @@
           </div>
         </div>
       `).join('');
+
+      grid.querySelectorAll('.tv-art-select-item').forEach(el => {
+        el.addEventListener('change', (e) => {
+          const checkbox = e.target;
+          const cid = checkbox.dataset.contentId;
+          if (!cid) return;
+          if (checkbox.checked) {
+            selectedTVArtIds.add(cid);
+          } else {
+            selectedTVArtIds.delete(cid);
+          }
+          updateDeleteSelectedButton();
+        });
+      });
     } catch (e) {
       grid.innerHTML = '<div class="empty">Failed to load art: ' + esc(e.message) + '</div>';
     }
@@ -672,6 +715,45 @@
       alert('Failed to delete: ' + e.message);
     }
   };
+
+  async function deleteSelectedTVArt() {
+    const tvIp = document.getElementById('tv-art-select').value;
+    const selectedIds = Array.from(selectedTVArtIds);
+    if (!tvIp || !selectedIds.length) return;
+
+    const favCount = selectedIds.filter(cid => loadedTVArtById[cid]?.is_favourite).length;
+    const msg = favCount
+      ? ('Delete ' + selectedIds.length + ' selected artworks? This includes ' + favCount + ' favourite(s).')
+      : ('Delete ' + selectedIds.length + ' selected artworks from TV?');
+    if (!confirm(msg)) return;
+
+    const btn = document.getElementById('btn-delete-selected');
+    btn.disabled = true;
+
+    try {
+      const resp = await fetch('/tv/art/delete', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          content_ids: selectedIds,
+          tv_ip: tvIp,
+          include_favorites: favCount > 0,
+        }),
+      });
+      if (!resp.ok) throw new Error('Server returned ' + resp.status);
+      const data = await resp.json();
+      if (data.deleted.length) {
+        await loadTVArt();
+      }
+      if (data.skipped_favorites.length) {
+        alert('Some favourites were skipped: ' + data.skipped_favorites.join(', '));
+      }
+    } catch (e) {
+      alert('Failed to delete selected artwork: ' + e.message);
+    } finally {
+      updateDeleteSelectedButton();
+    }
+  }
 
   // =========================================================================
   // Change Matte modal
