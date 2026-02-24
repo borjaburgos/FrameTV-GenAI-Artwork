@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -194,10 +195,37 @@ def _is_image_url(url: str) -> bool:
     lowered = url.lower()
     if not (lowered.startswith("http://") or lowered.startswith("https://")):
         return False
+    if "iiif.micr.io" in lowered:
+        return True
     return any(
         token in lowered
         for token in (".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".jp2", "/iiif/")
     )
+
+
+def _normalize_image_url(url: str) -> str:
+    """Convert IIIF-related references into a directly downloadable image URL."""
+    lowered = url.lower()
+    if "iiif.micr.io" not in lowered:
+        return url
+
+    # info.json -> direct image
+    if lowered.endswith("/info.json"):
+        return url[: -len("/info.json")] + "/full/max/0/default.jpg"
+    # manifest -> direct image
+    if lowered.endswith("/manifest"):
+        return url[: -len("/manifest")] + "/full/max/0/default.jpg"
+
+    parsed = urlparse(url)
+    path = parsed.path.rstrip("/")
+    if not path:
+        return url
+    last_segment = path.split("/")[-1]
+    # Bare resource root like https://iiif.micr.io/RFwqO
+    if "." not in last_segment and "/full/" not in path:
+        base = url.rstrip("/")
+        return f"{base}/full/max/0/default.jpg"
+    return url
 
 
 def _rijks_image_urls(*sources: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -212,7 +240,7 @@ def _rijks_image_urls(*sources: dict[str, Any]) -> tuple[str | None, str | None]
             continue
         seen.add(value)
         if _is_image_url(value):
-            image_urls.append(value)
+            image_urls.append(_normalize_image_url(value))
     if not image_urls:
         return None, None
     return image_urls[0], image_urls[0]
