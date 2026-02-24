@@ -432,7 +432,8 @@ def tv_list_art(ctx, tv_name, tv_ip):
         click.echo(f"Found {len(artworks)} artwork(s):")
         for art in artworks:
             cid = art.get("content_id", "unknown")
-            click.echo(f"  {cid}")
+            fav = " \u2665" if art.get("is_favourite") == "on" else ""
+            click.echo(f"  {cid}{fav}")
     except Exception as e:
         click.secho(f"Failed to list art: {e}", fg="red", err=True)
         sys.exit(1)
