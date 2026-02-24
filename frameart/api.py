@@ -46,6 +46,7 @@ from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
+import frameart.public_domain as public_domain
 from frameart import __version__
 from frameart.config import STYLE_PRESETS, load_settings
 
@@ -557,10 +558,8 @@ def catalog_search(
     limit: int = Query(20, ge=1, le=50, description="Max results."),
 ):
     """Search public-domain artwork from supported providers."""
-    from frameart.public_domain import search_artworks
-
     try:
-        items = search_artworks(source=source, query=q, limit=limit)
+        items = public_domain.search_artworks(source=source, query=q, limit=limit)
     except ValueError as e:
         logger.warning("Catalog search bad request source=%s q=%r: %s", source, q, e)
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -593,13 +592,16 @@ def catalog_search(
 def catalog_apply(req: PublicDomainApplyRequest):
     """Download a public-domain artwork and upload it to a TV."""
     from frameart.pipeline import run_import_and_apply
-    from frameart.public_domain import download_artwork_image
 
     settings = _settings()
     cache_dir = settings.data_dir / "catalog_cache"
 
     try:
-        image_path, item = download_artwork_image(req.source, req.artwork_id, cache_dir)
+        image_path, item = public_domain.download_artwork_image(
+            req.source,
+            req.artwork_id,
+            cache_dir,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:

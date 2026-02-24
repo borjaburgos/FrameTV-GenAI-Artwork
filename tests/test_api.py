@@ -639,7 +639,7 @@ class TestTVConfigured:
 # ---------------------------------------------------------------------------
 
 class TestCatalogSearch:
-    @patch("frameart.public_domain.search_artworks")
+    @patch("frameart.api.public_domain.search_artworks")
     def test_returns_results(self, mock_search):
         mock_search.return_value = [
             {
@@ -664,7 +664,7 @@ class TestCatalogSearch:
         assert data[0]["source"] == "met"
         assert data[0]["artwork_id"] == "123"
 
-    @patch("frameart.public_domain.search_artworks")
+    @patch("frameart.api.public_domain.search_artworks")
     def test_returns_cma_results(self, mock_search):
         mock_search.return_value = [
             {
@@ -689,7 +689,7 @@ class TestCatalogSearch:
         assert data[0]["source"] == "cma"
         assert data[0]["artwork_id"] == "98765"
 
-    @patch("frameart.public_domain.search_artworks")
+    @patch("frameart.api.public_domain.search_artworks")
     def test_bad_source_returns_400(self, mock_search):
         mock_search.side_effect = ValueError(
             "Unsupported source 'foo'. Use 'met', 'aic', or 'cma'."
@@ -698,7 +698,7 @@ class TestCatalogSearch:
         resp = client.get("/catalog/search?source=foo&q=test")
         assert resp.status_code == 400
 
-    @patch("frameart.public_domain.search_artworks")
+    @patch("frameart.api.public_domain.search_artworks")
     def test_drops_invalid_items_instead_of_500(self, mock_search):
         mock_search.return_value = [
             {"source": "met", "artwork_id": "123"},  # missing required fields
@@ -721,7 +721,7 @@ class TestCatalogSearch:
 class TestCatalogApply:
     @patch("frameart.api._settings")
     @patch("frameart.pipeline.run_import_and_apply")
-    @patch("frameart.public_domain.download_artwork_image")
+    @patch("frameart.api.public_domain.download_artwork_image")
     def test_apply_public_artwork_success(self, mock_download, mock_run, mock_settings):
         settings = MagicMock()
         settings.data_dir = Path("/tmp/frameart_test")
@@ -750,7 +750,7 @@ class TestCatalogApply:
         assert mock_run.call_args.kwargs["source_metadata"]["artwork_id"] == "123"
 
     @patch("frameart.api._settings")
-    @patch("frameart.public_domain.download_artwork_image")
+    @patch("frameart.api.public_domain.download_artwork_image")
     def test_apply_public_artwork_bad_input_returns_400(self, mock_download, mock_settings):
         settings = MagicMock()
         settings.data_dir = Path("/tmp/frameart_test")
