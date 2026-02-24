@@ -690,9 +690,34 @@ class TestCatalogSearch:
         assert data[0]["artwork_id"] == "98765"
 
     @patch("frameart.api.public_domain.search_artworks")
+    def test_returns_rijks_results(self, mock_search):
+        mock_search.return_value = [
+            {
+                "source": "rijks",
+                "artwork_id": "SK-C-5",
+                "title": "The Night Watch",
+                "artist": "Rembrandt van Rijn",
+                "date": "1642",
+                "image_url": "https://images.rijksmuseum.nl/test.jpg",
+                "thumbnail_url": "https://images.rijksmuseum.nl/test-thumb.jpg",
+                "license": "Public Domain",
+                "attribution": "Rijksmuseum",
+                "source_url": "https://www.rijksmuseum.nl/en/collection/SK-C-5",
+                "is_public_domain": True,
+            }
+        ]
+
+        resp = client.get("/catalog/search?source=rijks&q=rembrandt&limit=10")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["source"] == "rijks"
+        assert data[0]["artwork_id"] == "SK-C-5"
+
+    @patch("frameart.api.public_domain.search_artworks")
     def test_bad_source_returns_400(self, mock_search):
         mock_search.side_effect = ValueError(
-            "Unsupported source 'foo'. Use 'met', 'aic', or 'cma'."
+            "Unsupported source 'foo'. Use 'met', 'aic', 'cma', or 'rijks'."
         )
 
         resp = client.get("/catalog/search?source=foo&q=test")

@@ -376,6 +376,7 @@ See [`config.example.yaml`](config.example.yaml) for all options.
 |----------|-------------|
 | `OPENAI_API_KEY` | OpenAI API key for DALL-E |
 | `OLLAMA_BASE_URL` | Ollama server URL (default: `http://localhost:11434`) |
+| `FRAMEART_RIJKS_API_KEY` | Rijksmuseum API key for public-domain search (`source=rijks`) |
 | `FRAMEART_DATA_DIR` | Data directory (default: `/data/frameart` or `~/.local/share/frameart`) |
 | `FRAMEART_CONFIG` | Path to config file |
 | `FRAMEART_DEFAULT_PROVIDER` | Default image provider |
