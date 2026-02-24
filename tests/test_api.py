@@ -635,6 +635,90 @@ class TestTVConfigured:
 
 
 # ---------------------------------------------------------------------------
+# Public domain catalog
+# ---------------------------------------------------------------------------
+
+class TestCatalogSearch:
+    @patch("frameart.public_domain.search_artworks")
+    def test_returns_results(self, mock_search):
+        mock_search.return_value = [
+            {
+                "source": "met",
+                "artwork_id": "123",
+                "title": "Water Lilies",
+                "artist": "Claude Monet",
+                "date": "1906",
+                "image_url": "https://example.com/full.jpg",
+                "thumbnail_url": "https://example.com/thumb.jpg",
+                "license": "Public Domain",
+                "attribution": "The Met",
+                "source_url": "https://example.com/object/123",
+                "is_public_domain": True,
+            }
+        ]
+
+        resp = client.get("/catalog/search?source=met&q=monet&limit=10")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["source"] == "met"
+        assert data[0]["artwork_id"] == "123"
+
+    @patch("frameart.public_domain.search_artworks")
+    def test_bad_source_returns_400(self, mock_search):
+        mock_search.side_effect = ValueError("Unsupported source 'foo'.")
+
+        resp = client.get("/catalog/search?source=foo&q=test")
+        assert resp.status_code == 400
+
+
+class TestCatalogApply:
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_apply")
+    @patch("frameart.public_domain.download_artwork_image")
+    def test_apply_public_artwork_success(self, mock_download, mock_run, mock_settings):
+        settings = MagicMock()
+        settings.data_dir = Path("/tmp/frameart_test")
+        settings.tvs = {}
+        mock_settings.return_value = settings
+        mock_download.return_value = (
+            Path("/tmp/frameart_test/catalog_cache/met_123.jpg"),
+            {
+                "source": "met",
+                "artwork_id": "123",
+                "title": "Water Lilies",
+                "image_url": "https://example.com/full.jpg",
+                "is_public_domain": True,
+            },
+        )
+        mock_run.return_value = _fake_result()
+
+        resp = client.post(
+            "/catalog/apply",
+            json={"source": "met", "artwork_id": "123", "tv_ip": "192.168.1.100"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["content_id"] == "MY_ART_001"
+        assert data["metadata"]["catalog_item"]["artwork_id"] == "123"
+
+    @patch("frameart.api._settings")
+    @patch("frameart.public_domain.download_artwork_image")
+    def test_apply_public_artwork_bad_input_returns_400(self, mock_download, mock_settings):
+        settings = MagicMock()
+        settings.data_dir = Path("/tmp/frameart_test")
+        settings.tvs = {}
+        mock_settings.return_value = settings
+        mock_download.side_effect = ValueError("Artwork is unavailable or not public domain.")
+
+        resp = client.post(
+            "/catalog/apply",
+            json={"source": "met", "artwork_id": "123", "tv_ip": "192.168.1.100"},
+        )
+        assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
 # POST /jobs/{job_id}/apply
 # ---------------------------------------------------------------------------
 

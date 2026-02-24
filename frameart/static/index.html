@@ -130,6 +130,7 @@
   <div class="tabs">
     <button class="active" data-tab="generate">Generate</button>
     <button data-tab="gallery">Gallery</button>
+    <button data-tab="public">Public Domain</button>
     <button data-tab="tvs">TVs</button>
   </div>
 </div>
@@ -187,6 +188,47 @@
   </div>
   <div class="gallery" id="gallery-grid"></div>
   <div class="empty" id="gallery-empty" style="display:none;">No artwork generated yet.</div>
+</div>
+
+<!-- ===== Public Domain ===== -->
+<div class="panel" id="panel-public">
+  <div class="section-heading">
+    <h2>Public Domain Artwork</h2>
+  </div>
+  <div class="row">
+    <div>
+      <label for="public-source">Source</label>
+      <select id="public-source">
+        <option value="met">The Met</option>
+        <option value="aic">Art Institute of Chicago</option>
+      </select>
+    </div>
+    <div>
+      <label for="public-query">Search</label>
+      <input id="public-query" placeholder="e.g. monet, landscape, ukiyo-e">
+    </div>
+    <div style="align-self:end;">
+      <button class="btn btn-secondary" id="btn-public-search">Search</button>
+    </div>
+  </div>
+  <div class="row">
+    <div>
+      <label for="public-tv-select">Display on TV</label>
+      <select id="public-tv-select"></select>
+    </div>
+    <div>
+      <label for="public-matte-select">Matte Style</label>
+      <select id="public-matte-select">
+        <option value="none">none</option>
+        <option value="shadowbox_polar">shadowbox_polar</option>
+      </select>
+    </div>
+  </div>
+  <div class="status-bar" id="public-status">
+    <div class="value" id="public-status-text"></div>
+  </div>
+  <div class="gallery" id="public-grid"></div>
+  <div class="empty" id="public-empty">Search public-domain catalogs to display art on your TV.</div>
 </div>
 
 <!-- ===== TVs ===== -->
@@ -282,13 +324,15 @@
 
   function refreshTVSelects() {
     // Update all TV <select> elements throughout the UI
-    const selectors = ['tv-select', 'tv-art-select', 'upload-tv-select'];
+    const selectors = ['tv-select', 'tv-art-select', 'upload-tv-select', 'public-tv-select'];
     for (const id of selectors) {
       const sel = document.getElementById(id);
       if (!sel) continue;
       const prev = sel.value;
       if (id === 'tv-select') {
         sel.innerHTML = '<option value="">Generate only (no TV)</option>';
+      } else if (id === 'public-tv-select') {
+        sel.innerHTML = '<option value="">Select TV...</option>';
       } else {
         sel.innerHTML = '';
       }
@@ -566,6 +610,145 @@
   };
   document.getElementById('modal').addEventListener('click', function() {
     this.classList.remove('visible');
+  });
+
+  // =========================================================================
+  // Public domain catalog
+  // =========================================================================
+  const publicStatus = document.getElementById('public-status');
+  const publicStatusText = document.getElementById('public-status-text');
+
+  function showPublicStatus(msg, cls) {
+    publicStatus.className = 'status-bar visible' + (cls ? ' ' + cls : '');
+    publicStatusText.textContent = msg;
+  }
+
+  function renderPublicResults(items) {
+    const grid = document.getElementById('public-grid');
+    const empty = document.getElementById('public-empty');
+
+    if (!items.length) {
+      grid.innerHTML = '';
+      empty.textContent = 'No public-domain results found for this query.';
+      empty.style.display = 'block';
+      return;
+    }
+
+    empty.style.display = 'none';
+    grid.innerHTML = items.map(item => {
+      const title = esc(item.title || (item.source + ' ' + item.artwork_id));
+      const artist = esc(item.artist || 'Unknown artist');
+      const date = esc(item.date || '');
+      const meta = date ? (artist + ' · ' + date) : artist;
+      const thumb = esc(item.thumbnail_url || item.image_url || '');
+      const link = esc(item.source_url || '#');
+      return `
+        <div class="gallery-item">
+          <img src="${thumb}" alt="${title}" loading="lazy" onerror="this.style.display='none'">
+          <div class="info">
+            <div class="prompt">${title}</div>
+            <div class="meta">${meta}</div>
+          </div>
+          <div class="actions">
+            <button class="btn btn-small btn-pd-display"
+                    data-source="${esc(item.source)}"
+                    data-id="${esc(item.artwork_id)}">
+              Display on TV</button>
+            <a class="btn btn-secondary btn-small" href="${link}" target="_blank" rel="noopener noreferrer">
+              Source</a>
+          </div>
+        </div>
+      `;
+    }).join('');
+
+    grid.querySelectorAll('.btn-pd-display').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        const source = e.currentTarget.dataset.source;
+        const artworkId = e.currentTarget.dataset.id;
+        await applyPublicArtwork(source, artworkId, e.currentTarget);
+      });
+    });
+  }
+
+  async function searchPublicDomain() {
+    const source = document.getElementById('public-source').value;
+    const q = document.getElementById('public-query').value.trim();
+    const grid = document.getElementById('public-grid');
+    const empty = document.getElementById('public-empty');
+
+    if (!q) {
+      showPublicStatus('Enter search text first.', 'error');
+      return;
+    }
+
+    showPublicStatus('Searching ' + source.toUpperCase() + '...', '');
+    grid.innerHTML = '<div class="empty">Searching...</div>';
+    empty.style.display = 'none';
+
+    try {
+      const resp = await fetch(
+        '/catalog/search?source=' + encodeURIComponent(source) +
+        '&q=' + encodeURIComponent(q) + '&limit=20'
+      );
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.detail || ('Server returned ' + resp.status));
+      }
+      const items = await resp.json();
+      renderPublicResults(items);
+      showPublicStatus('Found ' + items.length + ' result(s).', items.length ? 'done' : '');
+    } catch (e) {
+      grid.innerHTML = '';
+      empty.textContent = 'Search failed.';
+      empty.style.display = 'block';
+      showPublicStatus('Search failed: ' + e.message, 'error');
+    }
+  }
+
+  async function applyPublicArtwork(source, artworkId, btn) {
+    const tvIp = document.getElementById('public-tv-select').value;
+    const matte = document.getElementById('public-matte-select').value || 'none';
+    if (!tvIp) {
+      showPublicStatus('Select a TV first.', 'error');
+      return;
+    }
+
+    btn.disabled = true;
+    showPublicStatus('Downloading and uploading artwork...', '');
+    try {
+      const resp = await fetch('/catalog/apply', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          source: source,
+          artwork_id: artworkId,
+          tv_ip: tvIp,
+          matte: matte,
+        }),
+      });
+      btn.disabled = false;
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.detail || ('Server returned ' + resp.status));
+      }
+
+      const data = await resp.json();
+      showPublicStatus('Displayed on TV. Job ' + data.job_id, 'done');
+    } catch (e) {
+      btn.disabled = false;
+      showPublicStatus('Failed: ' + e.message, 'error');
+    }
+  }
+
+  document.getElementById('btn-public-search').addEventListener('click', searchPublicDomain);
+  document.getElementById('public-query').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      searchPublicDomain();
+    }
+  });
+  document.getElementById('public-tv-select').addEventListener('change', (e) => {
+    loadMattesForSelect('public-matte-select', e.target.value);
   });
 
   // =========================================================================
