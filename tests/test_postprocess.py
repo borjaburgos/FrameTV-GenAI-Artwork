@@ -155,3 +155,20 @@ class TestPostprocess:
         img = Image.open(io.BytesIO(result.image_bytes))
         assert img.size == (TARGET_WIDTH, TARGET_HEIGHT)
         assert img.mode == "RGB"
+
+    def test_trims_embedded_letterbox_bars(self):
+        # Create a 16:9 image with black bars baked into top/bottom.
+        img = Image.new("RGB", (1920, 1080), "black")
+        center = Image.new("RGB", (1920, 800), "blue")
+        img.paste(center, (0, 140))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+
+        upscaler = NoneUpscaler()
+        result = postprocess(buf.getvalue(), upscaler)
+        out = Image.open(io.BytesIO(result.image_bytes))
+        assert out.size == (TARGET_WIDTH, TARGET_HEIGHT)
+
+        # Top row should not stay as black bar after trim+crop+resize.
+        top_row = [out.getpixel((x, 0)) for x in range(0, out.width, 64)]
+        assert any(px != (0, 0, 0) for px in top_row)

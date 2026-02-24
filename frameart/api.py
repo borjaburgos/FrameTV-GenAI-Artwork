@@ -572,7 +572,7 @@ def catalog_search(
 @app.post("/catalog/apply", response_model=JobResponse)
 def catalog_apply(req: PublicDomainApplyRequest):
     """Download a public-domain artwork and upload it to a TV."""
-    from frameart.pipeline import run_apply
+    from frameart.pipeline import run_import_and_apply
     from frameart.public_domain import download_artwork_image
 
     settings = _settings()
@@ -585,14 +585,14 @@ def catalog_apply(req: PublicDomainApplyRequest):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to fetch artwork: {e}") from e
 
-    result = run_apply(
+    result = run_import_and_apply(
         settings,
         str(image_path),
         tv_name=req.tv,
         tv_ip=req.tv_ip,
         matte=req.matte,
+        source_metadata=item,
     )
-    result.metadata = {**result.metadata, "catalog_item": item}
 
     resp = _pipeline_result_to_response(result)
     if result.error:

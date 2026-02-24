@@ -674,7 +674,7 @@ class TestCatalogSearch:
 
 class TestCatalogApply:
     @patch("frameart.api._settings")
-    @patch("frameart.pipeline.run_apply")
+    @patch("frameart.pipeline.run_import_and_apply")
     @patch("frameart.public_domain.download_artwork_image")
     def test_apply_public_artwork_success(self, mock_download, mock_run, mock_settings):
         settings = MagicMock()
@@ -700,7 +700,8 @@ class TestCatalogApply:
         assert resp.status_code == 200
         data = resp.json()
         assert data["content_id"] == "MY_ART_001"
-        assert data["metadata"]["catalog_item"]["artwork_id"] == "123"
+        mock_run.assert_called_once()
+        assert mock_run.call_args.kwargs["source_metadata"]["artwork_id"] == "123"
 
     @patch("frameart.api._settings")
     @patch("frameart.public_domain.download_artwork_image")
