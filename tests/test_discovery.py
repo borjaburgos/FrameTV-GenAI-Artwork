@@ -5,6 +5,8 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 from frameart.tv.discovery import (
+    _SEARCH_TARGETS,
+    _SEND_COUNT,
     DiscoveredTV,
     _query_device_info,
     _ssdp_search,
@@ -13,8 +15,9 @@ from frameart.tv.discovery import (
 
 
 class TestSSDPSearch:
+    @patch("frameart.tv.discovery.time.sleep")
     @patch("frameart.tv.discovery.socket.socket")
-    def test_parses_location_header(self, mock_socket_cls):
+    def test_parses_location_header(self, mock_socket_cls, _mock_sleep):
         mock_sock = MagicMock()
         mock_socket_cls.return_value = mock_sock
 
@@ -33,21 +36,33 @@ class TestSSDPSearch:
 
         ips = _ssdp_search(timeout=1)
         assert ips == ["192.168.1.50"]
-        mock_sock.sendto.assert_called_once()
 
+        # Should bind and set multicast TTL
+        mock_sock.bind.assert_called_once_with(("", 0))
+        mock_sock.setsockopt.assert_any_call(
+            __import__("socket").SOL_SOCKET,
+            __import__("socket").SO_REUSEADDR,
+            1,
+        )
+
+        # Should send packets for each search target, repeated _SEND_COUNT times
+        expected_sends = len(_SEARCH_TARGETS) * _SEND_COUNT
+        assert mock_sock.sendto.call_count == expected_sends
+
+    @patch("frameart.tv.discovery.time.sleep")
     @patch("frameart.tv.discovery.socket.socket")
-    def test_no_responses(self, mock_socket_cls):
+    def test_no_responses(self, mock_socket_cls, _mock_sleep):
         mock_sock = MagicMock()
         mock_socket_cls.return_value = mock_sock
-
 
         mock_sock.recvfrom.side_effect = TimeoutError("done")
 
         ips = _ssdp_search(timeout=1)
         assert ips == []
 
+    @patch("frameart.tv.discovery.time.sleep")
     @patch("frameart.tv.discovery.socket.socket")
-    def test_deduplicates_ips(self, mock_socket_cls):
+    def test_deduplicates_ips(self, mock_socket_cls, _mock_sleep):
         mock_sock = MagicMock()
         mock_socket_cls.return_value = mock_sock
 
@@ -61,6 +76,23 @@ class TestSSDPSearch:
 
         ips = _ssdp_search(timeout=1)
         assert ips == ["10.0.0.5"]
+
+    @patch("frameart.tv.discovery.time.sleep")
+    @patch("frameart.tv.discovery.socket.socket")
+    def test_fallback_to_source_address(self, mock_socket_cls, _mock_sleep):
+        mock_sock = MagicMock()
+        mock_socket_cls.return_value = mock_sock
+
+        # Response without a LOCATION header — should fall back to addr[0]
+        resp = b"HTTP/1.1 200 OK\r\nST: urn:samsung.com:device:RemoteControlReceiver:1\r\n\r\n"
+
+        mock_sock.recvfrom.side_effect = [
+            (resp, ("10.0.0.7", 1900)),
+            TimeoutError("done"),
+        ]
+
+        ips = _ssdp_search(timeout=1)
+        assert ips == ["10.0.0.7"]
 
 
 class TestQueryDeviceInfo:
