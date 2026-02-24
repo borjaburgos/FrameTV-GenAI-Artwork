@@ -10,6 +10,7 @@ import httpx
 
 MET_API_BASE = "https://collectionapi.metmuseum.org/public/collection/v1"
 AIC_API_BASE = "https://api.artic.edu/api/v1"
+CMA_API_BASE = "https://openaccess-api.clevelandart.org/api"
 
 
 def _http_client() -> httpx.Client:
@@ -84,6 +85,83 @@ def _aic_object_to_item(obj: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _cma_image_urls(obj: dict[str, Any]) -> tuple[str | None, str | None]:
+    images = obj.get("images") if isinstance(obj.get("images"), dict) else {}
+    order = ["web", "print", "full", "archive"]
+    urls: list[str] = []
+    for key in order:
+        value = images.get(key)
+        if isinstance(value, dict):
+            url = value.get("url")
+            if isinstance(url, str) and url:
+                urls.append(url)
+    if not urls:
+        top_url = obj.get("image_url")
+        if isinstance(top_url, str) and top_url:
+            urls.append(top_url)
+    if not urls:
+        return None, None
+    image_url = urls[0]
+    thumb_url = urls[0]
+    return image_url, thumb_url
+
+
+def _cma_is_public_domain(obj: dict[str, Any]) -> bool:
+    open_access = obj.get("open_access")
+    if isinstance(open_access, bool) and open_access:
+        return True
+    if isinstance(open_access, int) and open_access == 1:
+        return True
+
+    status = str(obj.get("share_license_status") or "").upper()
+    if "CC0" in status:
+        return True
+
+    rights = str(obj.get("rights_type") or obj.get("copyright") or "").lower()
+    return bool("public domain" in rights or "cc0" in rights)
+
+
+def _cma_object_to_item(obj: dict[str, Any]) -> dict[str, Any] | None:
+    if not _cma_is_public_domain(obj):
+        return None
+
+    image_url, thumb_url = _cma_image_urls(obj)
+    if not image_url:
+        return None
+
+    artwork_id = str(obj.get("id", ""))
+    if not artwork_id:
+        return None
+
+    creators = obj.get("creators") if isinstance(obj.get("creators"), list) else []
+    artist_names: list[str] = []
+    for creator in creators:
+        if not isinstance(creator, dict):
+            continue
+        desc = creator.get("description")
+        if isinstance(desc, str) and desc:
+            artist_names.append(desc)
+    artist = ", ".join(dict.fromkeys(artist_names)) if artist_names else None
+
+    source_url = obj.get("url")
+    if not isinstance(source_url, str) or not source_url:
+        source_url = f"https://www.clevelandart.org/art/{artwork_id}"
+
+    return {
+        "source": "cma",
+        "artwork_id": artwork_id,
+        "title": obj.get("title") or f"CMA Artwork {artwork_id}",
+        "artist": artist,
+        "date": obj.get("creation_date") or None,
+        "image_url": image_url,
+        "thumbnail_url": thumb_url,
+        "license": obj.get("share_license_status") or "Open Access",
+        "attribution": "Cleveland Museum of Art",
+        "source_url": source_url,
+        "is_public_domain": True,
+    }
+
+
 def _met_fetch_object(client: httpx.Client, artwork_id: str) -> dict[str, Any]:
     resp = client.get(f"{MET_API_BASE}/objects/{artwork_id}")
     resp.raise_for_status()
@@ -107,6 +185,13 @@ def _aic_fetch_object(client: httpx.Client, artwork_id: str) -> dict[str, Any]:
     return data.get("data", {})
 
 
+def _cma_fetch_object(client: httpx.Client, artwork_id: str) -> dict[str, Any]:
+    resp = client.get(f"{CMA_API_BASE}/artworks/{artwork_id}")
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("data", {})
+
+
 def search_artworks(source: str, query: str, limit: int = 20) -> list[dict[str, Any]]:
     """Search public-domain artworks for a source and query."""
     q = query.strip()
@@ -114,8 +199,8 @@ def search_artworks(source: str, query: str, limit: int = 20) -> list[dict[str, 
         return []
 
     src = source.lower()
-    if src not in {"met", "aic"}:
-        raise ValueError(f"Unsupported source '{source}'. Use 'met' or 'aic'.")
+    if src not in {"met", "aic", "cma"}:
+        raise ValueError(f"Unsupported source '{source}'. Use 'met', 'aic', or 'cma'.")
 
     with _http_client() as client:
         if src == "met":
@@ -139,43 +224,61 @@ def search_artworks(source: str, query: str, limit: int = 20) -> list[dict[str, 
                     break
             return results
 
-        fields = ",".join(
-            [
-                "id",
-                "title",
-                "artist_title",
-                "date_display",
-                "is_public_domain",
-                "image_id",
-            ]
-        )
+        if src == "aic":
+            fields = ",".join(
+                [
+                    "id",
+                    "title",
+                    "artist_title",
+                    "date_display",
+                    "is_public_domain",
+                    "image_id",
+                ]
+            )
+            resp = client.get(
+                f"{AIC_API_BASE}/artworks/search",
+                params={
+                    "q": q,
+                    "limit": min(max(limit, 1), 50),
+                    "fields": fields,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json().get("data") or []
+            items = [_aic_object_to_item(obj) for obj in data]
+            return [item for item in items if item is not None][:limit]
+
+        # CMA
         resp = client.get(
-            f"{AIC_API_BASE}/artworks/search",
+            f"{CMA_API_BASE}/artworks",
             params={
                 "q": q,
+                "has_image": "1",
                 "limit": min(max(limit, 1), 50),
-                "fields": fields,
             },
         )
         resp.raise_for_status()
         data = resp.json().get("data") or []
-        items = [_aic_object_to_item(obj) for obj in data]
+        items = [_cma_object_to_item(obj) for obj in data if isinstance(obj, dict)]
         return [item for item in items if item is not None][:limit]
 
 
 def get_artwork(source: str, artwork_id: str) -> dict[str, Any]:
     """Fetch a single artwork metadata record by source and ID."""
     src = source.lower()
-    if src not in {"met", "aic"}:
-        raise ValueError(f"Unsupported source '{source}'. Use 'met' or 'aic'.")
+    if src not in {"met", "aic", "cma"}:
+        raise ValueError(f"Unsupported source '{source}'. Use 'met', 'aic', or 'cma'.")
 
     with _http_client() as client:
         if src == "met":
             obj = _met_fetch_object(client, artwork_id)
             item = _met_object_to_item(obj)
-        else:
+        elif src == "aic":
             obj = _aic_fetch_object(client, artwork_id)
             item = _aic_object_to_item(obj)
+        else:
+            obj = _cma_fetch_object(client, artwork_id)
+            item = _cma_object_to_item(obj)
 
     if not item:
         raise ValueError("Artwork is unavailable or not public domain.")
