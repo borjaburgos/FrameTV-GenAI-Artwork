@@ -438,6 +438,51 @@ def tv_list_art(ctx, tv_name, tv_ip):
         sys.exit(1)
 
 
+@tv.command("delete-art")
+@_debug_option
+@_verbose_option
+@click.option("--tv", "tv_name", type=str, default=None, help="TV profile name.")
+@click.option("--tv-ip", type=str, default=None, help="TV IP address.")
+@click.argument("content_ids", nargs=-1, required=True)
+@click.pass_context
+def tv_delete_art(ctx, tv_name, tv_ip, content_ids):
+    """Delete artworks from the Frame TV by content ID.
+
+    Pass one or more content IDs (use 'frameart tv list-art' to find them).
+
+    \b
+    Examples:
+      frameart tv delete-art MY_F0006
+      frameart tv delete-art MY_F0006 MY_F0007 MY_F0008
+    """
+    _ensure_logging(ctx)
+    from frameart.config import TVProfile
+    from frameart.tv.controller import delete_art
+
+    settings = ctx.obj["settings"]
+
+    profile = None
+    if tv_name and tv_name in settings.tvs:
+        profile = settings.tvs[tv_name]
+    elif tv_ip:
+        profile = TVProfile(ip=tv_ip)
+    elif len(settings.tvs) == 1:
+        profile = next(iter(settings.tvs.values()))
+
+    if profile is None:
+        click.secho("No TV specified. Use --tv or --tv-ip.", fg="red", err=True)
+        sys.exit(1)
+
+    ids = list(content_ids)
+    click.echo(f"Deleting {len(ids)} artwork(s) from TV: {', '.join(ids)}")
+
+    if delete_art(profile, ids):
+        click.secho(f"Deleted {len(ids)} artwork(s).", fg="green")
+    else:
+        click.secho("Failed to delete artwork(s).", fg="red", err=True)
+        sys.exit(1)
+
+
 @tv.command("matte-list")
 @_debug_option
 @_verbose_option

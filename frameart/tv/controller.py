@@ -464,6 +464,30 @@ def get_matte_list(profile: TVProfile) -> list[dict[str, Any]]:
     return result
 
 
+def delete_art(profile: TVProfile, content_ids: list[str]) -> bool:
+    """Delete artworks from the TV by content ID.
+
+    Parameters
+    ----------
+    profile:
+        TV connection profile.
+    content_ids:
+        List of content IDs to delete (e.g., ``["MY_F0006", "MY_F0007"]``).
+
+    Returns
+    -------
+    True on success, False on failure.
+    """
+    art = _connect_art(profile)
+    try:
+        art.delete_list(content_ids)
+        logger.info("Deleted %d artwork(s): %s", len(content_ids), ", ".join(content_ids))
+        return True
+    except Exception as e:
+        logger.error("Failed to delete artwork(s): %s", e)
+        return False
+
+
 def change_matte(profile: TVProfile, content_id: str, matte_id: str) -> bool:
     """Change the matte/frame on an already-uploaded artwork.
 
