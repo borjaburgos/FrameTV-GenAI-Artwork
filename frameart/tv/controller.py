@@ -443,9 +443,35 @@ def switch_art(profile: TVProfile, content_id: str) -> bool:
 
 
 def list_art(profile: TVProfile) -> list[dict[str, Any]]:
-    """List all artworks available on the TV."""
+    """List all artworks available on the TV (raw, includes duplicates across categories)."""
     art = _connect_art(profile)
     return art.available()
+
+
+def list_art_deduplicated(profile: TVProfile) -> list[dict[str, Any]]:
+    """List artworks on the TV, deduplicated with ``is_favourite`` annotated.
+
+    The TV returns each artwork once per category:
+    MY-C0002 = user uploads, MY-C0003 = all, MY-C0004 = favourites.
+    This function deduplicates by ``content_id`` and adds a boolean
+    ``is_favourite`` key based on MY-C0004 membership.
+    """
+    raw = list_art(profile)
+
+    fav_ids: set[str] = set()
+    for item in raw:
+        if item.get("category_id") == "MY-C0004":
+            fav_ids.add(item.get("content_id", ""))
+
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for item in raw:
+        cid = item.get("content_id", "")
+        if cid and cid not in seen:
+            seen.add(cid)
+            unique.append({**item, "is_favourite": cid in fav_ids})
+
+    return unique
 
 
 def get_matte_list(profile: TVProfile) -> list[dict[str, Any]]:

@@ -411,7 +411,7 @@ def tv_list_art(ctx, tv_name, tv_ip):
     """List artworks on the Frame TV."""
     _ensure_logging(ctx)
     from frameart.config import TVProfile
-    from frameart.tv.controller import list_art
+    from frameart.tv.controller import list_art_deduplicated
 
     settings = ctx.obj["settings"]
 
@@ -428,28 +428,11 @@ def tv_list_art(ctx, tv_name, tv_ip):
         sys.exit(1)
 
     try:
-        artworks = list_art(profile)
-
-        # The TV returns each artwork once per category (MY-C0002 = uploads,
-        # MY-C0003 = all, MY-C0004 = favourites).  Deduplicate by content_id
-        # and detect favourites from MY-C0004 membership.
-        fav_ids: set[str] = set()
-        for item in artworks:
-            if item.get("category_id") == "MY-C0004":
-                fav_ids.add(item.get("content_id", ""))
-
-        seen: set[str] = set()
-        unique: list[dict] = []
-        for item in artworks:
-            cid = item.get("content_id", "unknown")
-            if cid not in seen:
-                seen.add(cid)
-                unique.append(item)
-
-        click.echo(f"Found {len(unique)} artwork(s):")
-        for art in unique:
+        artworks = list_art_deduplicated(profile)
+        click.echo(f"Found {len(artworks)} artwork(s):")
+        for art in artworks:
             cid = art.get("content_id", "unknown")
-            fav = " \u2665" if cid in fav_ids else ""
+            fav = " \u2665" if art.get("is_favourite") else ""
             click.echo(f"  {cid}{fav}")
     except Exception as e:
         click.secho(f"Failed to list art: {e}", fg="red", err=True)
@@ -461,10 +444,19 @@ def tv_list_art(ctx, tv_name, tv_ip):
 @_verbose_option
 @click.option("--tv", "tv_name", type=str, default=None, help="TV profile name.")
 @click.option("--tv-ip", type=str, default=None, help="TV IP address.")
+@click.option(
+    "--include-favorites",
+    is_flag=True,
+    default=False,
+    help="Also delete favourited artworks (skipped by default).",
+)
 @click.argument("content_ids", nargs=-1, required=True)
 @click.pass_context
-def tv_delete_art(ctx, tv_name, tv_ip, content_ids):
+def tv_delete_art(ctx, tv_name, tv_ip, include_favorites, content_ids):
     """Delete artworks from the Frame TV by content ID.
+
+    Favourited artworks are skipped by default. Pass --include-favorites
+    to delete them as well.
 
     Pass one or more content IDs (use 'frameart tv list-art' to find them).
 
@@ -472,10 +464,11 @@ def tv_delete_art(ctx, tv_name, tv_ip, content_ids):
     Examples:
       frameart tv delete-art MY_F0006
       frameart tv delete-art MY_F0006 MY_F0007 MY_F0008
+      frameart tv delete-art --include-favorites MY_F0006
     """
     _ensure_logging(ctx)
     from frameart.config import TVProfile
-    from frameart.tv.controller import delete_art
+    from frameart.tv.controller import delete_art, list_art_deduplicated
 
     settings = ctx.obj["settings"]
 
@@ -492,6 +485,30 @@ def tv_delete_art(ctx, tv_name, tv_ip, content_ids):
         sys.exit(1)
 
     ids = list(content_ids)
+
+    # Filter out favourites unless explicitly requested
+    if not include_favorites:
+        try:
+            artworks = list_art_deduplicated(profile)
+            fav_ids = {a["content_id"] for a in artworks if a.get("is_favourite")}
+        except Exception:
+            fav_ids = set()
+
+        skipped = [cid for cid in ids if cid in fav_ids]
+        ids = [cid for cid in ids if cid not in fav_ids]
+
+        if skipped:
+            click.secho(
+                f"Skipping {len(skipped)} favourite(s): {', '.join(skipped)}  "
+                f"(use --include-favorites to delete)",
+                fg="yellow",
+                err=True,
+            )
+
+    if not ids:
+        click.echo("Nothing to delete.")
+        return
+
     click.echo(f"Deleting {len(ids)} artwork(s) from TV: {', '.join(ids)}")
 
     if delete_art(profile, ids):
