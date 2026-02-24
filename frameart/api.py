@@ -224,6 +224,32 @@ class DeleteJobsResponse(BaseModel):
     failed: dict[str, str] = Field(default_factory=dict)
 
 
+class PublicDomainArtwork(BaseModel):
+    """A normalized public-domain artwork entry."""
+
+    source: str
+    artwork_id: str
+    title: str
+    artist: str | None = None
+    date: str | None = None
+    image_url: str
+    thumbnail_url: str | None = None
+    license: str | None = None
+    attribution: str | None = None
+    source_url: str | None = None
+    is_public_domain: bool = True
+
+
+class PublicDomainApplyRequest(BaseModel):
+    """Request body for downloading and displaying public-domain artwork."""
+
+    source: str = Field(..., description="Public domain source: met or aic.")
+    artwork_id: str = Field(..., description="Provider-specific artwork ID.")
+    tv: str | None = Field(None, description="TV profile name from config.")
+    tv_ip: str | None = Field(None, description="TV IP address.")
+    matte: str = Field("none", description="Matte style for upload.")
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -517,6 +543,61 @@ def tv_configured():
         ConfiguredTVResponse(name=name, ip=profile.ip, port=profile.port)
         for name, profile in settings.tvs.items()
     ]
+
+
+# ---------------------------------------------------------------------------
+# Routes — public domain catalog
+# ---------------------------------------------------------------------------
+
+
+@app.get("/catalog/search", response_model=list[PublicDomainArtwork])
+def catalog_search(
+    source: str = Query(..., description="Catalog source: met or aic."),
+    q: str = Query(..., min_length=1, description="Search query."),
+    limit: int = Query(20, ge=1, le=50, description="Max results."),
+):
+    """Search public-domain artwork from supported providers."""
+    from frameart.public_domain import search_artworks
+
+    try:
+        items = search_artworks(source=source, query=q, limit=limit)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Catalog search failed: {e}") from e
+
+    return [PublicDomainArtwork(**item) for item in items]
+
+
+@app.post("/catalog/apply", response_model=JobResponse)
+def catalog_apply(req: PublicDomainApplyRequest):
+    """Download a public-domain artwork and upload it to a TV."""
+    from frameart.pipeline import run_import_and_apply
+    from frameart.public_domain import download_artwork_image
+
+    settings = _settings()
+    cache_dir = settings.data_dir / "catalog_cache"
+
+    try:
+        image_path, item = download_artwork_image(req.source, req.artwork_id, cache_dir)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch artwork: {e}") from e
+
+    result = run_import_and_apply(
+        settings,
+        str(image_path),
+        tv_name=req.tv,
+        tv_ip=req.tv_ip,
+        matte=req.matte,
+        source_metadata=item,
+    )
+
+    resp = _pipeline_result_to_response(result)
+    if result.error:
+        raise HTTPException(status_code=500, detail=resp.model_dump())
+    return resp
 
 
 # ---------------------------------------------------------------------------

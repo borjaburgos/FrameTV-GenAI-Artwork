@@ -272,6 +272,79 @@ def run_apply(
     return result
 
 
+def run_import_and_apply(
+    settings: Settings,
+    image_path: str | Path,
+    *,
+    tv_name: str | None = None,
+    tv_ip: str | None = None,
+    matte: str = "none",
+    upscaler_name: str | None = None,
+    source_metadata: dict[str, Any] | None = None,
+    no_switch: bool = False,
+) -> PipelineResult:
+    """Import an existing image, post-process to frame format, then upload to TV."""
+    job_id = generate_job_id()
+    job_dir = get_job_dir(settings.data_dir, job_id)
+    timings: dict[str, float] = {}
+    result = PipelineResult(job_id=job_id, job_dir=job_dir, timings=timings)
+
+    try:
+        profile = _resolve_tv_profile(settings, tv_name, tv_ip)
+        if profile is None:
+            raise RuntimeError(
+                "No TV specified. Use --tv or --tv-ip, or configure a TV in config.yaml"
+            )
+
+        source_bytes = Path(image_path).read_bytes()
+        result.source_path = save_source_image(job_dir, source_bytes)
+
+        upscaler = _get_upscaler_instance(settings, upscaler_name)
+        t0 = time.monotonic()
+        pp_result = postprocess(source_bytes, upscaler)
+        timings["postprocess_ms"] = (time.monotonic() - t0) * 1000
+
+        result.final_path = save_final_image(job_dir, pp_result.image_bytes)
+
+        t0 = time.monotonic()
+        upload_result = tv_ctrl.upload_image(
+            profile,
+            pp_result.image_bytes,
+            file_type="PNG",
+            matte=matte,
+        )
+        timings["upload_ms"] = (time.monotonic() - t0) * 1000
+
+        if not upload_result.success:
+            raise RuntimeError(f"Upload failed: {upload_result.error}")
+
+        result.content_id = upload_result.content_id
+
+        if not no_switch:
+            t0 = time.monotonic()
+            result.tv_switched = tv_ctrl.switch_art(profile, upload_result.content_id)
+            timings["switch_ms"] = (time.monotonic() - t0) * 1000
+
+        result.metadata = {
+            "job_id": job_id,
+            "image_path": str(image_path),
+            "content_id": upload_result.content_id,
+            "tv_ip": profile.ip,
+            "tv_switched": result.tv_switched,
+            "matte": matte,
+            "upscaler": upscaler.name,
+            "source_metadata": source_metadata or {},
+            "timings": timings,
+        }
+        save_metadata(job_dir, result.metadata)
+
+    except Exception as e:
+        result.error = str(e)
+        logger.error("Pipeline import+apply failed: %s", e)
+
+    return result
+
+
 def run_generate_and_apply(
     settings: Settings,
     prompt: str,
