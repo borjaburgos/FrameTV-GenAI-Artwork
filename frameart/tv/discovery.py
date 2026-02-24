@@ -1,6 +1,6 @@
 """Samsung Frame TV auto-discovery via SSDP (UPnP).
 
-Sends an M-SEARCH multicast to find Samsung TVs on the local network,
+Sends M-SEARCH multicasts to find Samsung TVs on the local network,
 then queries each one's REST API to check for Frame TV support.
 """
 
@@ -9,6 +9,8 @@ from __future__ import annotations
 import logging
 import re
 import socket
+import struct
+import time
 from dataclasses import dataclass
 
 import httpx
@@ -18,21 +20,31 @@ logger = logging.getLogger(__name__)
 SSDP_ADDR = "239.255.255.250"
 SSDP_PORT = 1900
 SSDP_MX = 3  # seconds to wait for responses
+_SEND_COUNT = 3  # UDP is unreliable — send each M-SEARCH multiple times
+_SEND_INTERVAL = 0.3  # seconds between repeated sends
 
-# Samsung TVs respond to this search target
-SAMSUNG_ST = "urn:samsung.com:device:RemoteControlReceiver:1"
-
-_MSEARCH = (
-    "M-SEARCH * HTTP/1.1\r\n"
-    f"HOST: {SSDP_ADDR}:{SSDP_PORT}\r\n"
-    'MAN: "ssdp:discover"\r\n'
-    f"MX: {SSDP_MX}\r\n"
-    f"ST: {SAMSUNG_ST}\r\n"
-    "\r\n"
-)
+# Search targets — Samsung TVs respond to the Samsung-specific ST but also to
+# DIAL (used by casting protocols).  Trying both doubles our chance of getting
+# a response.  Non-Samsung DIAL devices get filtered out during the REST query.
+_SEARCH_TARGETS = [
+    "urn:samsung.com:device:RemoteControlReceiver:1",
+    "urn:dial-multiscreen-org:service:dial:1",
+]
 
 # Regex to extract IP from LOCATION header like http://192.168.1.50:9197/...
 _LOCATION_RE = re.compile(r"https?://(\d+\.\d+\.\d+\.\d+)")
+
+
+def _build_msearch(search_target: str) -> bytes:
+    """Build an SSDP M-SEARCH packet for a given search target."""
+    return (
+        "M-SEARCH * HTTP/1.1\r\n"
+        f"HOST: {SSDP_ADDR}:{SSDP_PORT}\r\n"
+        'MAN: "ssdp:discover"\r\n'
+        f"MX: {SSDP_MX}\r\n"
+        f"ST: {search_target}\r\n"
+        "\r\n"
+    ).encode()
 
 
 @dataclass
@@ -46,16 +58,36 @@ class DiscoveredTV:
 
 
 def _ssdp_search(timeout: float = SSDP_MX + 1) -> list[str]:
-    """Send SSDP M-SEARCH and return unique IPs that respond."""
+    """Send SSDP M-SEARCH and return unique IPs that respond.
+
+    Sends multiple packets for each search target (UDP is unreliable),
+    binds the socket so the OS routes responses back, and sets a
+    multicast TTL so packets reach the local network segment.
+    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.settimeout(timeout)
+    # Bind so the OS assigns a source port and routes responses back to us
+    sock.bind(("", 0))
+    # Multicast TTL — 2 is enough for any LAN topology
+    sock.setsockopt(
+        socket.IPPROTO_IP,
+        socket.IP_MULTICAST_TTL,
+        struct.pack("b", 2),
+    )
 
     ips: set[str] = set()
     try:
-        sock.sendto(_MSEARCH.encode(), (SSDP_ADDR, SSDP_PORT))
-        logger.debug("Sent SSDP M-SEARCH for %s", SAMSUNG_ST)
+        # Send M-SEARCH packets for each search target, repeated for reliability
+        for st in _SEARCH_TARGETS:
+            packet = _build_msearch(st)
+            for i in range(_SEND_COUNT):
+                sock.sendto(packet, (SSDP_ADDR, SSDP_PORT))
+                logger.debug("Sent SSDP M-SEARCH (%d/%d) for %s", i + 1, _SEND_COUNT, st)
+                if i < _SEND_COUNT - 1:
+                    time.sleep(_SEND_INTERVAL)
 
+        # Collect responses until timeout
+        sock.settimeout(timeout)
         while True:
             try:
                 data, addr = sock.recvfrom(4096)
@@ -72,7 +104,7 @@ def _ssdp_search(timeout: float = SSDP_MX + 1) -> list[str]:
     finally:
         sock.close()
 
-    logger.info("SSDP found %d Samsung device(s): %s", len(ips), ", ".join(sorted(ips)))
+    logger.info("SSDP found %d device(s): %s", len(ips), ", ".join(sorted(ips)))
     return sorted(ips)
 
 
