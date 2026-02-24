@@ -166,7 +166,10 @@ def generate(ctx, prompt, style, provider, model, upscaler, negative_prompt, see
 @click.option("--image", "-i", required=True, type=click.Path(exists=True), help="Image to upload.")
 @click.option("--tv", type=str, default=None, help="TV profile name from config.")
 @click.option("--tv-ip", type=str, default=None, help="TV IP address.")
-@click.option("--matte", type=str, default="none", help="Matte style (e.g., modern_black).")
+@click.option(
+    "--matte", type=str, default="shadowbox_polar",
+    help="Matte style (run 'frameart tv matte-list' to see options).",
+)
 @click.pass_context
 def apply(ctx, image, tv, tv_ip, matte):
     """Upload an existing image to the Frame TV and switch to it."""
@@ -201,7 +204,10 @@ def apply(ctx, image, tv, tv_ip, matte):
 @click.option("--guidance", type=float, default=None, help="Guidance scale.")
 @click.option("--tv", type=str, default=None, help="TV profile name from config.")
 @click.option("--tv-ip", type=str, default=None, help="TV IP address.")
-@click.option("--matte", type=str, default="none", help="Matte style.")
+@click.option(
+    "--matte", type=str, default="shadowbox_polar",
+    help="Matte style (run 'frameart tv matte-list' to see options).",
+)
 @click.option("--no-upload", is_flag=True, help="Generate + postprocess but skip upload.")
 @click.option("--no-switch", is_flag=True, help="Upload but don't switch displayed art.")
 @click.option("--dry-run", is_flag=True, help="Alias for --no-upload.")
@@ -429,6 +435,86 @@ def tv_list_art(ctx, tv_name, tv_ip):
             click.echo(f"  {cid}")
     except Exception as e:
         click.secho(f"Failed to list art: {e}", fg="red", err=True)
+        sys.exit(1)
+
+
+@tv.command("matte-list")
+@_debug_option
+@_verbose_option
+@click.option("--tv", "tv_name", type=str, default=None, help="TV profile name.")
+@click.option("--tv-ip", type=str, default=None, help="TV IP address.")
+@click.pass_context
+def tv_matte_list(ctx, tv_name, tv_ip):
+    """List matte/frame styles supported by the TV."""
+    _ensure_logging(ctx)
+    from frameart.config import TVProfile
+    from frameart.tv.controller import get_matte_list
+
+    settings = ctx.obj["settings"]
+
+    profile = None
+    if tv_name and tv_name in settings.tvs:
+        profile = settings.tvs[tv_name]
+    elif tv_ip:
+        profile = TVProfile(ip=tv_ip)
+    elif len(settings.tvs) == 1:
+        profile = next(iter(settings.tvs.values()))
+
+    if profile is None:
+        click.secho("No TV specified. Use --tv or --tv-ip.", fg="red", err=True)
+        sys.exit(1)
+
+    try:
+        mattes = get_matte_list(profile)
+        click.echo(f"Supported matte styles ({len(mattes)}):")
+        for m in mattes:
+            if isinstance(m, dict):
+                matte_id = m.get("matte_id", str(m))
+                click.echo(f"  {matte_id}")
+            else:
+                click.echo(f"  {m}")
+        click.echo(
+            "\nUse with: frameart generate-and-apply --matte <matte_id> ..."
+        )
+    except Exception as e:
+        click.secho(f"Failed to get matte list: {e}", fg="red", err=True)
+        sys.exit(1)
+
+
+@tv.command("change-matte")
+@_debug_option
+@_verbose_option
+@click.option("--tv", "tv_name", type=str, default=None, help="TV profile name.")
+@click.option("--tv-ip", type=str, default=None, help="TV IP address.")
+@click.option("--content-id", required=True, help="Content ID of the artwork (e.g., MY_F0006).")
+@click.option("--matte", required=True, help="Matte ID to apply (see 'tv matte-list').")
+@click.pass_context
+def tv_change_matte(ctx, tv_name, tv_ip, content_id, matte):
+    """Change the matte/frame on an existing artwork on the TV."""
+    _ensure_logging(ctx)
+    from frameart.config import TVProfile
+    from frameart.tv.controller import change_matte
+
+    settings = ctx.obj["settings"]
+
+    profile = None
+    if tv_name and tv_name in settings.tvs:
+        profile = settings.tvs[tv_name]
+    elif tv_ip:
+        profile = TVProfile(ip=tv_ip)
+    elif len(settings.tvs) == 1:
+        profile = next(iter(settings.tvs.values()))
+
+    if profile is None:
+        click.secho("No TV specified. Use --tv or --tv-ip.", fg="red", err=True)
+        sys.exit(1)
+
+    if change_matte(profile, content_id, matte):
+        click.secho(
+            f"Changed matte on {content_id} to '{matte}'.", fg="green",
+        )
+    else:
+        click.secho("Failed to change matte.", fg="red", err=True)
         sys.exit(1)
 
 

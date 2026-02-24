@@ -570,8 +570,9 @@ def upload_image(
     if ft == "jpeg":
         ft = "jpg"
 
-    # Resolve matte: use library default when the user hasn't picked one
-    effective_matte = matte if matte and matte != "none" else "shadowbox_polar"
+    # Pass the matte through as-is; callers are responsible for providing
+    # a valid matte_id (use ``get_matte_list`` to discover supported values).
+    effective_matte = matte or "shadowbox_polar"
 
     # Validate image bytes before attempting upload
     if len(upload_bytes) < 100:
@@ -676,5 +677,43 @@ def list_art(profile: TVProfile) -> list[dict[str, Any]]:
     tv = _connect(profile)
     art = tv.art()
     return art.available()
+
+
+def get_matte_list(profile: TVProfile) -> list[dict[str, Any]]:
+    """Query the TV for its supported matte types.
+
+    Returns a list of dicts, each with at least a ``matte_id`` key.
+    The exact structure depends on the TV firmware.
+    """
+    tv = _connect(profile)
+    art = tv.art()
+    return art.get_matte_list()
+
+
+def change_matte(profile: TVProfile, content_id: str, matte_id: str) -> bool:
+    """Change the matte/frame on an already-uploaded artwork.
+
+    Parameters
+    ----------
+    profile:
+        TV connection profile.
+    content_id:
+        The content ID of the artwork (e.g., ``MY_F0006``).
+    matte_id:
+        The matte ID to apply (use ``get_matte_list`` to see valid values).
+
+    Returns
+    -------
+    True on success, False on failure.
+    """
+    tv = _connect(profile)
+    art = tv.art()
+    try:
+        art.change_matte(content_id, matte_id)
+        logger.info("Changed matte on %s to %s", content_id, matte_id)
+        return True
+    except Exception as e:
+        logger.error("Failed to change matte: %s", e)
+        return False
 
 
