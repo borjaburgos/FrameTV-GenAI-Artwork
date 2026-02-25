@@ -248,7 +248,6 @@ def search_artworks(source: str, query: str, limit: int = 20) -> list[dict[str, 
             items = [_aic_object_to_item(obj) for obj in data]
             return [item for item in items if item is not None][:limit]
 
-        # CMA
         resp = client.get(
             f"{CMA_API_BASE}/artworks",
             params={
