@@ -7,7 +7,7 @@
 <style>
   :root { --bg: #111; --surface: #1a1a1a; --border: #333; --text: #e0e0e0;
           --muted: #888; --accent: #6c8; --accent2: #4af; --err: #e55;
-          --warn: #eb4; }
+          --warn: #eb4; --surface2: #232323; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
          background: var(--bg); color: var(--text); min-height: 100vh; }
@@ -38,8 +38,9 @@
   .row > * { flex: 1; }
   .btn { display: inline-flex; align-items: center; gap: .5rem; background: var(--accent);
          color: #111; border: none; border-radius: 6px; padding: .7rem 1.4rem; font-size: .95rem;
-         font-weight: 600; cursor: pointer; }
+         font-weight: 600; cursor: pointer; transition: transform .12s ease, opacity .12s ease; }
   .btn:hover { opacity: .85; }
+  .btn:active { transform: translateY(1px); }
   .btn:disabled { opacity: .4; cursor: not-allowed; }
   .btn-secondary { background: var(--border); color: var(--text); }
   .btn-small { padding: .4rem .8rem; font-size: .8rem; }
@@ -60,6 +61,7 @@
              gap: 1rem; }
   .gallery-item { background: var(--surface); border-radius: 8px; overflow: hidden;
                   border: 1px solid var(--border); }
+  .gallery-item.selected { border-color: var(--accent2); box-shadow: 0 0 0 1px rgba(68,170,255,.35) inset; }
   .gallery-item img { width: 100%; aspect-ratio: 16/9; object-fit: cover; display: block;
                       cursor: pointer; }
   .gallery-item .info { padding: .6rem .8rem; }
@@ -90,6 +92,7 @@
                  gap: .8rem; margin-top: 1rem; }
   .tv-art-item { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
                  padding: .8rem; display: flex; flex-direction: column; gap: .5rem; }
+  .tv-art-item.selected { border-color: var(--accent2); box-shadow: 0 0 0 1px rgba(68,170,255,.35) inset; }
   .tv-art-item .art-select-row { display: flex; align-items: center; gap: .5rem; }
   .tv-art-item .art-select-row input[type="checkbox"] { width: auto; margin: 0; }
   .tv-art-item .art-thumb-wrap { width: 100%; aspect-ratio: 16/9; border-radius: 6px;
@@ -121,6 +124,29 @@
 
   /* --- TV Art section within TVs tab --- */
   .tv-art-section { margin-top: 2rem; padding-top: 1.5rem; border-top: 1px solid var(--border); }
+
+  /* --- Skeleton loading --- */
+  .skeleton-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+                   overflow: hidden; }
+  .skeleton-card .sk-thumb { width: 100%; aspect-ratio: 16/9; background: linear-gradient(90deg, #181818, #262626, #181818);
+                              background-size: 200% 100%; animation: sk 1.1s infinite linear; }
+  .skeleton-card .sk-line { height: 12px; margin: 10px 12px; border-radius: 6px; background: #252525; }
+  .skeleton-card .sk-line.short { width: 45%; }
+  @keyframes sk {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+  }
+
+  /* --- Toasts --- */
+  .toast-wrap { position: fixed; right: 14px; bottom: 14px; z-index: 300; display: flex;
+                flex-direction: column; gap: 8px; max-width: min(440px, calc(100vw - 24px)); }
+  .toast { background: var(--surface2); border: 1px solid var(--border); border-left: 4px solid var(--accent2);
+           border-radius: 8px; padding: .65rem .8rem; box-shadow: 0 8px 24px rgba(0,0,0,.35); }
+  .toast.error { border-left-color: var(--err); }
+  .toast.done { border-left-color: var(--accent); }
+  .toast.warn { border-left-color: var(--warn); }
+
+  :focus-visible { outline: 2px solid var(--accent2); outline-offset: 2px; border-radius: 6px; }
 </style>
 </head>
 <body>
@@ -302,6 +328,8 @@
   </div>
 </div>
 
+<div class="toast-wrap" id="toast-wrap" aria-live="polite"></div>
+
 <script>
 (function() {
   // =========================================================================
@@ -312,6 +340,37 @@
   let selectedTVArtIds = new Set();
   let loadedTVArtById = {};
   let selectedGalleryJobIds = new Set();
+  const storageKeys = {
+    tvGenerate: 'frameart.tv.generate',
+    tvPublic: 'frameart.tv.public',
+    tvUpload: 'frameart.tv.upload',
+    tvArt: 'frameart.tv.art',
+    mattePublic: 'frameart.matte.public',
+    matteUpload: 'frameart.matte.upload',
+  };
+
+  function showToast(message, kind) {
+    const wrap = document.getElementById('toast-wrap');
+    if (!wrap) return;
+    const toast = document.createElement('div');
+    toast.className = 'toast' + (kind ? ' ' + kind : '');
+    toast.textContent = message;
+    wrap.appendChild(toast);
+    setTimeout(() => toast.remove(), 3600);
+  }
+
+  function setButtonBusy(btn, busyText) {
+    if (!btn) return;
+    if (!btn.dataset.originalText) btn.dataset.originalText = btn.textContent;
+    btn.disabled = true;
+    if (busyText) btn.textContent = busyText;
+  }
+
+  function clearButtonBusy(btn) {
+    if (!btn) return;
+    btn.disabled = false;
+    if (btn.dataset.originalText) btn.textContent = btn.dataset.originalText;
+  }
 
   function addTVs(tvs, source) {
     for (const tv of tvs) {
@@ -347,6 +406,16 @@
       // Restore previous selection if still valid
       if (prev && [...sel.options].some(o => o.value === prev)) {
         sel.value = prev;
+      } else {
+        const remembered = localStorage.getItem(
+          id === 'tv-select' ? storageKeys.tvGenerate :
+          id === 'public-tv-select' ? storageKeys.tvPublic :
+          id === 'upload-tv-select' ? storageKeys.tvUpload :
+          storageKeys.tvArt
+        );
+        if (remembered && [...sel.options].some(o => o.value === remembered)) {
+          sel.value = remembered;
+        }
       }
     }
     // Show the TV art section once we have TVs
@@ -420,6 +489,35 @@
       'No configured TVs. Click "Scan Network" to find Samsung TVs.';
   });
 
+  document.getElementById('tv-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.tvGenerate, e.target.value || '');
+  });
+  document.getElementById('tv-art-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.tvArt, e.target.value || '');
+  });
+  document.getElementById('upload-tv-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.tvUpload, e.target.value || '');
+  });
+  document.getElementById('public-tv-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.tvPublic, e.target.value || '');
+  });
+  document.getElementById('public-matte-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.mattePublic, e.target.value || '');
+  });
+  document.getElementById('upload-matte-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.matteUpload, e.target.value || '');
+  });
+  const rememberedPublicMatte = localStorage.getItem(storageKeys.mattePublic);
+  if (rememberedPublicMatte) {
+    const sel = document.getElementById('public-matte-select');
+    if ([...sel.options].some(o => o.value === rememberedPublicMatte)) sel.value = rememberedPublicMatte;
+  }
+  const rememberedUploadMatte = localStorage.getItem(storageKeys.matteUpload);
+  if (rememberedUploadMatte) {
+    const sel = document.getElementById('upload-matte-select');
+    if ([...sel.options].some(o => o.value === rememberedUploadMatte)) sel.value = rememberedUploadMatte;
+  }
+
   // =========================================================================
   // Status helpers
   // =========================================================================
@@ -428,6 +526,16 @@
   function showStatus(msg, cls) {
     statusBar.className = 'status-bar visible' + (cls ? ' ' + cls : '');
     statusText.textContent = msg;
+  }
+
+  function gallerySkeleton(count) {
+    return Array.from({ length: count }).map(() => `
+      <div class="skeleton-card">
+        <div class="sk-thumb"></div>
+        <div class="sk-line"></div>
+        <div class="sk-line short"></div>
+      </div>
+    `).join('');
   }
 
   // =========================================================================
@@ -448,7 +556,7 @@
     const body = { prompt, style, provider, model };
     if (useTV) { body.tv_ip = tvIp; }
 
-    btnGen.disabled = true;
+    setButtonBusy(btnGen, 'Generating...');
     showStatus('Submitting job...');
     document.getElementById('gen-preview').style.display = 'none';
 
@@ -462,7 +570,7 @@
       pollJob(data.job_id);
     } catch (e) {
       showStatus('Failed: ' + e.message, 'error');
-      btnGen.disabled = false;
+      clearButtonBusy(btnGen);
     }
   });
 
@@ -478,7 +586,7 @@
           return;
         }
         clearInterval(interval);
-        btnGen.disabled = false;
+        clearButtonBusy(btnGen);
         if (data.status === 'completed' && data.result) {
           showStatus('Done! Job ' + data.result.job_id, 'done');
           const img = document.getElementById('gen-preview-img');
@@ -490,7 +598,7 @@
       } catch (e) {
         clearInterval(interval);
         showStatus('Polling error: ' + e.message, 'error');
-        btnGen.disabled = false;
+        clearButtonBusy(btnGen);
       }
     }, 2000);
   }
@@ -510,10 +618,12 @@
     items.forEach((item) => {
       item.addEventListener('change', (e) => {
         const checkbox = e.target;
+        const card = checkbox.closest('.gallery-item');
         const jobId = checkbox.dataset.jobId;
         if (!jobId) return;
         if (checkbox.checked) selectedGalleryJobIds.add(jobId);
         else selectedGalleryJobIds.delete(jobId);
+        if (card) card.classList.toggle('selected', checkbox.checked);
         updateDeleteGalleryButton();
       });
     });
@@ -524,6 +634,8 @@
       const jobId = el.dataset.jobId;
       if (!jobId) return;
       el.checked = checked;
+      const card = el.closest('.gallery-item');
+      if (card) card.classList.toggle('selected', checked);
       if (checked) selectedGalleryJobIds.add(jobId);
       else selectedGalleryJobIds.delete(jobId);
     });
@@ -537,7 +649,7 @@
     if (!confirm('Delete ' + selectedIds.length + ' selected artwork item(s) from host storage?')) return;
 
     const btn = document.getElementById('btn-gallery-delete-selected');
-    btn.disabled = true;
+    setButtonBusy(btn, 'Deleting...');
 
     try {
       const resp = await fetch('/jobs/delete', {
@@ -548,17 +660,20 @@
       if (!resp.ok) throw new Error('Server returned ' + resp.status);
       const data = await resp.json();
       if (data.failed && Object.keys(data.failed).length) {
-        alert('Some items failed to delete: ' + Object.keys(data.failed).join(', '));
+        showToast('Some items failed to delete: ' + Object.keys(data.failed).join(', '), 'warn');
       }
       if (data.not_found && data.not_found.length) {
-        alert('Some items were not found: ' + data.not_found.join(', '));
+        showToast('Some items were not found: ' + data.not_found.join(', '), 'warn');
       }
       selectedGalleryJobIds = new Set();
       updateDeleteGalleryButton();
       await loadGallery();
+      showToast('Deleted selected gallery items.', 'done');
     } catch (e) {
-      alert('Failed to delete selected artwork: ' + e.message);
+      showToast('Failed to delete selected artwork: ' + e.message, 'error');
       updateDeleteGalleryButton();
+    } finally {
+      clearButtonBusy(btn);
     }
   }
 
@@ -567,6 +682,8 @@
     const empty = document.getElementById('gallery-empty');
     selectedGalleryJobIds = new Set();
     updateDeleteGalleryButton();
+    grid.innerHTML = gallerySkeleton(6);
+    empty.style.display = 'none';
     try {
       const resp = await fetch('/jobs?limit=50');
       const jobs = await resp.json();
@@ -596,7 +713,10 @@
         </div>`;
       }).join('');
       bindGallerySelectionHandlers();
-    } catch (e) { grid.innerHTML = '<div class="empty">Failed to load gallery.</div>'; }
+    } catch (e) {
+      grid.innerHTML = '<div class="empty">Failed to load gallery. Use Refresh to retry.</div>';
+      showToast('Failed to load gallery: ' + e.message, 'error');
+    }
   }
 
   document.getElementById('btn-refresh-gallery').addEventListener('click', loadGallery);
@@ -686,6 +806,7 @@
   }
 
   async function searchPublicDomain() {
+    const searchBtn = document.getElementById('btn-public-search');
     const source = document.getElementById('public-source').value;
     const q = document.getElementById('public-query').value.trim();
     const grid = document.getElementById('public-grid');
@@ -697,6 +818,7 @@
     }
 
     showPublicStatus('Searching ' + source.toUpperCase() + '...', '');
+    setButtonBusy(searchBtn, 'Searching...');
     grid.innerHTML = '<div class="empty">Searching...</div>';
     empty.style.display = 'none';
 
@@ -712,11 +834,15 @@
       const items = await resp.json();
       renderPublicResults(items);
       showPublicStatus('Found ' + items.length + ' result(s).', items.length ? 'done' : '');
+      if (items.length) showToast('Public results updated (' + items.length + ').', 'done');
     } catch (e) {
       grid.innerHTML = '';
       empty.textContent = 'Search failed.';
       empty.style.display = 'block';
       showPublicStatus('Search failed: ' + e.message, 'error');
+      showToast('Public search failed: ' + e.message, 'error');
+    } finally {
+      clearButtonBusy(searchBtn);
     }
   }
 
@@ -728,7 +854,7 @@
       return;
     }
 
-    btn.disabled = true;
+    setButtonBusy(btn, 'Applying...');
     showPublicStatus('Downloading and uploading artwork...', '');
     try {
       const resp = await fetch('/catalog/apply', {
@@ -741,7 +867,6 @@
           matte: matte,
         }),
       });
-      btn.disabled = false;
       if (!resp.ok) {
         const detail = await readApiError(resp, 'Server returned');
         throw new Error(detail);
@@ -749,9 +874,12 @@
 
       const data = await resp.json();
       showPublicStatus('Displayed on TV. Job ' + data.job_id, 'done');
+      showToast('Displayed on TV from public catalog.', 'done');
     } catch (e) {
-      btn.disabled = false;
       showPublicStatus('Failed: ' + e.message, 'error');
+      showToast('Failed to display public artwork: ' + e.message, 'error');
+    } finally {
+      clearButtonBusy(btn);
     }
   }
 
@@ -778,6 +906,11 @@
 
     // Populate TV select with known TVs
     refreshTVSelects();
+    const uploadTvSel = document.getElementById('upload-tv-select');
+    const rememberedTv = localStorage.getItem(storageKeys.tvUpload);
+    if (rememberedTv && [...uploadTvSel.options].some(o => o.value === rememberedTv)) {
+      uploadTvSel.value = rememberedTv;
+    }
 
     if (!knownTVs.length) {
       document.getElementById('upload-status').className = 'status-bar visible error';
@@ -785,8 +918,8 @@
         'No TVs available. Configure one or use Scan Network first.';
     }
 
-    // Try to load mattes for the first TV
-    loadMattesForSelect('upload-matte-select', knownTVs[0]?.ip);
+    // Try to load mattes for selected TV, fallback to first known TV.
+    loadMattesForSelect('upload-matte-select', uploadTvSel.value || knownTVs[0]?.ip);
 
     document.getElementById('upload-modal').classList.add('visible');
   };
@@ -812,7 +945,7 @@
     }
 
     const btn = document.getElementById('btn-upload-apply');
-    btn.disabled = true;
+    setButtonBusy(btn, 'Uploading...');
     statusEl.className = 'status-bar visible';
     statusTextEl.textContent = 'Uploading...';
 
@@ -823,7 +956,6 @@
         body: JSON.stringify({ tv_ip: tvIp, matte: matte }),
       });
 
-      btn.disabled = false;
       if (!resp.ok) {
         const err = await resp.json().catch(() => ({}));
         throw new Error(err.detail || 'Server returned ' + resp.status);
@@ -831,10 +963,13 @@
 
       statusEl.className = 'status-bar visible done';
       statusTextEl.textContent = 'Uploaded successfully!';
+      showToast('Artwork uploaded to TV.', 'done');
     } catch (e) {
-      btn.disabled = false;
       statusEl.className = 'status-bar visible error';
       statusTextEl.textContent = 'Failed: ' + e.message;
+      showToast('Upload to TV failed: ' + e.message, 'error');
+    } finally {
+      clearButtonBusy(btn);
     }
   });
 
@@ -845,14 +980,14 @@
   btnDiscover.addEventListener('click', async () => {
     const list = document.getElementById('tv-list');
     const empty = document.getElementById('tv-empty');
-    btnDiscover.disabled = true;
+    setButtonBusy(btnDiscover, 'Scanning...');
     list.innerHTML = '<div class="empty">Scanning...</div>';
     empty.style.display = 'none';
 
     try {
       const resp = await fetch('/tv/discover?timeout=4');
       const tvs = await resp.json();
-      btnDiscover.disabled = false;
+      clearButtonBusy(btnDiscover);
       if (!tvs.length && !knownTVs.length) {
         list.innerHTML = '';
         empty.textContent = 'No Samsung TVs found on network.';
@@ -860,9 +995,11 @@
         return;
       }
       addTVs(tvs, 'discovered');
+      showToast(tvs.length ? ('Found ' + tvs.length + ' TV(s).') : 'Scan complete.', 'done');
     } catch (e) {
-      btnDiscover.disabled = false;
+      clearButtonBusy(btnDiscover);
       list.innerHTML = '<div class="empty">Discovery failed: ' + e.message + '</div>';
+      showToast('TV discovery failed: ' + e.message, 'error');
     }
   });
 
@@ -904,7 +1041,7 @@
       return;
     }
 
-    grid.innerHTML = '<div class="empty">Loading artwork from TV...</div>';
+    grid.innerHTML = gallerySkeleton(8);
     empty.style.display = 'none';
 
     try {
@@ -953,6 +1090,7 @@
       grid.querySelectorAll('.tv-art-select-item').forEach(el => {
         el.addEventListener('change', (e) => {
           const checkbox = e.target;
+          const card = checkbox.closest('.tv-art-item');
           const cid = checkbox.dataset.contentId;
           if (!cid) return;
           if (checkbox.checked) {
@@ -960,11 +1098,13 @@
           } else {
             selectedTVArtIds.delete(cid);
           }
+          if (card) card.classList.toggle('selected', checkbox.checked);
           updateDeleteSelectedButton();
         });
       });
     } catch (e) {
       grid.innerHTML = '<div class="empty">Failed to load art: ' + esc(e.message) + '</div>';
+      showToast('Failed to load TV art: ' + e.message, 'error');
     }
   }
 
@@ -972,11 +1112,7 @@
   // Display Existing TV Art
   // =========================================================================
   window.displayTVArt = async function(contentId, tvIp, btn) {
-    const originalText = btn ? btn.textContent : '';
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = 'Displaying...';
-    }
+    setButtonBusy(btn, 'Displaying...');
     try {
       const resp = await fetch('/tv/art/display', {
         method: 'POST',
@@ -987,13 +1123,11 @@
         }),
       });
       if (!resp.ok) throw new Error('Server returned ' + resp.status);
+      showToast('TV switched to ' + contentId + '.', 'done');
     } catch (e) {
-      alert('Failed to display artwork: ' + e.message);
+      showToast('Failed to display artwork: ' + e.message, 'error');
     } finally {
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = originalText || 'Display on TV';
-      }
+      clearButtonBusy(btn);
     }
   };
 
@@ -1020,11 +1154,12 @@
       const data = await resp.json();
       if (data.deleted.length) {
         loadTVArt(); // Refresh the list
+        showToast('Artwork deleted from TV.', 'done');
       } else if (data.skipped_favorites.length) {
-        alert('Artwork was skipped because it is a favourite.');
+        showToast('Artwork was skipped because it is a favourite.', 'warn');
       }
     } catch (e) {
-      alert('Failed to delete: ' + e.message);
+      showToast('Failed to delete: ' + e.message, 'error');
     }
   };
 
@@ -1040,7 +1175,7 @@
     if (!confirm(msg)) return;
 
     const btn = document.getElementById('btn-delete-selected');
-    btn.disabled = true;
+    setButtonBusy(btn, 'Deleting...');
 
     try {
       const resp = await fetch('/tv/art/delete', {
@@ -1056,13 +1191,15 @@
       const data = await resp.json();
       if (data.deleted.length) {
         await loadTVArt();
+        showToast('Deleted selected artwork from TV.', 'done');
       }
       if (data.skipped_favorites.length) {
-        alert('Some favourites were skipped: ' + data.skipped_favorites.join(', '));
+        showToast('Some favourites were skipped: ' + data.skipped_favorites.join(', '), 'warn');
       }
     } catch (e) {
-      alert('Failed to delete selected artwork: ' + e.message);
+      showToast('Failed to delete selected artwork: ' + e.message, 'error');
     } finally {
+      clearButtonBusy(btn);
       updateDeleteSelectedButton();
     }
   }
@@ -1104,10 +1241,18 @@
         opt.textContent = id;
         sel.appendChild(opt);
       }
+      const remembered = localStorage.getItem(
+        selectId === 'public-matte-select' ? storageKeys.mattePublic : storageKeys.matteUpload
+      );
+      if (remembered && [...sel.options].some(o => o.value === remembered)) sel.value = remembered;
     } catch {
       sel.innerHTML = '<option value="none">none</option>' +
                       '<option value="shadowbox_polar">shadowbox_polar</option>' +
                       '<option value="shadowbox_noir">shadowbox_noir</option>';
+      const remembered = localStorage.getItem(
+        selectId === 'public-matte-select' ? storageKeys.mattePublic : storageKeys.matteUpload
+      );
+      if (remembered && [...sel.options].some(o => o.value === remembered)) sel.value = remembered;
     }
   }
 
