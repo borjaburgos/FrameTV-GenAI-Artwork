@@ -5,50 +5,154 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>FrameArt</title>
 <style>
-  :root { --bg: #111; --surface: #1a1a1a; --border: #333; --text: #e0e0e0;
-          --muted: #888; --accent: #6c8; --accent2: #4af; --err: #e55;
-          --warn: #eb4; --surface2: #232323; }
+  :root {
+    --bg: #090c12;
+    --bg-2: #0f141f;
+    --surface: #161d2a;
+    --surface-soft: #1b2435;
+    --border: #2a3346;
+    --text: #ecf1ff;
+    --muted: #a8b3c8;
+    --accent: #5fda96;
+    --accent2: #57a6ff;
+    --err: #f0616e;
+    --warn: #f0bf5a;
+    --surface2: #202a3c;
+    --shadow: 0 20px 40px rgba(0, 0, 0, .32);
+  }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-         background: var(--bg); color: var(--text); min-height: 100vh; }
+  body {
+    font-family: "Avenir Next", "Avenir", "Segoe UI", "Helvetica Neue", sans-serif;
+    background:
+      radial-gradient(1200px 500px at 0% -20%, rgba(87, 166, 255, .15), transparent 60%),
+      radial-gradient(1200px 500px at 100% -15%, rgba(95, 218, 150, .12), transparent 58%),
+      linear-gradient(180deg, var(--bg-2) 0%, var(--bg) 44%, #070a10 100%);
+    color: var(--text);
+    min-height: 100vh;
+  }
   a { color: var(--accent2); }
 
   /* --- Layout --- */
-  .header { display: flex; align-items: center; gap: 1rem; padding: 1rem 1.5rem;
-            border-bottom: 1px solid var(--border); }
+  .header {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    padding: 1rem 1.5rem;
+    border-bottom: 1px solid var(--border);
+    background: rgba(9, 12, 18, .82);
+    backdrop-filter: blur(8px);
+  }
   .header h1 { font-size: 1.4rem; font-weight: 600; }
   .header h1 span { color: var(--accent); }
+  .header-spacer { flex: 1 1 auto; }
   .tabs { display: flex; gap: 0; }
-  .tabs button { background: none; border: none; color: var(--muted); padding: .5rem 1rem;
-                 cursor: pointer; font-size: .9rem; border-bottom: 2px solid transparent; }
-  .tabs button.active { color: var(--accent); border-bottom-color: var(--accent); }
-  .tabs button:hover { color: var(--text); }
-  .content { max-width: 900px; margin: 0 auto; padding: 1.5rem; }
+  .tabs button {
+    background: transparent;
+    border: 1px solid transparent;
+    color: var(--muted);
+    padding: .55rem 1rem;
+    cursor: pointer;
+    font-size: .94rem;
+    border-radius: 999px;
+    transition: border-color .18s ease, color .18s ease, background .18s ease;
+  }
+  .tabs button.active {
+    color: var(--text);
+    border-color: rgba(95, 218, 150, .45);
+    background: rgba(95, 218, 150, .1);
+  }
+  .tabs button:hover { color: var(--text); border-color: rgba(87, 166, 255, .28); }
+  .content { max-width: 1180px; margin: 0 auto; padding: 1.6rem 1.5rem 2rem; }
   .panel { display: none; }
-  .panel.active { display: block; }
+  .panel.active { display: block; animation: fadeUp .24s ease; }
 
   /* --- Forms --- */
   label { display: block; color: var(--muted); font-size: .8rem; margin-bottom: .25rem; }
-  input, select, textarea { width: 100%; background: var(--surface); color: var(--text);
-    border: 1px solid var(--border); border-radius: 6px; padding: .6rem .8rem;
-    font-size: .95rem; margin-bottom: .8rem; }
+  input, select, textarea {
+    width: 100%;
+    background: rgba(20, 27, 39, .92);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: .64rem .82rem;
+    font-size: .95rem;
+    margin-bottom: .8rem;
+    transition: border-color .16s ease, box-shadow .16s ease, background .16s ease;
+  }
   textarea { resize: vertical; min-height: 80px; }
-  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  input:focus, select:focus, textarea:focus {
+    outline: none;
+    border-color: rgba(87, 166, 255, .9);
+    box-shadow: 0 0 0 3px rgba(87, 166, 255, .2);
+    background: rgba(21, 30, 45, .98);
+  }
   .row { display: flex; gap: 1rem; }
   .row > * { flex: 1; }
-  .btn { display: inline-flex; align-items: center; gap: .5rem; background: var(--accent);
-         color: #111; border: none; border-radius: 6px; padding: .7rem 1.4rem; font-size: .95rem;
-         font-weight: 600; cursor: pointer; transition: transform .12s ease, opacity .12s ease; }
-  .btn:hover { opacity: .85; }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: .5rem;
+    background: linear-gradient(120deg, #5fda96 0%, #60d6be 100%);
+    color: #08110e;
+    border: 1px solid rgba(95, 218, 150, .2);
+    border-radius: 11px;
+    padding: .68rem 1.3rem;
+    font-size: .95rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: transform .16s ease, filter .16s ease, box-shadow .16s ease;
+    box-shadow: 0 8px 18px rgba(95, 218, 150, .18);
+  }
+  .btn:hover {
+    filter: brightness(1.03);
+    transform: translateY(-1px);
+    box-shadow: 0 12px 20px rgba(95, 218, 150, .2);
+  }
   .btn:active { transform: translateY(1px); }
   .btn:disabled { opacity: .4; cursor: not-allowed; }
-  .btn-secondary { background: var(--border); color: var(--text); }
+  .btn.busy { cursor: progress; }
+  .btn-spinner {
+    width: .82rem;
+    height: .82rem;
+    border-radius: 50%;
+    border: 2px solid rgba(8, 17, 14, .24);
+    border-top-color: currentColor;
+    animation: spin .72s linear infinite;
+    flex: 0 0 auto;
+  }
+  .btn-secondary {
+    background: linear-gradient(180deg, #323c4f 0%, #2c3445 100%);
+    color: var(--text);
+    border-color: rgba(168, 179, 200, .2);
+    box-shadow: none;
+  }
   .btn-small { padding: .4rem .8rem; font-size: .8rem; }
-  .btn-danger { background: var(--err); color: #fff; }
+  .btn-danger {
+    background: linear-gradient(130deg, #cf4652 0%, #b53843 100%);
+    color: #fff;
+    border-color: rgba(255, 255, 255, .08);
+    box-shadow: none;
+  }
+  .btn-ghost {
+    background: transparent;
+    color: var(--muted);
+    border-color: rgba(168, 179, 200, .22);
+    box-shadow: none;
+  }
+  .btn-ghost:hover { color: var(--text); border-color: rgba(87, 166, 255, .35); }
 
   /* --- Status / results --- */
-  .status-bar { margin-top: 1rem; padding: .8rem 1rem; border-radius: 6px;
-                background: var(--surface); border: 1px solid var(--border); display: none; }
+  .status-bar {
+    margin-top: 1rem;
+    padding: .8rem 1rem;
+    border-radius: 10px;
+    background: rgba(22, 29, 42, .9);
+    border: 1px solid var(--border);
+    display: none;
+  }
   .status-bar.visible { display: block; }
   .status-bar .label { font-size: .8rem; color: var(--muted); }
   .status-bar .value { font-size: .95rem; }
@@ -59,8 +163,15 @@
   /* --- Gallery --- */
   .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
              gap: 1rem; }
-  .gallery-item { background: var(--surface); border-radius: 8px; overflow: hidden;
-                  border: 1px solid var(--border); }
+  .gallery-item {
+    background: linear-gradient(180deg, rgba(28, 36, 52, .92) 0%, rgba(21, 28, 40, .95) 100%);
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow);
+    transition: transform .22s ease, border-color .22s ease;
+  }
+  .gallery-item:hover { transform: translateY(-3px); border-color: rgba(87, 166, 255, .5); }
   .gallery-item.selected { border-color: var(--accent2); box-shadow: 0 0 0 1px rgba(68,170,255,.35) inset; }
   .gallery-item img { width: 100%; aspect-ratio: 16/9; object-fit: cover; display: block;
                       cursor: pointer; }
@@ -73,9 +184,19 @@
   .gallery-item .select-row input[type="checkbox"] { width: auto; margin: 0; }
 
   /* --- TV cards --- */
-  .tv-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
-             padding: 1rem; margin-bottom: .8rem; display: flex; justify-content: space-between;
-             align-items: center; }
+  .tv-card {
+    background: linear-gradient(90deg, rgba(28, 37, 54, .95), rgba(21, 27, 39, .95));
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1rem;
+    margin-bottom: .8rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    box-shadow: var(--shadow);
+    transition: border-color .2s ease, transform .2s ease;
+  }
+  .tv-card:hover { border-color: rgba(87, 166, 255, .45); transform: translateY(-2px); }
   .tv-card .tv-info { }
   .tv-card .tv-name { font-weight: 600; }
   .tv-card .tv-detail { font-size: .85rem; color: var(--muted); margin-top: .2rem; }
@@ -83,15 +204,25 @@
            font-weight: 600; }
   .badge-frame { background: rgba(102,204,136,.15); color: var(--accent); }
   .badge-samsung { background: rgba(68,170,255,.15); color: var(--accent2); }
-  .badge-config { background: rgba(255,255,255,.1); color: var(--muted); }
+  .badge-config { background: rgba(168,179,200,.15); color: var(--muted); }
 
   .empty { text-align: center; color: var(--muted); padding: 3rem 1rem; }
 
   /* --- TV Art grid --- */
   .tv-art-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
                  gap: .8rem; margin-top: 1rem; }
-  .tv-art-item { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
-                 padding: .8rem; display: flex; flex-direction: column; gap: .5rem; }
+  .tv-art-item {
+    background: linear-gradient(180deg, rgba(28, 37, 54, .95), rgba(20, 27, 39, .95));
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: .8rem;
+    display: flex;
+    flex-direction: column;
+    gap: .5rem;
+    box-shadow: var(--shadow);
+    transition: transform .22s ease, border-color .22s ease;
+  }
+  .tv-art-item:hover { transform: translateY(-2px); border-color: rgba(87, 166, 255, .46); }
   .tv-art-item.selected { border-color: var(--accent2); box-shadow: 0 0 0 1px rgba(68,170,255,.35) inset; }
   .tv-art-item .art-select-row { display: flex; align-items: center; gap: .5rem; }
   .tv-art-item .art-select-row input[type="checkbox"] { width: auto; margin: 0; }
@@ -106,11 +237,37 @@
   .tv-art-item .art-actions { display: flex; gap: .4rem; flex-wrap: wrap; }
 
   /* --- Matte modal --- */
-  .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.85);
-                   z-index: 100; justify-content: center; align-items: center; }
-  .modal-overlay.visible { display: flex; }
+  .modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(3, 6, 10, .82);
+    z-index: 100;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transition: opacity .2s ease, visibility .2s ease;
+  }
+  .modal-overlay.visible {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+  }
+  .modal-overlay img,
+  .modal-overlay .modal-dialog {
+    transform: translateY(10px) scale(.98);
+    opacity: .96;
+    transition: transform .22s ease, opacity .22s ease;
+  }
+  .modal-overlay.visible img,
+  .modal-overlay.visible .modal-dialog {
+    transform: translateY(0) scale(1);
+    opacity: 1;
+  }
   .modal-overlay img { max-width: 95vw; max-height: 90vh; border-radius: 8px; }
-  .modal-dialog { background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  .modal-dialog { background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
                   padding: 1.5rem; min-width: 320px; max-width: 90vw; }
   .modal-dialog h3 { margin-bottom: 1rem; font-size: 1.1rem; }
   .modal-dialog .modal-actions { display: flex; gap: .5rem; justify-content: flex-end;
@@ -119,7 +276,11 @@
   /* --- Section heading --- */
   .section-heading { display: flex; justify-content: space-between; align-items: center;
                      margin-bottom: 1rem; }
-  .section-heading h2 { font-size: 1.1rem; }
+  .section-heading h2 {
+    font-size: 1.35rem;
+    letter-spacing: .2px;
+    text-wrap: balance;
+  }
   .section-heading .btn-group { display: flex; gap: .5rem; }
 
   /* --- TV Art section within TVs tab --- */
@@ -140,13 +301,65 @@
   /* --- Toasts --- */
   .toast-wrap { position: fixed; right: 14px; bottom: 14px; z-index: 300; display: flex;
                 flex-direction: column; gap: 8px; max-width: min(440px, calc(100vw - 24px)); }
-  .toast { background: var(--surface2); border: 1px solid var(--border); border-left: 4px solid var(--accent2);
-           border-radius: 8px; padding: .65rem .8rem; box-shadow: 0 8px 24px rgba(0,0,0,.35); }
+  .toast {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--accent2);
+    border-radius: 10px;
+    padding: .65rem .8rem;
+    box-shadow: 0 8px 24px rgba(0,0,0,.35);
+    animation: fadeUp .2s ease;
+  }
   .toast.error { border-left-color: var(--err); }
   .toast.done { border-left-color: var(--accent); }
   .toast.warn { border-left-color: var(--warn); }
+  kbd {
+    display: inline-block;
+    min-width: 1.4em;
+    padding: .15rem .4rem;
+    border-radius: 6px;
+    border: 1px solid #3e4a63;
+    background: #212c3f;
+    color: #dce7ff;
+    font-size: .78rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    text-align: center;
+  }
+  .shortcut-grid {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: .5rem .8rem;
+    align-items: center;
+    margin-top: .6rem;
+  }
+  .shortcut-grid .label { color: var(--text); font-size: .9rem; }
+  .shortcut-grid .keys { display: flex; gap: .35rem; justify-content: flex-end; }
+  .hint-inline { font-size: .78rem; color: var(--muted); margin-left: .35rem; }
 
   :focus-visible { outline: 2px solid var(--accent2); outline-offset: 2px; border-radius: 6px; }
+
+  .reveal-stagger {
+    opacity: 0;
+    transform: translateY(6px);
+    animation: fadeUp .26s ease forwards;
+  }
+
+  @keyframes fadeUp {
+    0% { opacity: 0; transform: translateY(8px); }
+    100% { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes spin {
+    0% { transform: rotate(0); }
+    100% { transform: rotate(360deg); }
+  }
+
+  @media (max-width: 920px) {
+    .header { flex-wrap: wrap; gap: .8rem; }
+    .row { flex-direction: column; gap: .6rem; }
+    .section-heading { flex-direction: column; align-items: flex-start; gap: .6rem; }
+    .section-heading .btn-group { flex-wrap: wrap; }
+    .content { padding: 1.1rem .9rem 1.5rem; }
+  }
 </style>
 </head>
 <body>
@@ -159,6 +372,8 @@
     <button data-tab="public">Public Domain</button>
     <button data-tab="tvs">TVs</button>
   </div>
+  <div class="header-spacer"></div>
+  <button class="btn btn-ghost btn-small" id="btn-shortcuts">Shortcuts</button>
 </div>
 
 <!-- ===== Generate ===== -->
@@ -234,6 +449,7 @@
     <div>
       <label for="public-query">Search</label>
       <input id="public-query" placeholder="e.g. monet, landscape, ukiyo-e">
+      <span class="hint-inline">Tip: press <kbd>/</kbd> to focus search</span>
     </div>
     <div style="align-self:end;">
       <button class="btn btn-secondary" id="btn-public-search">Search</button>
@@ -275,6 +491,8 @@
       <div class="btn-group">
         <select id="tv-art-select" style="width:auto; margin-bottom:0;"></select>
         <button class="btn btn-secondary btn-small" id="btn-load-art">Load Art</button>
+        <button class="btn btn-secondary btn-small" id="btn-tv-art-select-all">Select All</button>
+        <button class="btn btn-secondary btn-small" id="btn-tv-art-clear">Clear</button>
         <button class="btn btn-danger btn-small" id="btn-delete-selected" disabled>Delete Selected</button>
       </div>
     </div>
@@ -329,6 +547,31 @@
   </div>
 </div>
 
+<div class="modal-overlay" id="shortcuts-modal">
+  <div class="modal-dialog">
+    <h3>Keyboard Shortcuts</h3>
+    <div class="shortcut-grid">
+      <div class="label">Generate on Generate tab</div>
+      <div class="keys"><kbd>Ctrl</kbd><kbd>Enter</kbd></div>
+      <div class="label">Switch to Generate</div>
+      <div class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>G</kbd></div>
+      <div class="label">Switch to Gallery</div>
+      <div class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>Y</kbd></div>
+      <div class="label">Switch to Public Domain</div>
+      <div class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>P</kbd></div>
+      <div class="label">Switch to TVs</div>
+      <div class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>T</kbd></div>
+      <div class="label">Focus primary search</div>
+      <div class="keys"><kbd>/</kbd></div>
+      <div class="label">Close open modal</div>
+      <div class="keys"><kbd>Esc</kbd></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-small" id="btn-shortcuts-close">Close</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast-wrap" id="toast-wrap" aria-live="polite"></div>
 
 <script>
@@ -360,17 +603,32 @@
     setTimeout(() => toast.remove(), 3600);
   }
 
+  function animateStaggeredChildren(container, selector) {
+    if (!container) return;
+    const nodes = container.querySelectorAll(selector);
+    nodes.forEach((node, index) => {
+      node.classList.add('reveal-stagger');
+      node.style.animationDelay = (index * 22) + 'ms';
+    });
+  }
+
   function setButtonBusy(btn, busyText) {
     if (!btn) return;
-    if (!btn.dataset.originalText) btn.dataset.originalText = btn.textContent;
+    btn.dataset.originalHtml = btn.innerHTML;
+    btn.dataset.originalText = btn.textContent;
     btn.disabled = true;
-    if (busyText) btn.textContent = busyText;
+    btn.classList.add('busy');
+    btn.setAttribute('aria-busy', 'true');
+    const label = busyText || btn.dataset.originalText || 'Working...';
+    btn.innerHTML = '<span class="btn-spinner" aria-hidden="true"></span><span>' + esc(label) + '</span>';
   }
 
   function clearButtonBusy(btn) {
     if (!btn) return;
     btn.disabled = false;
-    if (btn.dataset.originalText) btn.textContent = btn.dataset.originalText;
+    btn.classList.remove('busy');
+    btn.removeAttribute('aria-busy');
+    if (btn.dataset.originalHtml) btn.innerHTML = btn.dataset.originalHtml;
   }
 
   function addTVs(tvs, source) {
@@ -451,6 +709,7 @@
           <span class="badge ${badgeClass}">${badgeText}</span>
         </div>`;
     }).join('');
+    animateStaggeredChildren(list, '.tv-card');
   }
 
   // =========================================================================
@@ -458,15 +717,23 @@
   // =========================================================================
   const tabs = document.querySelectorAll('.tabs button');
   const panels = document.querySelectorAll('.panel');
+
+  function setActiveTab(tabName) {
+    tabs.forEach(t => t.classList.toggle('active', t.dataset.tab === tabName));
+    panels.forEach(p => p.classList.toggle('active', p.id === ('panel-' + tabName)));
+    if (tabName === 'gallery') loadGallery();
+  }
+
   tabs.forEach(btn => {
     btn.addEventListener('click', () => {
-      tabs.forEach(t => t.classList.remove('active'));
-      panels.forEach(p => p.classList.remove('active'));
-      btn.classList.add('active');
-      document.getElementById('panel-' + btn.dataset.tab).classList.add('active');
-      if (btn.dataset.tab === 'gallery') loadGallery();
+      setActiveTab(btn.dataset.tab);
     });
   });
+
+  function getActiveTabName() {
+    const activeTab = document.querySelector('.tabs button.active');
+    return activeTab ? activeTab.dataset.tab : 'generate';
+  }
 
   // =========================================================================
   // Startup: load styles + configured TVs in parallel
@@ -713,6 +980,7 @@
           </div>
         </div>`;
       }).join('');
+      animateStaggeredChildren(grid, '.gallery-item');
       bindGallerySelectionHandlers();
     } catch (e) {
       grid.innerHTML = '<div class="empty">Failed to load gallery. Use Refresh to retry.</div>';
@@ -725,13 +993,48 @@
   document.getElementById('btn-gallery-clear-selection').addEventListener('click', () => setAllGallerySelections(false));
   document.getElementById('btn-gallery-delete-selected').addEventListener('click', deleteSelectedGalleryJobs);
 
-  window.showPreview = function(jobId) {
-    const modal = document.getElementById('modal');
-    document.getElementById('modal-img').src = '/jobs/' + jobId + '/image';
+  const modalIds = ['modal', 'matte-modal', 'upload-modal', 'shortcuts-modal'];
+  let lastFocusedBeforeModal = null;
+
+  function openModal(modalId, focusSelector) {
+    const modal = document.getElementById(modalId);
+    if (!modal) return;
+    lastFocusedBeforeModal = document.activeElement;
     modal.classList.add('visible');
+    if (!focusSelector) return;
+    const focusTarget = modal.querySelector(focusSelector);
+    if (focusTarget) setTimeout(() => focusTarget.focus(), 20);
+  }
+
+  function closeModal(modalId) {
+    const modal = document.getElementById(modalId);
+    if (!modal) return;
+    modal.classList.remove('visible');
+    if (lastFocusedBeforeModal && typeof lastFocusedBeforeModal.focus === 'function') {
+      setTimeout(() => lastFocusedBeforeModal.focus(), 20);
+    }
+  }
+
+  function closeAllModals() {
+    modalIds.forEach((id) => {
+      const modal = document.getElementById(id);
+      if (modal) modal.classList.remove('visible');
+    });
+  }
+
+  document.getElementById('btn-shortcuts').addEventListener('click', () => {
+    openModal('shortcuts-modal', '#btn-shortcuts-close');
+  });
+  document.getElementById('btn-shortcuts-close').addEventListener('click', () => {
+    closeModal('shortcuts-modal');
+  });
+
+  window.showPreview = function(jobId) {
+    document.getElementById('modal-img').src = '/jobs/' + jobId + '/image';
+    openModal('modal');
   };
   document.getElementById('modal').addEventListener('click', function() {
-    this.classList.remove('visible');
+    closeModal('modal');
   });
 
   // =========================================================================
@@ -796,6 +1099,7 @@
         </div>
       `;
     }).join('');
+    animateStaggeredChildren(grid, '.gallery-item');
 
     grid.querySelectorAll('.btn-pd-display').forEach(btn => {
       btn.addEventListener('click', async (e) => {
@@ -922,11 +1226,11 @@
     // Try to load mattes for selected TV, fallback to first known TV.
     loadMattesForSelect('upload-matte-select', uploadTvSel.value || knownTVs[0]?.ip);
 
-    document.getElementById('upload-modal').classList.add('visible');
+    openModal('upload-modal', '#upload-tv-select');
   };
 
   document.getElementById('btn-upload-cancel').addEventListener('click', () => {
-    document.getElementById('upload-modal').classList.remove('visible');
+    closeModal('upload-modal');
   });
 
   document.getElementById('upload-tv-select').addEventListener('change', (e) => {
@@ -1018,12 +1322,27 @@
   });
   document.getElementById('btn-load-art').addEventListener('click', loadTVArt);
   document.getElementById('btn-delete-selected').addEventListener('click', deleteSelectedTVArt);
+  document.getElementById('btn-tv-art-select-all').addEventListener('click', () => setAllTVArtSelections(true));
+  document.getElementById('btn-tv-art-clear').addEventListener('click', () => setAllTVArtSelections(false));
 
   function updateDeleteSelectedButton() {
     const btn = document.getElementById('btn-delete-selected');
     const n = selectedTVArtIds.size;
     btn.disabled = n === 0;
     btn.textContent = n > 0 ? ('Delete Selected (' + n + ')') : 'Delete Selected';
+  }
+
+  function setAllTVArtSelections(checked) {
+    document.querySelectorAll('.tv-art-select-item').forEach((el) => {
+      const cid = el.dataset.contentId;
+      if (!cid) return;
+      el.checked = checked;
+      const card = el.closest('.tv-art-item');
+      if (card) card.classList.toggle('selected', checked);
+      if (checked) selectedTVArtIds.add(cid);
+      else selectedTVArtIds.delete(cid);
+    });
+    updateDeleteSelectedButton();
   }
 
   async function loadTVArt() {
@@ -1087,6 +1406,7 @@
           </div>
         </div>
       `).join('');
+      animateStaggeredChildren(grid, '.tv-art-item');
 
       grid.querySelectorAll('.tv-art-select-item').forEach(el => {
         el.addEventListener('change', (e) => {
@@ -1215,7 +1535,7 @@
     matteContentId = contentId;
     matteTvIp = tvIp;
     document.getElementById('matte-content-id').textContent = contentId;
-    document.getElementById('matte-modal').classList.add('visible');
+    openModal('matte-modal', '#matte-select');
 
     loadMattesForSelect('matte-select', tvIp);
   };
@@ -1258,7 +1578,7 @@
   }
 
   document.getElementById('btn-matte-cancel').addEventListener('click', () => {
-    document.getElementById('matte-modal').classList.remove('visible');
+    closeModal('matte-modal');
   });
 
   document.getElementById('btn-matte-apply').addEventListener('click', async () => {
@@ -1279,7 +1599,7 @@
         }),
       });
       if (!resp.ok) throw new Error('Server returned ' + resp.status);
-      document.getElementById('matte-modal').classList.remove('visible');
+      closeModal('matte-modal');
     } catch (e) {
       alert('Failed to change matte: ' + e.message);
     } finally {
@@ -1288,11 +1608,66 @@
   });
 
   // Close modals on overlay click (but not dialog click)
-  document.getElementById('matte-modal').addEventListener('click', function(e) {
-    if (e.target === this) this.classList.remove('visible');
+  modalIds.forEach((modalId) => {
+    const modal = document.getElementById(modalId);
+    if (!modal) return;
+    modal.addEventListener('click', function(e) {
+      if (e.target === this) closeModal(modalId);
+    });
   });
-  document.getElementById('upload-modal').addEventListener('click', function(e) {
-    if (e.target === this) this.classList.remove('visible');
+
+  function isTypingTarget(el) {
+    if (!el) return false;
+    const tag = (el.tagName || '').toLowerCase();
+    return tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable;
+  }
+
+  // =========================================================================
+  // Keyboard shortcuts (Phase 2B)
+  // =========================================================================
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      closeAllModals();
+      return;
+    }
+
+    // Cmd/Ctrl+Enter: generate from prompt
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+      const activeTab = getActiveTabName();
+      if (activeTab === 'generate') {
+        e.preventDefault();
+        document.getElementById('btn-generate').click();
+      }
+      return;
+    }
+
+    const typing = isTypingTarget(e.target);
+
+    // Alt+Shift+[G,Y,P,T]: tab jump
+    if (e.altKey && e.shiftKey) {
+      const key = e.key.toLowerCase();
+      if (key === 'g') setActiveTab('generate');
+      else if (key === 'y') setActiveTab('gallery');
+      else if (key === 'p') setActiveTab('public');
+      else if (key === 't') setActiveTab('tvs');
+      else return;
+      e.preventDefault();
+      return;
+    }
+
+    if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
+
+    // Slash focuses primary search by active tab.
+    if (e.key === '/') {
+      const activeTab = getActiveTabName();
+      if (activeTab === 'public') {
+        e.preventDefault();
+        document.getElementById('public-query').focus();
+      } else if (activeTab === 'gallery') {
+        e.preventDefault();
+        document.getElementById('btn-refresh-gallery').focus();
+      }
+    }
   });
 
   // =========================================================================
