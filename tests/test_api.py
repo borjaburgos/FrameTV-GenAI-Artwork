@@ -63,6 +63,62 @@ class TestStyles:
 
 
 # ---------------------------------------------------------------------------
+# /providers
+# ---------------------------------------------------------------------------
+
+class TestProviders:
+    @patch("frameart.api._settings")
+    def test_list_configured_providers_and_models(self, mock_settings):
+        settings = MagicMock()
+        settings.default_provider = "openai"
+        settings.default_model = "gpt-image-1"
+        settings.providers = {
+            "openai": MagicMock(model="dall-e-3"),
+            "ollama": MagicMock(model="sdxl"),
+        }
+        mock_settings.return_value = settings
+
+        resp = client.get("/providers")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        assert data["default_provider"] == "openai"
+        names = [p["name"] for p in data["providers"]]
+        assert names == ["ollama", "openai"]
+
+        openai = next(p for p in data["providers"] if p["name"] == "openai")
+        assert openai["is_default"] is True
+        assert openai["default_model"] == "gpt-image-1"
+        assert openai["models"] == ["dall-e-3", "gpt-image-1"]
+
+        ollama = next(p for p in data["providers"] if p["name"] == "ollama")
+        assert ollama["is_default"] is False
+        assert ollama["default_model"] == "sdxl"
+        assert ollama["models"] == ["sdxl"]
+
+    @patch("frameart.api._settings")
+    def test_default_provider_included_even_without_provider_block(self, mock_settings):
+        settings = MagicMock()
+        settings.default_provider = "openai"
+        settings.default_model = None
+        settings.providers = {}
+        mock_settings.return_value = settings
+
+        resp = client.get("/providers")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["default_provider"] == "openai"
+        assert data["providers"] == [
+            {
+                "name": "openai",
+                "is_default": True,
+                "models": [],
+                "default_model": None,
+            }
+        ]
+
+
+# ---------------------------------------------------------------------------
 # POST /generate
 # ---------------------------------------------------------------------------
 

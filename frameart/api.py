@@ -210,6 +210,22 @@ class HealthResponse(BaseModel):
     version: str = __version__
 
 
+class ProviderOption(BaseModel):
+    """Configured provider metadata for the web UI."""
+
+    name: str
+    is_default: bool = False
+    models: list[str] = Field(default_factory=list)
+    default_model: str | None = None
+
+
+class ProvidersResponse(BaseModel):
+    """Configured providers and model options."""
+
+    default_provider: str
+    providers: list[ProviderOption] = Field(default_factory=list)
+
+
 class JobSummary(BaseModel):
     """Summary of a single job for listing."""
 
@@ -298,6 +314,41 @@ def health():
 def list_styles():
     """List available style presets."""
     return STYLE_PRESETS
+
+
+@app.get("/providers", response_model=ProvidersResponse)
+def list_providers():
+    """List configured providers and models for the web UI."""
+    settings = _settings()
+
+    configured_names: set[str] = set(settings.providers.keys())
+    if settings.default_provider:
+        configured_names.add(settings.default_provider)
+
+    options: list[ProviderOption] = []
+    for name in sorted(configured_names):
+        cfg = settings.providers.get(name)
+        models: list[str] = []
+        if cfg and cfg.model:
+            models.append(cfg.model)
+        if name == settings.default_provider and settings.default_model:
+            models.append(settings.default_model)
+
+        unique_models = list(dict.fromkeys(models))
+        default_model = settings.default_model if name == settings.default_provider else None
+        if not default_model and cfg and cfg.model:
+            default_model = cfg.model
+
+        options.append(
+            ProviderOption(
+                name=name,
+                is_default=(name == settings.default_provider),
+                models=unique_models,
+                default_model=default_model,
+            )
+        )
+
+    return ProvidersResponse(default_provider=settings.default_provider, providers=options)
 
 
 @app.post("/generate", response_model=JobResponse)

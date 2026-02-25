@@ -396,11 +396,11 @@
   <div class="row">
     <div>
       <label for="provider">Provider</label>
-      <input id="provider" placeholder="e.g. openai (leave blank for default)">
+      <select id="provider"></select>
     </div>
     <div>
       <label for="model">Model</label>
-      <input id="model" placeholder="e.g. dall-e-3 (leave blank for default)">
+      <select id="model"></select>
     </div>
   </div>
 
@@ -584,11 +584,14 @@
   let selectedTVArtIds = new Set();
   let loadedTVArtById = {};
   let selectedGalleryJobIds = new Set();
+  let configuredProviders = [];
   const storageKeys = {
     tvGenerate: 'frameart.tv.generate',
     tvPublic: 'frameart.tv.public',
     tvUpload: 'frameart.tv.upload',
     tvArt: 'frameart.tv.art',
+    providerGenerate: 'frameart.provider.generate',
+    modelGenerate: 'frameart.model.generate',
     mattePublic: 'frameart.matte.public',
     matteUpload: 'frameart.matte.upload',
   };
@@ -610,6 +613,63 @@
       node.classList.add('reveal-stagger');
       node.style.animationDelay = (index * 22) + 'ms';
     });
+  }
+
+  function findProviderOption(name) {
+    return configuredProviders.find((p) => p.name === name) || null;
+  }
+
+  function refreshModelSelect(providerName, preferredModel) {
+    const modelSel = document.getElementById('model');
+    const provider = findProviderOption(providerName);
+    const models = provider?.models || [];
+    const defaultLabel = provider?.default_model
+      ? ('Provider default (' + provider.default_model + ')')
+      : 'Provider default';
+
+    modelSel.innerHTML = '';
+    const defaultOpt = document.createElement('option');
+    defaultOpt.value = '';
+    defaultOpt.textContent = defaultLabel;
+    modelSel.appendChild(defaultOpt);
+
+    for (const model of models) {
+      const opt = document.createElement('option');
+      opt.value = model;
+      opt.textContent = model;
+      modelSel.appendChild(opt);
+    }
+
+    if (preferredModel && [...modelSel.options].some((o) => o.value === preferredModel)) {
+      modelSel.value = preferredModel;
+    } else {
+      modelSel.value = '';
+    }
+  }
+
+  function refreshProviderSelects(payload) {
+    configuredProviders = payload?.providers || [];
+    const providerSel = document.getElementById('provider');
+    const rememberedProvider = localStorage.getItem(storageKeys.providerGenerate);
+    const rememberedModel = localStorage.getItem(storageKeys.modelGenerate);
+    const fallback = payload?.default_provider || configuredProviders[0]?.name || '';
+    const preferredProvider = rememberedProvider || fallback;
+
+    providerSel.innerHTML = '';
+    for (const provider of configuredProviders) {
+      const opt = document.createElement('option');
+      opt.value = provider.name;
+      opt.textContent = provider.is_default ? (provider.name + ' (default)') : provider.name;
+      providerSel.appendChild(opt);
+    }
+
+    if ([...providerSel.options].some((o) => o.value === preferredProvider)) {
+      providerSel.value = preferredProvider;
+    } else if (providerSel.options.length) {
+      providerSel.selectedIndex = 0;
+    }
+
+    refreshModelSelect(providerSel.value, rememberedModel || '');
   }
 
   function setButtonBusy(btn, busyText) {
@@ -747,6 +807,17 @@
     }
   }).catch(() => {});
 
+  fetch('/providers').then(r => r.json()).then((payload) => {
+    refreshProviderSelects(payload);
+  }).catch(() => {
+    const providerSel = document.getElementById('provider');
+    const modelSel = document.getElementById('model');
+    providerSel.innerHTML = '<option value="openai">openai</option>';
+    providerSel.value = 'openai';
+    modelSel.innerHTML = '<option value="">Provider default</option>';
+    showToast('Failed to load configured providers; using fallback defaults.', 'warn');
+  });
+
   // Load pre-configured TVs on startup
   fetch('/tv/configured').then(r => r.json()).then(configured => {
     addTVs(configured.map(c => ({
@@ -759,6 +830,15 @@
 
   document.getElementById('tv-select').addEventListener('change', (e) => {
     localStorage.setItem(storageKeys.tvGenerate, e.target.value || '');
+  });
+  document.getElementById('provider').addEventListener('change', (e) => {
+    const provider = e.target.value || '';
+    localStorage.setItem(storageKeys.providerGenerate, provider);
+    refreshModelSelect(provider, '');
+    localStorage.setItem(storageKeys.modelGenerate, '');
+  });
+  document.getElementById('model').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.modelGenerate, e.target.value || '');
   });
   document.getElementById('tv-art-select').addEventListener('change', (e) => {
     localStorage.setItem(storageKeys.tvArt, e.target.value || '');
@@ -815,8 +895,8 @@
     if (!prompt) { showStatus('Please enter a prompt.', 'error'); return; }
 
     const style = document.getElementById('style').value || undefined;
-    const provider = document.getElementById('provider').value.trim() || undefined;
-    const model = document.getElementById('model').value.trim() || undefined;
+    const provider = document.getElementById('provider').value || undefined;
+    const model = document.getElementById('model').value || undefined;
     const tvIp = document.getElementById('tv-select').value || undefined;
 
     const useTV = !!tvIp;
