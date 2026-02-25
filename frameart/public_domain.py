@@ -418,13 +418,45 @@ def download_artwork_image(
     """Download a public-domain artwork image to disk."""
     item = get_artwork(source, artwork_id)
     image_url = item["image_url"]
+    thumbnail_url = item.get("thumbnail_url")
     safe_name = _safe_filename(f"{item['source']}_{item['artwork_id']}.jpg")
     dest_dir.mkdir(parents=True, exist_ok=True)
     out_path = dest_dir / safe_name
 
-    with _http_client() as client:
-        resp = client.get(image_url)
-        resp.raise_for_status()
-        out_path.write_bytes(resp.content)
+    def _download_to_file(url: str) -> None:
+        # Download image bytes with a longer read timeout than metadata calls.
+        timeout = httpx.Timeout(connect=15.0, read=120.0, write=60.0, pool=30.0)
+        headers = {
+            "User-Agent": "FrameArt/0.1 (+https://github.com/borjaburgos/FrameTV-GenAI-Artwork)",
+            "Accept": "*/*",
+            "Referer": "https://www.artic.edu/",
+        }
+        last_error: Exception | None = None
+        for _ in range(3):
+            try:
+                with httpx.Client(timeout=timeout, follow_redirects=True, headers=headers) as client:
+                    with client.stream("GET", url) as resp:
+                        resp.raise_for_status()
+                        with out_path.open("wb") as f:
+                            for chunk in resp.iter_bytes(chunk_size=1024 * 64):
+                                if chunk:
+                                    f.write(chunk)
+                return
+            except (httpx.TimeoutException, httpx.NetworkError) as e:
+                last_error = e
+                continue
+        if last_error:
+            raise last_error
+
+    try:
+        _download_to_file(image_url)
+    except (httpx.TimeoutException, httpx.NetworkError):
+        # Some providers expose large originals that can time out; fallback to
+        # thumbnail when available. The existing processing pipeline still
+        # normalizes output to 16:9 and 4K as needed.
+        if thumbnail_url and thumbnail_url != image_url:
+            _download_to_file(thumbnail_url)
+        else:
+            raise
 
     return out_path, item
