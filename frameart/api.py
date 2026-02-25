@@ -187,6 +187,14 @@ class ChangeMatteRequest(BaseModel):
     tv_ip: str | None = Field(None, description="TV IP address.")
 
 
+class DisplayArtRequest(BaseModel):
+    """Request body for displaying an existing TV artwork by content ID."""
+
+    content_id: str = Field(..., description="Content ID of the artwork to display.")
+    tv: str | None = Field(None, description="TV profile name from config.")
+    tv_ip: str | None = Field(None, description="TV IP address.")
+
+
 class ConfiguredTVResponse(BaseModel):
     """A pre-configured TV from config.yaml."""
 
@@ -522,6 +530,17 @@ def tv_change_matte(req: ChangeMatteRequest):
     if change_matte(profile, req.content_id, req.matte_id):
         return {"ok": True, "content_id": req.content_id, "matte_id": req.matte_id}
     raise HTTPException(status_code=500, detail="Failed to change matte.")
+
+
+@app.post("/tv/art/display")
+def tv_display_art(req: DisplayArtRequest):
+    """Switch the TV display to an existing artwork by content ID."""
+    from frameart.tv.controller import switch_art
+
+    profile = _resolve_tv_profile(req.tv, req.tv_ip)
+    if switch_art(profile, req.content_id):
+        return {"ok": True, "content_id": req.content_id}
+    raise HTTPException(status_code=500, detail="Failed to display artwork.")
 
 
 @app.get("/tv/mattes")
