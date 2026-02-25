@@ -15,6 +15,7 @@ FrameArt is a self-hosted tool that accepts a text description, generates an ima
 - **HTTP API**: FastAPI server with sync and async endpoints — ideal for voice agents and Home Assistant
 - **Async job queue**: Submit long-running generation jobs and poll for results
 - **Web UI**: Built-in browser interface with provider/model dropdowns and concurrent async job tracking
+- **Public domain artwork support**: Search and apply art from major open-access museum collections
 - **Style presets**: abstract, oil_painting, watercolor, kid_drawing, and more
 - **Pluggable upscalers**: Built-in Pillow LANCZOS, local HTTP (Real-ESRGAN), or remote services
 - **Artifact management**: Date-organized storage with full metadata tracking
@@ -207,6 +208,13 @@ Interactive API docs are available at `http://localhost:8000/docs` and the web U
 | `GET` | `/jobs` | List recent jobs |
 | `GET` | `/jobs/{job_id}/image` | Serve the final processed image |
 
+**Public domain catalog**:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/catalog/search` | Search supported museum/open-access sources |
+| `POST` | `/catalog/apply` | Download an artwork, run FrameArt processing pipeline, and upload to TV |
+
 **Misc**:
 
 | Method | Path | Description |
@@ -303,6 +311,20 @@ curl http://localhost:8000/async/jobs?limit=10
 ```bash
 curl http://localhost:8000/tv/discover
 # [{"ip":"192.168.1.100","name":"Living Room","model":"QN55LS03","frame_tv":true}]
+```
+
+**Search public-domain artwork:**
+
+```bash
+curl "http://localhost:8000/catalog/search?source=aic&q=landscape&limit=10"
+```
+
+**Apply public-domain artwork to TV:**
+
+```bash
+curl -X POST http://localhost:8000/catalog/apply \
+  -H "Content-Type: application/json" \
+  -d '{"source":"met","artwork_id":"436121","tv_ip":"192.168.1.100","matte":"none"}'
 ```
 
 **Health check:**
@@ -406,6 +428,21 @@ tvs:
     ip: "192.168.1.101"
     token_file: "/data/frameart/secrets/bedroom.token"
 ```
+
+### Public domain providers
+
+The `Public Domain` web UI tab and `/catalog/*` API currently support:
+
+- `aic` (Art Institute of Chicago)
+- `met` (The Metropolitan Museum of Art)
+- `cma` (Cleveland Museum of Art)
+- `europeana` (Europeana)
+
+Optional key for Europeana (a demo key is used by default):
+
+| Variable | Description |
+|----------|-------------|
+| `EUROPEANA_API_KEY` | Europeana API key (optional; defaults to `apidemo`) |
 
 ---
 
@@ -531,6 +568,12 @@ FrameArt attempts to switch to Art Mode automatically. If it fails, press the po
 - Check that the TV is in Art Mode: `frameart tv status --tv-ip <IP>`
 - The image may need a moment to process on the TV after upload.
 - Try listing artworks to confirm it uploaded: `frameart tv list-art --tv-ip <IP>`
+
+### Public-domain image timeouts
+
+- FrameArt first tries the full-resolution source image.
+- If a provider's large source times out, FrameArt falls back to the thumbnail when available.
+- In both cases, the same post-processing pipeline is applied (border trim, 16:9 crop, and 4K normalization).
 
 ### Provider API errors
 
