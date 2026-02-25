@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from urllib.parse import quote
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,32 @@ def _first_str(value: Any) -> str | None:
         for item in value:
             if isinstance(item, str) and item:
                 return item
+    return None
+
+
+def _first_from_aggregations(obj: dict[str, Any], field: str) -> str | None:
+    aggs = obj.get("aggregations")
+    if not isinstance(aggs, list):
+        return None
+    for agg in aggs:
+        if not isinstance(agg, dict):
+            continue
+        val = _first_str(agg.get(field))
+        if val:
+            return val
+    return None
+
+
+def _first_from_proxies(obj: dict[str, Any], field: str) -> str | None:
+    proxies = obj.get("proxies")
+    if not isinstance(proxies, list):
+        return None
+    for proxy in proxies:
+        if not isinstance(proxy, dict):
+            continue
+        val = _first_str(proxy.get(field))
+        if val:
+            return val
     return None
 
 
@@ -166,21 +193,44 @@ def _cma_object_to_item(obj: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _europeana_object_to_item(obj: dict[str, Any]) -> dict[str, Any] | None:
-    artwork_id = _first_str(obj.get("id"))
+    artwork_id = _first_str(obj.get("id")) or _first_str(obj.get("about"))
     if not artwork_id:
         return None
 
     title = _first_str(obj.get("title")) or f"Europeana Record {artwork_id}"
-    artist = _first_str(obj.get("dcCreator")) or _first_str(obj.get("edmAgentLabel"))
-    date = _first_str(obj.get("year")) or _first_str(obj.get("timestamp_created"))
+    artist = (
+        _first_str(obj.get("dcCreator"))
+        or _first_str(obj.get("edmAgentLabel"))
+        or _first_from_proxies(obj, "dcCreator")
+    )
+    date = (
+        _first_str(obj.get("year"))
+        or _first_str(obj.get("timestamp_created"))
+        or _first_from_proxies(obj, "year")
+        or _first_from_proxies(obj, "dcDate")
+    )
 
-    image_url = _first_str(obj.get("edmIsShownBy")) or _first_str(obj.get("edmPreview"))
+    image_url = (
+        _first_str(obj.get("edmIsShownBy"))
+        or _first_from_aggregations(obj, "edmIsShownBy")
+        or _first_str(obj.get("edmPreview"))
+        or _first_from_aggregations(obj, "edmObject")
+        or _first_from_aggregations(obj, "edmPreview")
+    )
     thumb_url = _first_str(obj.get("edmPreview")) or image_url
     if not image_url:
         return None
 
-    source_url = _first_str(obj.get("guid")) or _first_str(obj.get("edmIsShownAt"))
-    rights = _first_str(obj.get("rights")) or _first_str(obj.get("edmRights"))
+    source_url = (
+        _first_str(obj.get("guid"))
+        or _first_str(obj.get("edmIsShownAt"))
+        or _first_from_aggregations(obj, "edmIsShownAt")
+    )
+    rights = (
+        _first_str(obj.get("rights"))
+        or _first_str(obj.get("edmRights"))
+        or _first_from_aggregations(obj, "edmRights")
+    )
 
     return {
         "source": "europeana",
@@ -235,7 +285,7 @@ def _europeana_wskey() -> str:
 def _europeana_fetch_object(client: httpx.Client, artwork_id: str) -> dict[str, Any]:
     record_id = artwork_id.lstrip("/")
     resp = client.get(
-        f"{EUROPEANA_API_BASE}/{record_id}.json",
+        f"{EUROPEANA_API_BASE}/{quote(record_id, safe='/')}.json",
         params={"wskey": _europeana_wskey(), "profile": "rich"},
     )
     resp.raise_for_status()
