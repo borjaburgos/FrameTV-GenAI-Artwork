@@ -434,17 +434,19 @@ def download_artwork_image(
         last_error: Exception | None = None
         for _ in range(3):
             try:
-                with httpx.Client(
-                    timeout=timeout,
-                    follow_redirects=True,
-                    headers=headers,
-                ) as client:
-                    with client.stream("GET", url) as resp:
-                        resp.raise_for_status()
-                        with out_path.open("wb") as f:
-                            for chunk in resp.iter_bytes(chunk_size=1024 * 64):
-                                if chunk:
-                                    f.write(chunk)
+                with (
+                    httpx.Client(
+                        timeout=timeout,
+                        follow_redirects=True,
+                        headers=headers,
+                    ) as client,
+                    client.stream("GET", url) as resp,
+                ):
+                    resp.raise_for_status()
+                    with out_path.open("wb") as f:
+                        for chunk in resp.iter_bytes(chunk_size=1024 * 64):
+                            if chunk:
+                                f.write(chunk)
                 return
             except httpx.RequestError as e:
                 last_error = e
