@@ -117,6 +117,27 @@ class TestProviders:
             }
         ]
 
+    @patch("frameart.api._settings")
+    @patch("frameart.api._fetch_openai_image_models")
+    def test_openai_live_models_are_merged(self, mock_live_models, mock_settings):
+        settings = MagicMock()
+        settings.default_provider = "openai"
+        settings.default_model = "gpt-image-1"
+        settings.providers = {
+            "openai": MagicMock(model="dall-e-3"),
+            "ollama": MagicMock(model="sdxl"),
+        }
+        mock_settings.return_value = settings
+        mock_live_models.return_value = ["gpt-image-1", "gpt-image-2"]
+
+        resp = client.get("/providers")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        openai = next(p for p in data["providers"] if p["name"] == "openai")
+        assert openai["models"] == ["dall-e-3", "gpt-image-1", "gpt-image-2"]
+        mock_live_models.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # POST /generate

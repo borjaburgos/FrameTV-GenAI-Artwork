@@ -38,10 +38,12 @@ Misc:
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
@@ -299,6 +301,44 @@ def _pipeline_result_to_response(result) -> JobResponse:
     )
 
 
+def _is_openai_image_model(model_id: str) -> bool:
+    if not model_id:
+        return False
+    if model_id in {"dall-e-2", "dall-e-3", "gpt-image-1"}:
+        return True
+    return model_id.startswith("gpt-image-")
+
+
+def _fetch_openai_image_models(openai_cfg) -> list[str]:
+    """Fetch available image-capable OpenAI models for configured credentials."""
+    api_key = (openai_cfg.api_key if openai_cfg else None) or os.environ.get("OPENAI_API_KEY") or ""
+    if not api_key:
+        return []
+
+    base_url = (openai_cfg.base_url if openai_cfg else None) or "https://api.openai.com/v1"
+    url = base_url.rstrip("/") + "/models"
+
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            resp = client.get(
+                url,
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+        resp.raise_for_status()
+        payload = resp.json()
+        items = payload.get("data") if isinstance(payload, dict) else []
+        models: list[str] = []
+        if isinstance(items, list):
+            for item in items:
+                model_id = item.get("id") if isinstance(item, dict) else None
+                if isinstance(model_id, str) and _is_openai_image_model(model_id):
+                    models.append(model_id)
+        return list(dict.fromkeys(models))
+    except Exception as e:
+        logger.warning("OpenAI model discovery failed: %s", e)
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Routes — synchronous
 # ---------------------------------------------------------------------------
@@ -333,6 +373,8 @@ def list_providers():
             models.append(cfg.model)
         if name == settings.default_provider and settings.default_model:
             models.append(settings.default_model)
+        if name == "openai":
+            models.extend(_fetch_openai_image_models(cfg))
 
         unique_models = list(dict.fromkeys(models))
         default_model = settings.default_model if name == settings.default_provider else None
