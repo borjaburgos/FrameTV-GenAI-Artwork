@@ -879,6 +879,35 @@ class TestJobApply:
             mock_run_apply.assert_not_called()
 
     @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_apply")
+    def test_persists_content_id_after_apply(self, mock_run, mock_settings):
+        import json
+        import tempfile
+
+        settings = MagicMock()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job_dir = Path(tmpdir) / "artifacts" / "2025" / "01" / "01" / "test-job"
+            job_dir.mkdir(parents=True)
+            (job_dir / "final.png").write_bytes(b"fakepng")
+            (job_dir / "meta.json").write_text('{"job_id":"test-job"}')
+            settings.data_dir = Path(tmpdir)
+            mock_settings.return_value = settings
+            mock_run.return_value = _fake_result(
+                content_id="MY_F9000",
+                metadata={"tv_ip": "192.168.1.100"},
+            )
+
+            resp = client.post(
+                "/jobs/test-job/apply",
+                json={"tv_ip": "192.168.1.100", "matte": "none"},
+            )
+            assert resp.status_code == 200
+
+            persisted = json.loads((job_dir / "meta.json").read_text())
+            assert persisted["content_id"] == "MY_F9000"
+            assert persisted["tv_content_ids"]["192.168.1.100"] == "MY_F9000"
+
+    @patch("frameart.api._settings")
     def test_not_found(self, mock_settings):
         settings = MagicMock()
         settings.data_dir = Path("/tmp/nonexistent_frameart_test")

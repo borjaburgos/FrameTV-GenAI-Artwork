@@ -752,25 +752,46 @@ def apply_job_to_tv(job_id: str, req: JobApplyRequest):
     # Reuse existing TV content when possible to avoid duplicate uploads.
     job_dir = selected_image.parent
     meta_path = job_dir / "meta.json"
+    meta: dict[str, Any] = {}
     existing_content_id: str | None = None
+    tv_content_ids: dict[str, str] = {}
     try:
         if meta_path.exists():
             meta = _json.loads(meta_path.read_text())
+            tv_map = meta.get("tv_content_ids")
+            if isinstance(tv_map, dict):
+                for key, value in tv_map.items():
+                    if isinstance(key, str) and isinstance(value, str) and value:
+                        tv_content_ids[key] = value
             content_id = meta.get("content_id")
             if isinstance(content_id, str) and content_id:
                 existing_content_id = content_id
     except Exception:
         existing_content_id = None
 
-    if existing_content_id:
+    profile = None
+    try:
         profile = _resolve_tv_profile(req.tv, req.tv_ip)
+    except HTTPException:
+        profile = None
+
+    candidate_ids: list[str] = []
+    if profile:
+        mapped_id = tv_content_ids.get(profile.ip)
+        if mapped_id:
+            candidate_ids.append(mapped_id)
+    if existing_content_id and existing_content_id not in candidate_ids:
+        candidate_ids.append(existing_content_id)
+
+    if profile and candidate_ids:
         try:
             tv_art = list_art_deduplicated(profile)
             tv_ids = {str(a.get("content_id", "")) for a in tv_art}
         except Exception:
             tv_ids = set()
 
-        if existing_content_id in tv_ids and switch_art(profile, existing_content_id):
+        reusable_content_id = next((cid for cid in candidate_ids if cid in tv_ids), None)
+        if reusable_content_id and switch_art(profile, reusable_content_id):
             source_preview = job_dir / "source.png"
             final_preview = job_dir / "final.png"
             return JobResponse(
@@ -778,11 +799,11 @@ def apply_job_to_tv(job_id: str, req: JobApplyRequest):
                 job_dir=str(job_dir),
                 source_path=str(source_preview) if source_preview.exists() else None,
                 final_path=str(final_preview) if final_preview.exists() else None,
-                content_id=existing_content_id,
+                content_id=reusable_content_id,
                 tv_switched=True,
                 metadata={
                     "job_id": job_id,
-                    "content_id": existing_content_id,
+                    "content_id": reusable_content_id,
                     "tv_ip": profile.ip,
                     "tv_switched": True,
                     "reused_existing_content": True,
@@ -801,6 +822,32 @@ def apply_job_to_tv(job_id: str, req: JobApplyRequest):
     resp = _pipeline_result_to_response(result)
     if result.error:
         raise HTTPException(status_code=500, detail=resp.model_dump())
+
+    # Persist applied content ID back to the original job metadata for dedupe on re-apply.
+    try:
+        persisted_meta = meta if isinstance(meta, dict) else {}
+        if result.content_id:
+            persisted_meta["content_id"] = result.content_id
+            result_tv_ip = (
+                result.metadata.get("tv_ip")
+                if isinstance(result.metadata, dict)
+                else None
+            )
+            target_tv_ip = (
+                result_tv_ip
+                if isinstance(result_tv_ip, str)
+                else (profile.ip if profile else req.tv_ip)
+            )
+            if isinstance(target_tv_ip, str) and target_tv_ip:
+                tv_map = persisted_meta.get("tv_content_ids")
+                if not isinstance(tv_map, dict):
+                    tv_map = {}
+                tv_map[target_tv_ip] = result.content_id
+                persisted_meta["tv_content_ids"] = tv_map
+        meta_path.write_text(_json.dumps(persisted_meta, indent=2, default=str))
+    except Exception:
+        logger.warning("Failed to persist re-apply metadata for job_id=%s", job_id)
+
     return resp
 
 
