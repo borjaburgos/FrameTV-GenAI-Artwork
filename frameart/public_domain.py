@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ import httpx
 MET_API_BASE = "https://collectionapi.metmuseum.org/public/collection/v1"
 AIC_API_BASE = "https://api.artic.edu/api/v1"
 CMA_API_BASE = "https://openaccess-api.clevelandart.org/api"
+EUROPEANA_API_BASE = "https://api.europeana.eu/record/v2"
 
 
 def _http_client() -> httpx.Client:
@@ -27,6 +29,16 @@ def _http_client() -> httpx.Client:
 
 def _safe_filename(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "_", value).strip("._") or "item"
+
+
+def _first_str(value: Any) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, str) and item:
+                return item
+    return None
 
 
 def _met_object_to_item(obj: dict[str, Any]) -> dict[str, Any] | None:
@@ -162,6 +174,38 @@ def _cma_object_to_item(obj: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _europeana_object_to_item(obj: dict[str, Any]) -> dict[str, Any] | None:
+    artwork_id = _first_str(obj.get("id"))
+    if not artwork_id:
+        return None
+
+    title = _first_str(obj.get("title")) or f"Europeana Record {artwork_id}"
+    artist = _first_str(obj.get("dcCreator")) or _first_str(obj.get("edmAgentLabel"))
+    date = _first_str(obj.get("year")) or _first_str(obj.get("timestamp_created"))
+
+    image_url = _first_str(obj.get("edmIsShownBy")) or _first_str(obj.get("edmPreview"))
+    thumb_url = _first_str(obj.get("edmPreview")) or image_url
+    if not image_url:
+        return None
+
+    source_url = _first_str(obj.get("guid")) or _first_str(obj.get("edmIsShownAt"))
+    rights = _first_str(obj.get("rights")) or _first_str(obj.get("edmRights"))
+
+    return {
+        "source": "europeana",
+        "artwork_id": artwork_id,
+        "title": title,
+        "artist": artist,
+        "date": date,
+        "image_url": image_url,
+        "thumbnail_url": thumb_url,
+        "license": rights or "See source",
+        "attribution": "Europeana",
+        "source_url": source_url or "https://www.europeana.eu/",
+        "is_public_domain": True,
+    }
+
+
 def _met_fetch_object(client: httpx.Client, artwork_id: str) -> dict[str, Any]:
     resp = client.get(f"{MET_API_BASE}/objects/{artwork_id}")
     resp.raise_for_status()
@@ -192,6 +236,25 @@ def _cma_fetch_object(client: httpx.Client, artwork_id: str) -> dict[str, Any]:
     return data.get("data", {})
 
 
+def _europeana_wskey() -> str:
+    # Europeana demo key can be used for development and low-volume usage.
+    return os.getenv("EUROPEANA_API_KEY", "apidemo")
+
+
+def _europeana_fetch_object(client: httpx.Client, artwork_id: str) -> dict[str, Any]:
+    record_id = artwork_id.lstrip("/")
+    resp = client.get(
+        f"{EUROPEANA_API_BASE}/{record_id}.json",
+        params={"wskey": _europeana_wskey(), "profile": "rich"},
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    record = payload.get("object")
+    if isinstance(record, dict):
+        return record
+    return {}
+
+
 def search_artworks(source: str, query: str, limit: int = 20) -> list[dict[str, Any]]:
     """Search public-domain artworks for a source and query."""
     q = query.strip()
@@ -199,8 +262,10 @@ def search_artworks(source: str, query: str, limit: int = 20) -> list[dict[str, 
         return []
 
     src = source.lower()
-    if src not in {"met", "aic", "cma"}:
-        raise ValueError(f"Unsupported source '{source}'. Use 'met', 'aic', or 'cma'.")
+    if src not in {"met", "aic", "cma", "europeana"}:
+        raise ValueError(
+            f"Unsupported source '{source}'. Use 'met', 'aic', 'cma', or 'europeana'."
+        )
 
     with _http_client() as client:
         if src == "met":
@@ -248,25 +313,42 @@ def search_artworks(source: str, query: str, limit: int = 20) -> list[dict[str, 
             items = [_aic_object_to_item(obj) for obj in data]
             return [item for item in items if item is not None][:limit]
 
+        if src == "cma":
+            resp = client.get(
+                f"{CMA_API_BASE}/artworks",
+                params={
+                    "q": q,
+                    "has_image": "1",
+                    "limit": min(max(limit, 1), 50),
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json().get("data") or []
+            items = [_cma_object_to_item(obj) for obj in data if isinstance(obj, dict)]
+            return [item for item in items if item is not None][:limit]
+
         resp = client.get(
-            f"{CMA_API_BASE}/artworks",
+            f"{EUROPEANA_API_BASE}/search.json",
             params={
-                "q": q,
-                "has_image": "1",
-                "limit": min(max(limit, 1), 50),
+                "wskey": _europeana_wskey(),
+                "query": q,
+                "rows": min(max(limit, 1), 50),
+                "profile": "rich",
             },
         )
         resp.raise_for_status()
-        data = resp.json().get("data") or []
-        items = [_cma_object_to_item(obj) for obj in data if isinstance(obj, dict)]
+        data = resp.json().get("items") or []
+        items = [_europeana_object_to_item(obj) for obj in data if isinstance(obj, dict)]
         return [item for item in items if item is not None][:limit]
 
 
 def get_artwork(source: str, artwork_id: str) -> dict[str, Any]:
     """Fetch a single artwork metadata record by source and ID."""
     src = source.lower()
-    if src not in {"met", "aic", "cma"}:
-        raise ValueError(f"Unsupported source '{source}'. Use 'met', 'aic', or 'cma'.")
+    if src not in {"met", "aic", "cma", "europeana"}:
+        raise ValueError(
+            f"Unsupported source '{source}'. Use 'met', 'aic', 'cma', or 'europeana'."
+        )
 
     with _http_client() as client:
         if src == "met":
@@ -275,9 +357,12 @@ def get_artwork(source: str, artwork_id: str) -> dict[str, Any]:
         elif src == "aic":
             obj = _aic_fetch_object(client, artwork_id)
             item = _aic_object_to_item(obj)
-        else:
+        elif src == "cma":
             obj = _cma_fetch_object(client, artwork_id)
             item = _cma_object_to_item(obj)
+        else:
+            obj = _europeana_fetch_object(client, artwork_id)
+            item = _europeana_object_to_item(obj)
 
     if not item:
         raise ValueError("Artwork is unavailable or not public domain.")

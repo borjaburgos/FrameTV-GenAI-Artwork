@@ -781,9 +781,33 @@ class TestCatalogSearch:
         assert data[0]["artwork_id"] == "98765"
 
     @patch("frameart.api.public_domain.search_artworks")
+    def test_returns_europeana_results(self, mock_search):
+        mock_search.return_value = [
+            {
+                "source": "europeana",
+                "artwork_id": "/90402/https___www_europeana_eu_item_test_123",
+                "title": "Study for a Landscape",
+                "artist": "Unknown",
+                "date": "19th century",
+                "image_url": "https://example.com/eu-full.jpg",
+                "thumbnail_url": "https://example.com/eu-thumb.jpg",
+                "license": "See source",
+                "attribution": "Europeana",
+                "source_url": "https://www.europeana.eu/item/test/123",
+                "is_public_domain": True,
+            }
+        ]
+
+        resp = client.get("/catalog/search?source=europeana&q=landscape&limit=10")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data) == 1
+        assert data[0]["source"] == "europeana"
+
+    @patch("frameart.api.public_domain.search_artworks")
     def test_bad_source_returns_400(self, mock_search):
         mock_search.side_effect = ValueError(
-            "Unsupported source 'foo'. Use 'met', 'aic', or 'cma'."
+            "Unsupported source 'foo'. Use 'met', 'aic', 'cma', or 'europeana'."
         )
 
         resp = client.get("/catalog/search?source=foo&q=test")
