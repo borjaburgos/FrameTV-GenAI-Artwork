@@ -14,7 +14,7 @@ FrameArt is a self-hosted tool that accepts a text description, generates an ima
 - **TV auto-discovery**: Find Frame TVs on your LAN automatically via UPnP/SSDP
 - **HTTP API**: FastAPI server with sync and async endpoints — ideal for voice agents and Home Assistant
 - **Async job queue**: Submit long-running generation jobs and poll for results
-- **Web UI**: Built-in dark-themed browser interface for generating art and browsing the gallery
+- **Web UI**: Built-in browser interface with provider/model dropdowns and concurrent async job tracking
 - **Style presets**: abstract, oil_painting, watercolor, kid_drawing, and more
 - **Pluggable upscalers**: Built-in Pillow LANCZOS, local HTTP (Real-ESRGAN), or remote services
 - **Artifact management**: Date-organized storage with full metadata tracking
@@ -196,6 +196,7 @@ Interactive API docs are available at `http://localhost:8000/docs` and the web U
 | `POST` | `/async/generate-and-apply` | Submit generate+apply job |
 | `POST` | `/async/apply` | Submit upload job |
 | `GET` | `/jobs/{job_id}/status` | Poll job progress and result |
+| `GET` | `/async/jobs` | List recent async jobs with status and metadata |
 
 **TV and gallery**:
 
@@ -212,6 +213,7 @@ Interactive API docs are available at `http://localhost:8000/docs` and the web U
 |--------|------|-------------|
 | `GET` | `/` | Web UI |
 | `GET` | `/styles` | List available style presets |
+| `GET` | `/providers` | List configured providers and model options |
 | `GET` | `/health` | Liveness check |
 
 ### API Examples
@@ -271,6 +273,13 @@ curl http://localhost:8000/jobs?limit=5
 curl http://localhost:8000/jobs/120000-abc12345/image -o artwork.png
 ```
 
+**List configured providers and model options:**
+
+```bash
+curl http://localhost:8000/providers
+# {"default_provider":"openai","providers":[{"name":"openai","models":["gpt-image-1",...]}]}
+```
+
 **Async generation** (returns immediately, poll for status):
 
 ```bash
@@ -283,6 +292,10 @@ curl -X POST http://localhost:8000/async/generate \
 # Poll until complete
 curl http://localhost:8000/jobs/143022-a1b2c3d4/status
 # {"job_id":"143022-a1b2c3d4","status":"completed","result":{...}}
+
+# List recent async jobs
+curl http://localhost:8000/async/jobs?limit=10
+# [{"job_id":"143022-a1b2c3d4","status":"running","request":{"prompt":"...","provider":"openai","model":"gpt-image-1"}}]
 ```
 
 **Discover TVs on the network:**
