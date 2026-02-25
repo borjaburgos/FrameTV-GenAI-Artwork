@@ -569,6 +569,54 @@ class TestTVChangeMatte:
 
 
 # ---------------------------------------------------------------------------
+# POST /tv/art/display
+# ---------------------------------------------------------------------------
+
+class TestTVDisplayArt:
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.switch_art")
+    def test_success(self, mock_switch, mock_settings):
+        settings = MagicMock()
+        settings.tvs = {}
+        mock_settings.return_value = settings
+        mock_switch.return_value = True
+
+        resp = client.post("/tv/art/display", json={
+            "content_id": "MY_F0001",
+            "tv_ip": "192.168.1.100",
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["content_id"] == "MY_F0001"
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.switch_art")
+    def test_failure_returns_500(self, mock_switch, mock_settings):
+        settings = MagicMock()
+        settings.tvs = {}
+        mock_settings.return_value = settings
+        mock_switch.return_value = False
+
+        resp = client.post("/tv/art/display", json={
+            "content_id": "MY_F0001",
+            "tv_ip": "192.168.1.100",
+        })
+        assert resp.status_code == 500
+
+    @patch("frameart.api._settings")
+    def test_no_tv_returns_400(self, mock_settings):
+        settings = MagicMock()
+        settings.tvs = {}
+        mock_settings.return_value = settings
+
+        resp = client.post("/tv/art/display", json={
+            "content_id": "MY_F0001",
+        })
+        assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
 # GET /tv/mattes
 # ---------------------------------------------------------------------------
 

@@ -937,6 +937,9 @@
             <div class="art-thumb-fallback">No thumbnail</div>
           </div>
           <div class="art-actions">
+            <button class="btn btn-small"
+                    onclick="displayTVArt('${esc(a.content_id)}', '${esc(tvIp)}', this)">
+              Display on TV</button>
             <button class="btn btn-secondary btn-small"
                     onclick="openMatteModal('${esc(a.content_id)}', '${esc(tvIp)}')">
               Change Matte</button>
@@ -964,6 +967,35 @@
       grid.innerHTML = '<div class="empty">Failed to load art: ' + esc(e.message) + '</div>';
     }
   }
+
+  // =========================================================================
+  // Display Existing TV Art
+  // =========================================================================
+  window.displayTVArt = async function(contentId, tvIp, btn) {
+    const originalText = btn ? btn.textContent : '';
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = 'Displaying...';
+    }
+    try {
+      const resp = await fetch('/tv/art/display', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          content_id: contentId,
+          tv_ip: tvIp,
+        }),
+      });
+      if (!resp.ok) throw new Error('Server returned ' + resp.status);
+    } catch (e) {
+      alert('Failed to display artwork: ' + e.message);
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = originalText || 'Display on TV';
+      }
+    }
+  };
 
   // =========================================================================
   // Delete TV Art
