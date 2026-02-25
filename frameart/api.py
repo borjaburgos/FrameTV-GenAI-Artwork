@@ -244,7 +244,7 @@ class PublicDomainArtwork(BaseModel):
 class PublicDomainApplyRequest(BaseModel):
     """Request body for downloading and displaying public-domain artwork."""
 
-    source: str = Field(..., description="Public domain source: met, aic, cma, or rijks.")
+    source: str = Field(..., description="Public domain source: met, aic, or cma.")
     artwork_id: str = Field(..., description="Provider-specific artwork ID.")
     tv: str | None = Field(None, description="TV profile name from config.")
     tv_ip: str | None = Field(None, description="TV IP address.")
@@ -553,7 +553,7 @@ def tv_configured():
 
 @app.get("/catalog/search", response_model=list[PublicDomainArtwork])
 def catalog_search(
-    source: str = Query(..., description="Catalog source: met, aic, cma, or rijks."),
+    source: str = Query(..., description="Catalog source: met, aic, or cma."),
     q: str = Query(..., min_length=1, description="Search query."),
     limit: int = Query(20, ge=1, le=50, description="Max results."),
 ):

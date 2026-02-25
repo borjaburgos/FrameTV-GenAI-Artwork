@@ -382,9 +382,6 @@ See [`config.example.yaml`](config.example.yaml) for all options.
 | `FRAMEART_DEFAULT_UPSCALER` | Default upscaler |
 | `FRAMEART_LOG_LEVEL` | Logging level (`DEBUG`, `INFO`, `WARNING`) |
 
-Rijksmuseum Data Services (`source=rijks`) uses the keyless API at
-`https://data.rijksmuseum.nl/search/collection`.
-
 ### Multiple TVs
 
 ```yaml
