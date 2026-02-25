@@ -47,6 +47,7 @@
   }
   .header h1 { font-size: 1.4rem; font-weight: 600; }
   .header h1 span { color: var(--accent); }
+  .header-spacer { flex: 1 1 auto; }
   .tabs { display: flex; gap: 0; }
   .tabs button {
     background: transparent;
@@ -135,6 +136,13 @@
     border-color: rgba(255, 255, 255, .08);
     box-shadow: none;
   }
+  .btn-ghost {
+    background: transparent;
+    color: var(--muted);
+    border-color: rgba(168, 179, 200, .22);
+    box-shadow: none;
+  }
+  .btn-ghost:hover { color: var(--text); border-color: rgba(87, 166, 255, .35); }
 
   /* --- Status / results --- */
   .status-bar {
@@ -305,6 +313,28 @@
   .toast.error { border-left-color: var(--err); }
   .toast.done { border-left-color: var(--accent); }
   .toast.warn { border-left-color: var(--warn); }
+  kbd {
+    display: inline-block;
+    min-width: 1.4em;
+    padding: .15rem .4rem;
+    border-radius: 6px;
+    border: 1px solid #3e4a63;
+    background: #212c3f;
+    color: #dce7ff;
+    font-size: .78rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    text-align: center;
+  }
+  .shortcut-grid {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: .5rem .8rem;
+    align-items: center;
+    margin-top: .6rem;
+  }
+  .shortcut-grid .label { color: var(--text); font-size: .9rem; }
+  .shortcut-grid .keys { display: flex; gap: .35rem; justify-content: flex-end; }
+  .hint-inline { font-size: .78rem; color: var(--muted); margin-left: .35rem; }
 
   :focus-visible { outline: 2px solid var(--accent2); outline-offset: 2px; border-radius: 6px; }
 
@@ -342,6 +372,8 @@
     <button data-tab="public">Public Domain</button>
     <button data-tab="tvs">TVs</button>
   </div>
+  <div class="header-spacer"></div>
+  <button class="btn btn-ghost btn-small" id="btn-shortcuts">Shortcuts</button>
 </div>
 
 <!-- ===== Generate ===== -->
@@ -417,6 +449,7 @@
     <div>
       <label for="public-query">Search</label>
       <input id="public-query" placeholder="e.g. monet, landscape, ukiyo-e">
+      <span class="hint-inline">Tip: press <kbd>/</kbd> to focus search</span>
     </div>
     <div style="align-self:end;">
       <button class="btn btn-secondary" id="btn-public-search">Search</button>
@@ -458,6 +491,8 @@
       <div class="btn-group">
         <select id="tv-art-select" style="width:auto; margin-bottom:0;"></select>
         <button class="btn btn-secondary btn-small" id="btn-load-art">Load Art</button>
+        <button class="btn btn-secondary btn-small" id="btn-tv-art-select-all">Select All</button>
+        <button class="btn btn-secondary btn-small" id="btn-tv-art-clear">Clear</button>
         <button class="btn btn-danger btn-small" id="btn-delete-selected" disabled>Delete Selected</button>
       </div>
     </div>
@@ -508,6 +543,31 @@
     </div>
     <div class="status-bar" id="upload-status" style="margin-top:.8rem;">
       <div class="value" id="upload-status-text"></div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="shortcuts-modal">
+  <div class="modal-dialog">
+    <h3>Keyboard Shortcuts</h3>
+    <div class="shortcut-grid">
+      <div class="label">Generate on Generate tab</div>
+      <div class="keys"><kbd>Ctrl</kbd><kbd>Enter</kbd></div>
+      <div class="label">Switch to Generate</div>
+      <div class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>G</kbd></div>
+      <div class="label">Switch to Gallery</div>
+      <div class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>Y</kbd></div>
+      <div class="label">Switch to Public Domain</div>
+      <div class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>P</kbd></div>
+      <div class="label">Switch to TVs</div>
+      <div class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>T</kbd></div>
+      <div class="label">Focus primary search</div>
+      <div class="keys"><kbd>/</kbd></div>
+      <div class="label">Close open modal</div>
+      <div class="keys"><kbd>Esc</kbd></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-small" id="btn-shortcuts-close">Close</button>
     </div>
   </div>
 </div>
@@ -933,7 +993,7 @@
   document.getElementById('btn-gallery-clear-selection').addEventListener('click', () => setAllGallerySelections(false));
   document.getElementById('btn-gallery-delete-selected').addEventListener('click', deleteSelectedGalleryJobs);
 
-  const modalIds = ['modal', 'matte-modal', 'upload-modal'];
+  const modalIds = ['modal', 'matte-modal', 'upload-modal', 'shortcuts-modal'];
   let lastFocusedBeforeModal = null;
 
   function openModal(modalId, focusSelector) {
@@ -961,6 +1021,13 @@
       if (modal) modal.classList.remove('visible');
     });
   }
+
+  document.getElementById('btn-shortcuts').addEventListener('click', () => {
+    openModal('shortcuts-modal', '#btn-shortcuts-close');
+  });
+  document.getElementById('btn-shortcuts-close').addEventListener('click', () => {
+    closeModal('shortcuts-modal');
+  });
 
   window.showPreview = function(jobId) {
     document.getElementById('modal-img').src = '/jobs/' + jobId + '/image';
@@ -1255,12 +1322,27 @@
   });
   document.getElementById('btn-load-art').addEventListener('click', loadTVArt);
   document.getElementById('btn-delete-selected').addEventListener('click', deleteSelectedTVArt);
+  document.getElementById('btn-tv-art-select-all').addEventListener('click', () => setAllTVArtSelections(true));
+  document.getElementById('btn-tv-art-clear').addEventListener('click', () => setAllTVArtSelections(false));
 
   function updateDeleteSelectedButton() {
     const btn = document.getElementById('btn-delete-selected');
     const n = selectedTVArtIds.size;
     btn.disabled = n === 0;
     btn.textContent = n > 0 ? ('Delete Selected (' + n + ')') : 'Delete Selected';
+  }
+
+  function setAllTVArtSelections(checked) {
+    document.querySelectorAll('.tv-art-select-item').forEach((el) => {
+      const cid = el.dataset.contentId;
+      if (!cid) return;
+      el.checked = checked;
+      const card = el.closest('.tv-art-item');
+      if (card) card.classList.toggle('selected', checked);
+      if (checked) selectedTVArtIds.add(cid);
+      else selectedTVArtIds.delete(cid);
+    });
+    updateDeleteSelectedButton();
   }
 
   async function loadTVArt() {
