@@ -368,12 +368,12 @@ def _rijks_search_candidates(
     candidates: list[tuple[str, dict[str, Any]]] = []
     last_error: Exception | None = None
     query_variants = [
-        {"query": query, "imageAvailable": "true"},
-        {"title": query, "imageAvailable": "true"},
-        {"creator": query, "imageAvailable": "true"},
-        {"description": query, "imageAvailable": "true"},
-        {"type": query, "imageAvailable": "true"},
-        {"q": query, "imageAvailable": "true"},
+        {"query": query},
+        {"title": query},
+        {"creator": query},
+        {"description": query},
+        {"type": query},
+        {"q": query},
     ]
 
     for params in query_variants:
