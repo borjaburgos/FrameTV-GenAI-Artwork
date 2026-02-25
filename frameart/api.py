@@ -656,9 +656,13 @@ def list_jobs(limit: int = Query(20, ge=1, le=200, description="Max jobs to retu
     if not artifacts_dir.exists():
         return []
 
-    meta_files = sorted(artifacts_dir.rglob("meta.json"), reverse=True)[:limit]
+    meta_files = sorted(artifacts_dir.rglob("meta.json"), reverse=True)
     jobs: list[JobSummary] = []
     for meta_path in meta_files:
+        job_dir = meta_path.parent
+        # Only show jobs that have an image preview the UI can render.
+        if not (job_dir / "final.png").exists() and not (job_dir / "source.png").exists():
+            continue
         try:
             meta = _json.loads(meta_path.read_text())
             jobs.append(
@@ -671,6 +675,8 @@ def list_jobs(limit: int = Query(20, ge=1, le=200, description="Max jobs to retu
             )
         except Exception:
             jobs.append(JobSummary(job_id=meta_path.parent.name))
+        if len(jobs) >= limit:
+            break
     return jobs
 
 
@@ -710,11 +716,16 @@ def get_job_image(job_id: str):
     settings = _settings()
     artifacts_dir = settings.data_dir / "artifacts"
 
-    # Search date-structured dirs for the job
-    matches = list(artifacts_dir.rglob(f"{job_id}/final.png"))
-    if not matches:
-        raise HTTPException(status_code=404, detail=f"No image found for job {job_id}")
-    return FileResponse(matches[0], media_type="image/png")
+    # Search date-structured dirs for the job.
+    final_matches = list(artifacts_dir.rglob(f"{job_id}/final.png"))
+    if final_matches:
+        return FileResponse(final_matches[0], media_type="image/png")
+
+    source_matches = list(artifacts_dir.rglob(f"{job_id}/source.png"))
+    if source_matches:
+        return FileResponse(source_matches[0], media_type="image/png")
+
+    raise HTTPException(status_code=404, detail=f"No image found for job {job_id}")
 
 
 class JobApplyRequest(BaseModel):

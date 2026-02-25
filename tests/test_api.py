@@ -262,6 +262,33 @@ class TestListJobs:
         assert resp.status_code == 200
         assert resp.json() == []
 
+    @patch("frameart.api._settings")
+    def test_skips_jobs_without_preview_image(self, mock_settings):
+        import tempfile
+
+        settings = MagicMock()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifacts = Path(tmpdir) / "artifacts" / "2025" / "01" / "01"
+            with_preview = artifacts / "with-preview"
+            no_preview = artifacts / "no-preview"
+            with_preview.mkdir(parents=True)
+            no_preview.mkdir(parents=True)
+
+            (with_preview / "meta.json").write_text(
+                '{"job_id":"with-preview","provider":"openai"}'
+            )
+            (with_preview / "final.png").write_bytes(b"fakepng")
+            (no_preview / "meta.json").write_text('{"job_id":"no-preview"}')
+
+            settings.data_dir = Path(tmpdir)
+            mock_settings.return_value = settings
+
+            resp = client.get("/jobs")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert len(data) == 1
+            assert data[0]["job_id"] == "with-preview"
+
 
 # ---------------------------------------------------------------------------
 # GET /jobs/{job_id}/image
@@ -276,6 +303,22 @@ class TestGetJobImage:
 
         resp = client.get("/jobs/doesnotexist/image")
         assert resp.status_code == 404
+
+    @patch("frameart.api._settings")
+    def test_falls_back_to_source_image(self, mock_settings):
+        import tempfile
+
+        settings = MagicMock()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job_dir = Path(tmpdir) / "artifacts" / "2025" / "01" / "01" / "job-1"
+            job_dir.mkdir(parents=True)
+            (job_dir / "source.png").write_bytes(b"\x89PNG\r\n")
+            settings.data_dir = Path(tmpdir)
+            mock_settings.return_value = settings
+
+            resp = client.get("/jobs/job-1/image")
+            assert resp.status_code == 200
+            assert resp.headers["content-type"] == "image/png"
 
 
 # ---------------------------------------------------------------------------
