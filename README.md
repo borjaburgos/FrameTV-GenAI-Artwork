@@ -604,4 +604,18 @@ frameart/
 
 ## License
 
-GPL-3.0 — see [LICENSE](LICENSE).
+This project is licensed under **GNU GPL v3.0 or later**. See [LICENSE](LICENSE).
+
+## Acknowledgements
+
+FrameArt is built on top of excellent open-source projects, including:
+
+- [samsungtvws](https://github.com/xchwarze/samsung-tv-ws-api) (Samsung TV WebSocket API client)
+- [FastAPI](https://fastapi.tiangolo.com/)
+- [Uvicorn](https://www.uvicorn.org/)
+- [httpx](https://www.python-httpx.org/)
+- [Pillow](https://python-pillow.org/)
+- [Pydantic](https://docs.pydantic.dev/)
+- [Click](https://click.palletsprojects.com/)
+
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for additional dependency notes.
