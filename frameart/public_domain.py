@@ -42,9 +42,6 @@ def _first_str(value: Any) -> str | None:
 
 
 def _met_object_to_item(obj: dict[str, Any]) -> dict[str, Any] | None:
-    if not obj.get("isPublicDomain"):
-        return None
-
     image_url = obj.get("primaryImage") or obj.get("primaryImageSmall")
     thumb_url = obj.get("primaryImageSmall") or obj.get("primaryImage")
     if not image_url:
@@ -62,18 +59,15 @@ def _met_object_to_item(obj: dict[str, Any]) -> dict[str, Any] | None:
         "date": obj.get("objectDate") or None,
         "image_url": image_url,
         "thumbnail_url": thumb_url,
-        "license": "Public Domain (CC0)",
+        "license": "Public Domain (CC0)" if obj.get("isPublicDomain") else "See source",
         "attribution": "The Metropolitan Museum of Art",
         "source_url": obj.get("objectURL")
         or f"https://www.metmuseum.org/art/collection/search/{artwork_id}",
-        "is_public_domain": True,
+        "is_public_domain": bool(obj.get("isPublicDomain")),
     }
 
 
 def _aic_object_to_item(obj: dict[str, Any]) -> dict[str, Any] | None:
-    if not obj.get("is_public_domain"):
-        return None
-
     image_id = obj.get("image_id")
     if not image_id:
         return None
@@ -90,10 +84,10 @@ def _aic_object_to_item(obj: dict[str, Any]) -> dict[str, Any] | None:
         "date": obj.get("date_display") or None,
         "image_url": f"https://www.artic.edu/iiif/2/{image_id}/full/1686,/0/default.jpg",
         "thumbnail_url": f"https://www.artic.edu/iiif/2/{image_id}/full/843,/0/default.jpg",
-        "license": "Public Domain",
+        "license": "Public Domain" if obj.get("is_public_domain") else "See source",
         "attribution": "Art Institute of Chicago",
         "source_url": f"https://www.artic.edu/artworks/{artwork_id}",
-        "is_public_domain": True,
+        "is_public_domain": bool(obj.get("is_public_domain")),
     }
 
 
@@ -134,9 +128,6 @@ def _cma_is_public_domain(obj: dict[str, Any]) -> bool:
 
 
 def _cma_object_to_item(obj: dict[str, Any]) -> dict[str, Any] | None:
-    if not _cma_is_public_domain(obj):
-        return None
-
     image_url, thumb_url = _cma_image_urls(obj)
     if not image_url:
         return None
@@ -170,7 +161,7 @@ def _cma_object_to_item(obj: dict[str, Any]) -> dict[str, Any] | None:
         "license": obj.get("share_license_status") or "Open Access",
         "attribution": "Cleveland Museum of Art",
         "source_url": source_url,
-        "is_public_domain": True,
+        "is_public_domain": _cma_is_public_domain(obj),
     }
 
 
@@ -365,7 +356,7 @@ def get_artwork(source: str, artwork_id: str) -> dict[str, Any]:
             item = _europeana_object_to_item(obj)
 
     if not item:
-        raise ValueError("Artwork is unavailable or not public domain.")
+        raise ValueError("Artwork is unavailable.")
     return item
 
 
