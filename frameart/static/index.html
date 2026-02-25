@@ -112,6 +112,16 @@
   }
   .btn:active { transform: translateY(1px); }
   .btn:disabled { opacity: .4; cursor: not-allowed; }
+  .btn.busy { cursor: progress; }
+  .btn-spinner {
+    width: .82rem;
+    height: .82rem;
+    border-radius: 50%;
+    border: 2px solid rgba(8, 17, 14, .24);
+    border-top-color: currentColor;
+    animation: spin .72s linear infinite;
+    flex: 0 0 auto;
+  }
   .btn-secondary {
     background: linear-gradient(180deg, #323c4f 0%, #2c3445 100%);
     color: var(--text);
@@ -219,9 +229,35 @@
   .tv-art-item .art-actions { display: flex; gap: .4rem; flex-wrap: wrap; }
 
   /* --- Matte modal --- */
-  .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.85);
-                   z-index: 100; justify-content: center; align-items: center; }
-  .modal-overlay.visible { display: flex; }
+  .modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(3, 6, 10, .82);
+    z-index: 100;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transition: opacity .2s ease, visibility .2s ease;
+  }
+  .modal-overlay.visible {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+  }
+  .modal-overlay img,
+  .modal-overlay .modal-dialog {
+    transform: translateY(10px) scale(.98);
+    opacity: .96;
+    transition: transform .22s ease, opacity .22s ease;
+  }
+  .modal-overlay.visible img,
+  .modal-overlay.visible .modal-dialog {
+    transform: translateY(0) scale(1);
+    opacity: 1;
+  }
   .modal-overlay img { max-width: 95vw; max-height: 90vh; border-radius: 8px; }
   .modal-dialog { background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
                   padding: 1.5rem; min-width: 320px; max-width: 90vw; }
@@ -281,6 +317,10 @@
   @keyframes fadeUp {
     0% { opacity: 0; transform: translateY(8px); }
     100% { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes spin {
+    0% { transform: rotate(0); }
+    100% { transform: rotate(360deg); }
   }
 
   @media (max-width: 920px) {
@@ -514,15 +554,21 @@
 
   function setButtonBusy(btn, busyText) {
     if (!btn) return;
-    if (!btn.dataset.originalText) btn.dataset.originalText = btn.textContent;
+    btn.dataset.originalHtml = btn.innerHTML;
+    btn.dataset.originalText = btn.textContent;
     btn.disabled = true;
-    if (busyText) btn.textContent = busyText;
+    btn.classList.add('busy');
+    btn.setAttribute('aria-busy', 'true');
+    const label = busyText || btn.dataset.originalText || 'Working...';
+    btn.innerHTML = '<span class="btn-spinner" aria-hidden="true"></span><span>' + esc(label) + '</span>';
   }
 
   function clearButtonBusy(btn) {
     if (!btn) return;
     btn.disabled = false;
-    if (btn.dataset.originalText) btn.textContent = btn.dataset.originalText;
+    btn.classList.remove('busy');
+    btn.removeAttribute('aria-busy');
+    if (btn.dataset.originalHtml) btn.innerHTML = btn.dataset.originalHtml;
   }
 
   function addTVs(tvs, source) {
@@ -611,15 +657,23 @@
   // =========================================================================
   const tabs = document.querySelectorAll('.tabs button');
   const panels = document.querySelectorAll('.panel');
+
+  function setActiveTab(tabName) {
+    tabs.forEach(t => t.classList.toggle('active', t.dataset.tab === tabName));
+    panels.forEach(p => p.classList.toggle('active', p.id === ('panel-' + tabName)));
+    if (tabName === 'gallery') loadGallery();
+  }
+
   tabs.forEach(btn => {
     btn.addEventListener('click', () => {
-      tabs.forEach(t => t.classList.remove('active'));
-      panels.forEach(p => p.classList.remove('active'));
-      btn.classList.add('active');
-      document.getElementById('panel-' + btn.dataset.tab).classList.add('active');
-      if (btn.dataset.tab === 'gallery') loadGallery();
+      setActiveTab(btn.dataset.tab);
     });
   });
+
+  function getActiveTabName() {
+    const activeTab = document.querySelector('.tabs button.active');
+    return activeTab ? activeTab.dataset.tab : 'generate';
+  }
 
   // =========================================================================
   // Startup: load styles + configured TVs in parallel
@@ -879,13 +933,41 @@
   document.getElementById('btn-gallery-clear-selection').addEventListener('click', () => setAllGallerySelections(false));
   document.getElementById('btn-gallery-delete-selected').addEventListener('click', deleteSelectedGalleryJobs);
 
-  window.showPreview = function(jobId) {
-    const modal = document.getElementById('modal');
-    document.getElementById('modal-img').src = '/jobs/' + jobId + '/image';
+  const modalIds = ['modal', 'matte-modal', 'upload-modal'];
+  let lastFocusedBeforeModal = null;
+
+  function openModal(modalId, focusSelector) {
+    const modal = document.getElementById(modalId);
+    if (!modal) return;
+    lastFocusedBeforeModal = document.activeElement;
     modal.classList.add('visible');
+    if (!focusSelector) return;
+    const focusTarget = modal.querySelector(focusSelector);
+    if (focusTarget) setTimeout(() => focusTarget.focus(), 20);
+  }
+
+  function closeModal(modalId) {
+    const modal = document.getElementById(modalId);
+    if (!modal) return;
+    modal.classList.remove('visible');
+    if (lastFocusedBeforeModal && typeof lastFocusedBeforeModal.focus === 'function') {
+      setTimeout(() => lastFocusedBeforeModal.focus(), 20);
+    }
+  }
+
+  function closeAllModals() {
+    modalIds.forEach((id) => {
+      const modal = document.getElementById(id);
+      if (modal) modal.classList.remove('visible');
+    });
+  }
+
+  window.showPreview = function(jobId) {
+    document.getElementById('modal-img').src = '/jobs/' + jobId + '/image';
+    openModal('modal');
   };
   document.getElementById('modal').addEventListener('click', function() {
-    this.classList.remove('visible');
+    closeModal('modal');
   });
 
   // =========================================================================
@@ -1077,11 +1159,11 @@
     // Try to load mattes for selected TV, fallback to first known TV.
     loadMattesForSelect('upload-matte-select', uploadTvSel.value || knownTVs[0]?.ip);
 
-    document.getElementById('upload-modal').classList.add('visible');
+    openModal('upload-modal', '#upload-tv-select');
   };
 
   document.getElementById('btn-upload-cancel').addEventListener('click', () => {
-    document.getElementById('upload-modal').classList.remove('visible');
+    closeModal('upload-modal');
   });
 
   document.getElementById('upload-tv-select').addEventListener('change', (e) => {
@@ -1371,7 +1453,7 @@
     matteContentId = contentId;
     matteTvIp = tvIp;
     document.getElementById('matte-content-id').textContent = contentId;
-    document.getElementById('matte-modal').classList.add('visible');
+    openModal('matte-modal', '#matte-select');
 
     loadMattesForSelect('matte-select', tvIp);
   };
@@ -1414,7 +1496,7 @@
   }
 
   document.getElementById('btn-matte-cancel').addEventListener('click', () => {
-    document.getElementById('matte-modal').classList.remove('visible');
+    closeModal('matte-modal');
   });
 
   document.getElementById('btn-matte-apply').addEventListener('click', async () => {
@@ -1435,7 +1517,7 @@
         }),
       });
       if (!resp.ok) throw new Error('Server returned ' + resp.status);
-      document.getElementById('matte-modal').classList.remove('visible');
+      closeModal('matte-modal');
     } catch (e) {
       alert('Failed to change matte: ' + e.message);
     } finally {
@@ -1444,11 +1526,66 @@
   });
 
   // Close modals on overlay click (but not dialog click)
-  document.getElementById('matte-modal').addEventListener('click', function(e) {
-    if (e.target === this) this.classList.remove('visible');
+  modalIds.forEach((modalId) => {
+    const modal = document.getElementById(modalId);
+    if (!modal) return;
+    modal.addEventListener('click', function(e) {
+      if (e.target === this) closeModal(modalId);
+    });
   });
-  document.getElementById('upload-modal').addEventListener('click', function(e) {
-    if (e.target === this) this.classList.remove('visible');
+
+  function isTypingTarget(el) {
+    if (!el) return false;
+    const tag = (el.tagName || '').toLowerCase();
+    return tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable;
+  }
+
+  // =========================================================================
+  // Keyboard shortcuts (Phase 2B)
+  // =========================================================================
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      closeAllModals();
+      return;
+    }
+
+    // Cmd/Ctrl+Enter: generate from prompt
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+      const activeTab = getActiveTabName();
+      if (activeTab === 'generate') {
+        e.preventDefault();
+        document.getElementById('btn-generate').click();
+      }
+      return;
+    }
+
+    const typing = isTypingTarget(e.target);
+
+    // Alt+Shift+[G,Y,P,T]: tab jump
+    if (e.altKey && e.shiftKey) {
+      const key = e.key.toLowerCase();
+      if (key === 'g') setActiveTab('generate');
+      else if (key === 'y') setActiveTab('gallery');
+      else if (key === 'p') setActiveTab('public');
+      else if (key === 't') setActiveTab('tvs');
+      else return;
+      e.preventDefault();
+      return;
+    }
+
+    if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
+
+    // Slash focuses primary search by active tab.
+    if (e.key === '/') {
+      const activeTab = getActiveTabName();
+      if (activeTab === 'public') {
+        e.preventDefault();
+        document.getElementById('public-query').focus();
+      } else if (activeTab === 'gallery') {
+        e.preventDefault();
+        document.getElementById('btn-refresh-gallery').focus();
+      }
+    }
   });
 
   // =========================================================================
