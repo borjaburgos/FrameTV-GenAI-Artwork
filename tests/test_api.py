@@ -841,6 +841,44 @@ class TestJobApply:
             assert resp.json()["content_id"] == "MY_ART_001"
 
     @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_apply")
+    @patch("frameart.tv.controller.switch_art")
+    @patch("frameart.tv.controller.list_art_deduplicated")
+    def test_reuses_existing_tv_content_without_upload(
+        self,
+        mock_list_art,
+        mock_switch_art,
+        mock_run_apply,
+        mock_settings,
+    ):
+        import tempfile
+
+        settings = MagicMock()
+        settings.tvs = {}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job_dir = Path(tmpdir) / "artifacts" / "2025" / "01" / "01" / "test-job"
+            job_dir.mkdir(parents=True)
+            (job_dir / "final.png").write_bytes(b"fakepng")
+            (job_dir / "meta.json").write_text('{"job_id":"test-job","content_id":"MY_F1234"}')
+            settings.data_dir = Path(tmpdir)
+            mock_settings.return_value = settings
+
+            mock_list_art.return_value = [{"content_id": "MY_F1234", "is_favourite": False}]
+            mock_switch_art.return_value = True
+
+            resp = client.post(
+                "/jobs/test-job/apply",
+                json={"tv_ip": "192.168.1.100", "matte": "none"},
+            )
+
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["content_id"] == "MY_F1234"
+            assert data["tv_switched"] is True
+            assert data["metadata"]["reused_existing_content"] is True
+            mock_run_apply.assert_not_called()
+
+    @patch("frameart.api._settings")
     def test_not_found(self, mock_settings):
         settings = MagicMock()
         settings.data_dir = Path("/tmp/nonexistent_frameart_test")

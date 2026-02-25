@@ -731,17 +731,69 @@ class JobApplyRequest(BaseModel):
 @app.post("/jobs/{job_id}/apply", response_model=JobResponse)
 def apply_job_to_tv(job_id: str, req: JobApplyRequest):
     """Upload a previously generated job's image to a TV."""
+    import json as _json
+
     from frameart.pipeline import run_apply
+    from frameart.tv.controller import list_art_deduplicated, switch_art
 
     settings = _settings()
     artifacts_dir = settings.data_dir / "artifacts"
-    matches = list(artifacts_dir.rglob(f"{job_id}/final.png"))
-    if not matches:
+    final_matches = list(artifacts_dir.rglob(f"{job_id}/final.png"))
+    source_matches = list(artifacts_dir.rglob(f"{job_id}/source.png"))
+
+    selected_image: Path | None = None
+    if final_matches:
+        selected_image = final_matches[0]
+    elif source_matches:
+        selected_image = source_matches[0]
+    if selected_image is None:
         raise HTTPException(status_code=404, detail=f"No image found for job {job_id}")
+
+    # Reuse existing TV content when possible to avoid duplicate uploads.
+    job_dir = selected_image.parent
+    meta_path = job_dir / "meta.json"
+    existing_content_id: str | None = None
+    try:
+        if meta_path.exists():
+            meta = _json.loads(meta_path.read_text())
+            content_id = meta.get("content_id")
+            if isinstance(content_id, str) and content_id:
+                existing_content_id = content_id
+    except Exception:
+        existing_content_id = None
+
+    if existing_content_id:
+        profile = _resolve_tv_profile(req.tv, req.tv_ip)
+        try:
+            tv_art = list_art_deduplicated(profile)
+            tv_ids = {str(a.get("content_id", "")) for a in tv_art}
+        except Exception:
+            tv_ids = set()
+
+        if existing_content_id in tv_ids and switch_art(profile, existing_content_id):
+            source_preview = job_dir / "source.png"
+            final_preview = job_dir / "final.png"
+            return JobResponse(
+                job_id=job_id,
+                job_dir=str(job_dir),
+                source_path=str(source_preview) if source_preview.exists() else None,
+                final_path=str(final_preview) if final_preview.exists() else None,
+                content_id=existing_content_id,
+                tv_switched=True,
+                metadata={
+                    "job_id": job_id,
+                    "content_id": existing_content_id,
+                    "tv_ip": profile.ip,
+                    "tv_switched": True,
+                    "reused_existing_content": True,
+                },
+                timings={},
+                error=None,
+            )
 
     result = run_apply(
         settings,
-        str(matches[0]),
+        str(selected_image),
         tv_name=req.tv,
         tv_ip=req.tv_ip,
         matte=req.matte,
