@@ -982,6 +982,31 @@ def get_job_status(job_id: str):
     )
 
 
+@app.get("/async/jobs", response_model=list[AsyncJobDetail])
+def list_async_jobs(
+    limit: int = Query(50, ge=1, le=200, description="Maximum number of async jobs to return."),
+):
+    """List recent async jobs (newest first)."""
+    from frameart.jobs import job_store
+
+    jobs = job_store.list_jobs(limit=limit)
+    out: list[AsyncJobDetail] = []
+    for job in jobs:
+        result_response = None
+        if job.result is not None:
+            result_response = _pipeline_result_to_response(job.result)
+        out.append(
+            AsyncJobDetail(
+                job_id=job.id,
+                status=job.status.value,
+                request=job.request,
+                result=result_response,
+                error=job.error,
+            )
+        )
+    return out
+
+
 @app.post("/async/generate", response_model=AsyncJobResponse)
 def async_generate(req: GenerateRequest):
     """Submit an image generation job to the background queue."""
@@ -1006,7 +1031,13 @@ def async_generate(req: GenerateRequest):
             "steps": req.steps,
             "guidance": req.guidance,
         },
-        request_summary={"type": "generate", "prompt": req.prompt, "style": req.style},
+        request_summary={
+            "type": "generate",
+            "prompt": req.prompt,
+            "style": req.style,
+            "provider": req.provider,
+            "model": req.model,
+        },
     )
 
     return AsyncJobResponse(job_id=job_id, status="pending")
@@ -1044,6 +1075,10 @@ def async_generate_and_apply(req: GenerateAndApplyRequest):
             "type": "generate-and-apply",
             "prompt": req.prompt,
             "style": req.style,
+            "provider": req.provider,
+            "model": req.model,
+            "tv": req.tv,
+            "tv_ip": req.tv_ip,
         },
     )
 
