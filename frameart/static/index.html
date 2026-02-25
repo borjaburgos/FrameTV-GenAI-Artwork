@@ -182,6 +182,52 @@
   .gallery-item .actions { padding: 0 .8rem .6rem; display: flex; gap: .5rem; flex-wrap: wrap; }
   .gallery-item .select-row { display: flex; align-items: center; gap: .5rem; margin-bottom: .4rem; }
   .gallery-item .select-row input[type="checkbox"] { width: auto; margin: 0; }
+  .gen-jobs { margin-top: 1.2rem; }
+  .gen-jobs h3 { font-size: 1rem; margin-bottom: .55rem; }
+  .gen-jobs-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: .8rem;
+  }
+  .gen-job-card {
+    background: linear-gradient(180deg, rgba(28, 36, 52, .92), rgba(21, 28, 40, .95));
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: .75rem .8rem;
+    display: flex;
+    flex-direction: column;
+    gap: .4rem;
+  }
+  .gen-job-card.done { border-color: rgba(95, 218, 150, .45); }
+  .gen-job-card.error { border-color: rgba(240, 97, 110, .55); }
+  .gen-job-row { display: flex; justify-content: space-between; gap: .8rem; align-items: center; }
+  .gen-job-id { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: .78rem; color: var(--muted); }
+  .gen-job-status { font-size: .76rem; padding: .1rem .45rem; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+  .gen-job-status.pending, .gen-job-status.running { color: var(--accent2); border-color: rgba(87, 166, 255, .45); }
+  .gen-job-status.completed { color: var(--accent); border-color: rgba(95, 218, 150, .45); }
+  .gen-job-status.failed { color: var(--err); border-color: rgba(240, 97, 110, .5); }
+  .gen-job-prompt { font-size: .88rem; line-height: 1.35; max-height: 3.8em; overflow: hidden; }
+  .gen-job-meta { font-size: .76rem; color: var(--muted); }
+  .gen-job-actions { display: flex; gap: .45rem; margin-top: .2rem; flex-wrap: wrap; }
+  .gen-job-thumb-wrap {
+    width: 100%;
+    aspect-ratio: 16/9;
+    border-radius: 8px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    background: #101722;
+    position: relative;
+  }
+  .gen-job-thumb-wrap img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .gen-job-thumb-fallback {
+    position: absolute;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted);
+    font-size: .8rem;
+  }
 
   /* --- TV cards --- */
   .tv-card {
@@ -396,11 +442,11 @@
   <div class="row">
     <div>
       <label for="provider">Provider</label>
-      <input id="provider" placeholder="e.g. openai (leave blank for default)">
+      <select id="provider"></select>
     </div>
     <div>
       <label for="model">Model</label>
-      <input id="model" placeholder="e.g. dall-e-3 (leave blank for default)">
+      <select id="model"></select>
     </div>
   </div>
 
@@ -413,6 +459,17 @@
 
   <div id="gen-preview" style="margin-top:1rem; display:none;">
     <img id="gen-preview-img" style="width:100%; border-radius:8px; aspect-ratio:16/9; object-fit:cover;">
+  </div>
+
+  <div class="gen-jobs">
+    <div class="section-heading" style="margin-bottom:.5rem;">
+      <h3>In Progress Jobs</h3>
+      <div class="btn-group">
+        <button class="btn btn-secondary btn-small" id="btn-gen-jobs-clear">Clear Finished</button>
+      </div>
+    </div>
+    <div class="gen-jobs-grid" id="gen-jobs-grid"></div>
+    <div class="empty" id="gen-jobs-empty">No active generation jobs.</div>
   </div>
 </div>
 
@@ -584,11 +641,16 @@
   let selectedTVArtIds = new Set();
   let loadedTVArtById = {};
   let selectedGalleryJobIds = new Set();
+  let configuredProviders = [];
+  const generationJobs = new Map();
+  let generationPollTimer = null;
   const storageKeys = {
     tvGenerate: 'frameart.tv.generate',
     tvPublic: 'frameart.tv.public',
     tvUpload: 'frameart.tv.upload',
     tvArt: 'frameart.tv.art',
+    providerGenerate: 'frameart.provider.generate',
+    modelGenerate: 'frameart.model.generate',
     mattePublic: 'frameart.matte.public',
     matteUpload: 'frameart.matte.upload',
   };
@@ -610,6 +672,63 @@
       node.classList.add('reveal-stagger');
       node.style.animationDelay = (index * 22) + 'ms';
     });
+  }
+
+  function findProviderOption(name) {
+    return configuredProviders.find((p) => p.name === name) || null;
+  }
+
+  function refreshModelSelect(providerName, preferredModel) {
+    const modelSel = document.getElementById('model');
+    const provider = findProviderOption(providerName);
+    const models = provider?.models || [];
+    const defaultLabel = provider?.default_model
+      ? ('Provider default (' + provider.default_model + ')')
+      : 'Provider default';
+
+    modelSel.innerHTML = '';
+    const defaultOpt = document.createElement('option');
+    defaultOpt.value = '';
+    defaultOpt.textContent = defaultLabel;
+    modelSel.appendChild(defaultOpt);
+
+    for (const model of models) {
+      const opt = document.createElement('option');
+      opt.value = model;
+      opt.textContent = model;
+      modelSel.appendChild(opt);
+    }
+
+    if (preferredModel && [...modelSel.options].some((o) => o.value === preferredModel)) {
+      modelSel.value = preferredModel;
+    } else {
+      modelSel.value = '';
+    }
+  }
+
+  function refreshProviderSelects(payload) {
+    configuredProviders = payload?.providers || [];
+    const providerSel = document.getElementById('provider');
+    const rememberedProvider = localStorage.getItem(storageKeys.providerGenerate);
+    const rememberedModel = localStorage.getItem(storageKeys.modelGenerate);
+    const fallback = payload?.default_provider || configuredProviders[0]?.name || '';
+    const preferredProvider = rememberedProvider || fallback;
+
+    providerSel.innerHTML = '';
+    for (const provider of configuredProviders) {
+      const opt = document.createElement('option');
+      opt.value = provider.name;
+      opt.textContent = provider.is_default ? (provider.name + ' (default)') : provider.name;
+      providerSel.appendChild(opt);
+    }
+
+    if ([...providerSel.options].some((o) => o.value === preferredProvider)) {
+      providerSel.value = preferredProvider;
+    } else if (providerSel.options.length) {
+      providerSel.selectedIndex = 0;
+    }
+
+    refreshModelSelect(providerSel.value, rememberedModel || '');
   }
 
   function setButtonBusy(btn, busyText) {
@@ -722,6 +841,7 @@
     tabs.forEach(t => t.classList.toggle('active', t.dataset.tab === tabName));
     panels.forEach(p => p.classList.toggle('active', p.id === ('panel-' + tabName)));
     if (tabName === 'gallery') loadGallery();
+    if (tabName === 'generate') loadGenerationJobsFromAPI();
   }
 
   tabs.forEach(btn => {
@@ -735,6 +855,9 @@
     return activeTab ? activeTab.dataset.tab : 'generate';
   }
 
+  // Hydrate generate jobs from API on initial load.
+  loadGenerationJobsFromAPI();
+
   // =========================================================================
   // Startup: load styles + configured TVs in parallel
   // =========================================================================
@@ -746,6 +869,17 @@
       sel.appendChild(opt);
     }
   }).catch(() => {});
+
+  fetch('/providers').then(r => r.json()).then((payload) => {
+    refreshProviderSelects(payload);
+  }).catch(() => {
+    const providerSel = document.getElementById('provider');
+    const modelSel = document.getElementById('model');
+    providerSel.innerHTML = '<option value="openai">openai</option>';
+    providerSel.value = 'openai';
+    modelSel.innerHTML = '<option value="">Provider default</option>';
+    showToast('Failed to load configured providers; using fallback defaults.', 'warn');
+  });
 
   // Load pre-configured TVs on startup
   fetch('/tv/configured').then(r => r.json()).then(configured => {
@@ -759,6 +893,15 @@
 
   document.getElementById('tv-select').addEventListener('change', (e) => {
     localStorage.setItem(storageKeys.tvGenerate, e.target.value || '');
+  });
+  document.getElementById('provider').addEventListener('change', (e) => {
+    const provider = e.target.value || '';
+    localStorage.setItem(storageKeys.providerGenerate, provider);
+    refreshModelSelect(provider, '');
+    localStorage.setItem(storageKeys.modelGenerate, '');
+  });
+  document.getElementById('model').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.modelGenerate, e.target.value || '');
   });
   document.getElementById('tv-art-select').addEventListener('change', (e) => {
     localStorage.setItem(storageKeys.tvArt, e.target.value || '');
@@ -809,14 +952,164 @@
   // =========================================================================
   // Generate
   // =========================================================================
+  function renderGenerationJobs() {
+    const grid = document.getElementById('gen-jobs-grid');
+    const empty = document.getElementById('gen-jobs-empty');
+    const jobs = Array.from(generationJobs.values())
+      .sort((a, b) => b.createdAt - a.createdAt);
+
+    if (!jobs.length) {
+      grid.innerHTML = '';
+      empty.style.display = 'block';
+      return;
+    }
+    empty.style.display = 'none';
+    grid.innerHTML = jobs.map((job) => {
+      const providerLabel = job.provider || 'default';
+      const modelLabel = job.model || 'default';
+      const styleLabel = job.style || 'none';
+      const tvLabel = job.tvIp || 'no TV';
+      const cardClass = job.status === 'completed' ? ' done' : (job.status === 'failed' ? ' error' : '');
+      const prompt = esc(job.prompt || '');
+      const errorBlock = job.error ? `<div class="gen-job-meta" style="color:var(--err)">Error: ${esc(job.error)}</div>` : '';
+      const previewToken = job.previewNonce || '';
+      const imageJobId = job.resultJobId || job.jobId;
+      const previewBlock = (job.status === 'completed' && job.imageAvailable)
+        ? `<div class="gen-job-thumb-wrap">
+             <img src="/jobs/${esc(imageJobId)}/image?${previewToken}" alt="${prompt}" loading="lazy"
+               onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
+             <div class="gen-job-thumb-fallback">No image available</div>
+           </div>`
+        : '';
+      const actionsBlock = job.status === 'completed' && job.imageAvailable
+        ? `<div class="gen-job-actions">
+             <button class="btn btn-secondary btn-small btn-gen-open" data-job-id="${esc(imageJobId)}">Open Image</button>
+           </div>`
+        : '';
+      return `
+        <div class="gen-job-card${cardClass}">
+          <div class="gen-job-row">
+            <span class="gen-job-id">${esc(job.jobId)}</span>
+            <span class="gen-job-status ${esc(job.status)}">${esc(job.status)}</span>
+          </div>
+          <div class="gen-job-prompt">${prompt}</div>
+          <div class="gen-job-meta">Provider: ${esc(providerLabel)} · Model: ${esc(modelLabel)}</div>
+          <div class="gen-job-meta">Style: ${esc(styleLabel)} · TV: ${esc(tvLabel)}</div>
+          ${errorBlock}
+          ${previewBlock}
+          ${actionsBlock}
+        </div>
+      `;
+    }).join('');
+
+    grid.querySelectorAll('.btn-gen-open').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        const jobId = e.currentTarget.dataset.jobId;
+        if (!jobId) return;
+        window.showPreview(jobId);
+      });
+    });
+  }
+
+  function clearFinishedGenerationJobs() {
+    for (const [jobId, job] of generationJobs.entries()) {
+      if (job.status === 'completed' || job.status === 'failed') {
+        generationJobs.delete(jobId);
+      }
+    }
+    renderGenerationJobs();
+  }
+
+  function ensureGenerationPolling() {
+    if (generationPollTimer) return;
+    generationPollTimer = setInterval(pollGenerationJobs, 1800);
+  }
+
+  function stopGenerationPollingIfIdle() {
+    const hasActive = Array.from(generationJobs.values())
+      .some((j) => j.status === 'pending' || j.status === 'running');
+    if (!hasActive && generationPollTimer) {
+      clearInterval(generationPollTimer);
+      generationPollTimer = null;
+    }
+  }
+
+  async function pollGenerationJobs() {
+    const activeJobs = Array.from(generationJobs.values())
+      .filter((j) => j.status === 'pending' || j.status === 'running');
+    if (!activeJobs.length) {
+      stopGenerationPollingIfIdle();
+      return;
+    }
+
+    let changed = false;
+    await Promise.all(activeJobs.map(async (job) => {
+      try {
+        const resp = await fetch('/jobs/' + job.jobId + '/status');
+        if (!resp.ok) {
+          const nextError = 'Status check failed (' + resp.status + ')';
+          if (job.status !== 'failed' || job.error !== nextError) {
+            job.status = 'failed';
+            job.error = nextError;
+            changed = true;
+          }
+          return;
+        }
+        const data = await resp.json();
+        const nextStatus = data.status || job.status;
+        const nextError = data.error || null;
+        if (nextStatus !== job.status || nextError !== job.error) {
+          changed = true;
+          job.status = nextStatus;
+          job.error = nextError;
+        }
+        if (data.status === 'completed' && data.result) {
+          const nextResultJobId = data.result.job_id || job.jobId;
+          const nextImageAvailable = Boolean(data.result.final_path);
+          if (job.resultJobId !== nextResultJobId || job.imageAvailable !== nextImageAvailable) {
+            changed = true;
+            job.resultJobId = nextResultJobId;
+            job.imageAvailable = nextImageAvailable;
+          }
+          if (!job.previewNonce) {
+            changed = true;
+            job.previewNonce = Date.now();
+          }
+          showStatus('Done: ' + job.jobId, 'done');
+          if (job.imageAvailable) {
+            const img = document.getElementById('gen-preview-img');
+            img.src = '/jobs/' + job.resultJobId + '/image?' + Date.now();
+            document.getElementById('gen-preview').style.display = 'block';
+          }
+        } else if (data.status === 'failed') {
+          if (job.imageAvailable) {
+            job.imageAvailable = false;
+            changed = true;
+          }
+          showStatus('Failed: ' + (data.error || job.jobId), 'error');
+        }
+      } catch (e) {
+        if (job.status !== 'failed' || job.error !== e.message) {
+          job.status = 'failed';
+          job.error = e.message;
+          changed = true;
+        }
+      }
+    }));
+
+    if (changed) renderGenerationJobs();
+    stopGenerationPollingIfIdle();
+  }
+
   const btnGen = document.getElementById('btn-generate');
+  document.getElementById('btn-gen-jobs-clear').addEventListener('click', clearFinishedGenerationJobs);
   btnGen.addEventListener('click', async () => {
     const prompt = document.getElementById('prompt').value.trim();
     if (!prompt) { showStatus('Please enter a prompt.', 'error'); return; }
 
     const style = document.getElementById('style').value || undefined;
-    const provider = document.getElementById('provider').value.trim() || undefined;
-    const model = document.getElementById('model').value.trim() || undefined;
+    const provider = document.getElementById('provider').value || undefined;
+    const model = document.getElementById('model').value || undefined;
     const tvIp = document.getElementById('tv-select').value || undefined;
 
     const useTV = !!tvIp;
@@ -824,9 +1117,8 @@
     const body = { prompt, style, provider, model };
     if (useTV) { body.tv_ip = tvIp; }
 
-    setButtonBusy(btnGen, 'Generating...');
+    setButtonBusy(btnGen, 'Queueing...');
     showStatus('Submitting job...');
-    document.getElementById('gen-preview').style.display = 'none';
 
     try {
       const resp = await fetch(endpoint, {
@@ -835,40 +1127,62 @@
       });
       if (!resp.ok) { throw new Error('Server returned ' + resp.status); }
       const data = await resp.json();
-      pollJob(data.job_id);
+      generationJobs.set(data.job_id, {
+        jobId: data.job_id,
+        prompt,
+        provider,
+        model,
+        style,
+        tvIp,
+        status: data.status || 'pending',
+        error: null,
+        imageAvailable: false,
+        createdAt: Date.now(),
+      });
+      renderGenerationJobs();
+      ensureGenerationPolling();
+      showStatus('Queued job ' + data.job_id + '.', '');
     } catch (e) {
       showStatus('Failed: ' + e.message, 'error');
+    } finally {
       clearButtonBusy(btnGen);
     }
   });
 
-  function pollJob(jobId) {
-    showStatus('Job ' + jobId + ' \u2014 running...');
-    const interval = setInterval(async () => {
-      try {
-        const resp = await fetch('/jobs/' + jobId + '/status');
-        if (!resp.ok) { clearInterval(interval); showStatus('Lost track of job.', 'error'); btnGen.disabled = false; return; }
-        const data = await resp.json();
-        if (data.status === 'pending' || data.status === 'running') {
-          showStatus('Job ' + jobId + ' \u2014 ' + data.status + '...');
-          return;
-        }
-        clearInterval(interval);
-        clearButtonBusy(btnGen);
-        if (data.status === 'completed' && data.result) {
-          showStatus('Done! Job ' + data.result.job_id, 'done');
-          const img = document.getElementById('gen-preview-img');
-          img.src = '/jobs/' + data.result.job_id + '/image?' + Date.now();
-          document.getElementById('gen-preview').style.display = 'block';
-        } else {
-          showStatus('Failed: ' + (data.error || 'unknown error'), 'error');
-        }
-      } catch (e) {
-        clearInterval(interval);
-        showStatus('Polling error: ' + e.message, 'error');
-        clearButtonBusy(btnGen);
+  async function loadGenerationJobsFromAPI() {
+    try {
+      const resp = await fetch('/async/jobs?limit=60');
+      if (!resp.ok) throw new Error('Server returned ' + resp.status);
+      const items = await resp.json();
+      for (const item of items) {
+        const req = item.request || {};
+        const kind = req.type || '';
+        if (kind !== 'generate' && kind !== 'generate-and-apply') continue;
+        const existing = generationJobs.get(item.job_id);
+        const current = existing || {
+          jobId: item.job_id,
+          createdAt: Date.now(),
+        };
+        const resultJobId = item.result && item.result.job_id ? item.result.job_id : item.job_id;
+        current.prompt = req.prompt || current.prompt || '';
+        current.provider = req.provider || current.provider || '';
+        current.model = req.model || current.model || '';
+        current.style = req.style || current.style || '';
+        current.tvIp = req.tv_ip || current.tvIp || '';
+        current.status = item.status || current.status || 'pending';
+        current.error = item.error || null;
+        current.resultJobId = resultJobId;
+        current.imageAvailable = Boolean(item.result && item.result.final_path);
+        if (current.imageAvailable && !current.previewNonce) current.previewNonce = Date.now();
+        generationJobs.set(item.job_id, current);
       }
-    }, 2000);
+      renderGenerationJobs();
+      const hasActive = Array.from(generationJobs.values())
+        .some((j) => j.status === 'pending' || j.status === 'running');
+      if (hasActive) ensureGenerationPolling();
+    } catch (e) {
+      showToast('Failed to load async jobs: ' + e.message, 'warn');
+    }
   }
 
   // =========================================================================

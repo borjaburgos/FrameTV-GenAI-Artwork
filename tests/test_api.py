@@ -63,6 +63,83 @@ class TestStyles:
 
 
 # ---------------------------------------------------------------------------
+# /providers
+# ---------------------------------------------------------------------------
+
+class TestProviders:
+    @patch("frameart.api._settings")
+    def test_list_configured_providers_and_models(self, mock_settings):
+        settings = MagicMock()
+        settings.default_provider = "openai"
+        settings.default_model = "gpt-image-1"
+        settings.providers = {
+            "openai": MagicMock(model="dall-e-3"),
+            "ollama": MagicMock(model="sdxl"),
+        }
+        mock_settings.return_value = settings
+
+        resp = client.get("/providers")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        assert data["default_provider"] == "openai"
+        names = [p["name"] for p in data["providers"]]
+        assert names == ["ollama", "openai"]
+
+        openai = next(p for p in data["providers"] if p["name"] == "openai")
+        assert openai["is_default"] is True
+        assert openai["default_model"] == "gpt-image-1"
+        assert openai["models"] == ["dall-e-3", "gpt-image-1"]
+
+        ollama = next(p for p in data["providers"] if p["name"] == "ollama")
+        assert ollama["is_default"] is False
+        assert ollama["default_model"] == "sdxl"
+        assert ollama["models"] == ["sdxl"]
+
+    @patch("frameart.api._settings")
+    def test_default_provider_included_even_without_provider_block(self, mock_settings):
+        settings = MagicMock()
+        settings.default_provider = "openai"
+        settings.default_model = None
+        settings.providers = {}
+        mock_settings.return_value = settings
+
+        resp = client.get("/providers")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["default_provider"] == "openai"
+        assert data["providers"] == [
+            {
+                "name": "openai",
+                "is_default": True,
+                "models": [],
+                "default_model": None,
+            }
+        ]
+
+    @patch("frameart.api._settings")
+    @patch("frameart.api._fetch_openai_image_models")
+    def test_openai_live_models_are_merged(self, mock_live_models, mock_settings):
+        settings = MagicMock()
+        settings.default_provider = "openai"
+        settings.default_model = "gpt-image-1"
+        settings.providers = {
+            "openai": MagicMock(model="dall-e-3"),
+            "ollama": MagicMock(model="sdxl"),
+        }
+        mock_settings.return_value = settings
+        mock_live_models.return_value = ["gpt-image-1", "gpt-image-2"]
+
+        resp = client.get("/providers")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        openai = next(p for p in data["providers"] if p["name"] == "openai")
+        assert openai["models"] == ["dall-e-3", "gpt-image-1", "gpt-image-2"]
+        mock_live_models.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # POST /generate
 # ---------------------------------------------------------------------------
 
@@ -1021,6 +1098,29 @@ class TestAsyncGenerate:
 
     @patch("frameart.api._settings")
     @patch("frameart.pipeline.run_generate")
+    def test_request_metadata_contains_provider_and_model(self, mock_run, mock_settings):
+        mock_settings.return_value = MagicMock()
+        mock_run.return_value = _fake_result()
+
+        resp = client.post(
+            "/async/generate",
+            json={"prompt": "a sunset", "provider": "openai", "model": "gpt-image-1"},
+        )
+        assert resp.status_code == 200
+        job_id = resp.json()["job_id"]
+
+        for _ in range(50):
+            status_resp = client.get(f"/jobs/{job_id}/status")
+            if status_resp.json()["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.05)
+
+        request_summary = status_resp.json()["request"]
+        assert request_summary["provider"] == "openai"
+        assert request_summary["model"] == "gpt-image-1"
+
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_generate")
     def test_failed_job(self, mock_run, mock_settings):
         mock_settings.return_value = MagicMock()
         mock_run.return_value = _fake_result(error="provider exploded")
@@ -1053,6 +1153,35 @@ class TestAsyncGenerateAndApply:
         assert resp.status_code == 200
         assert resp.json()["status"] == "pending"
 
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_generate_and_apply")
+    def test_request_metadata_contains_provider_model_and_tv(self, mock_run, mock_settings):
+        mock_settings.return_value = MagicMock()
+        mock_run.return_value = _fake_result()
+
+        resp = client.post(
+            "/async/generate-and-apply",
+            json={
+                "prompt": "mountains",
+                "provider": "openai",
+                "model": "gpt-image-1",
+                "tv_ip": "10.0.0.1",
+            },
+        )
+        assert resp.status_code == 200
+        job_id = resp.json()["job_id"]
+
+        for _ in range(50):
+            status_resp = client.get(f"/jobs/{job_id}/status")
+            if status_resp.json()["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.05)
+
+        request_summary = status_resp.json()["request"]
+        assert request_summary["provider"] == "openai"
+        assert request_summary["model"] == "gpt-image-1"
+        assert request_summary["tv_ip"] == "10.0.0.1"
+
 
 class TestAsyncApply:
     @patch("frameart.api._settings")
@@ -1077,6 +1206,36 @@ class TestJobStatusNotFound:
     def test_missing_job(self):
         resp = client.get("/jobs/nonexistent/status")
         assert resp.status_code == 404
+
+
+class TestAsyncJobsList:
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_generate")
+    def test_lists_recent_async_jobs(self, mock_run, mock_settings):
+        mock_settings.return_value = MagicMock()
+        mock_run.return_value = _fake_result()
+
+        submit = client.post(
+            "/async/generate",
+            json={"prompt": "list me", "provider": "openai", "model": "gpt-image-1"},
+        )
+        assert submit.status_code == 200
+        job_id = submit.json()["job_id"]
+
+        for _ in range(50):
+            status_resp = client.get(f"/jobs/{job_id}/status")
+            if status_resp.json()["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.05)
+
+        resp = client.get("/async/jobs?limit=20")
+        assert resp.status_code == 200
+        jobs = resp.json()
+        found = next((j for j in jobs if j["job_id"] == job_id), None)
+        assert found is not None
+        assert found["request"]["type"] == "generate"
+        assert found["request"]["provider"] == "openai"
+        assert found["request"]["model"] == "gpt-image-1"
 
 
 # ---------------------------------------------------------------------------

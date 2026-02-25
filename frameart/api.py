@@ -38,10 +38,12 @@ Misc:
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
@@ -210,6 +212,22 @@ class HealthResponse(BaseModel):
     version: str = __version__
 
 
+class ProviderOption(BaseModel):
+    """Configured provider metadata for the web UI."""
+
+    name: str
+    is_default: bool = False
+    models: list[str] = Field(default_factory=list)
+    default_model: str | None = None
+
+
+class ProvidersResponse(BaseModel):
+    """Configured providers and model options."""
+
+    default_provider: str
+    providers: list[ProviderOption] = Field(default_factory=list)
+
+
 class JobSummary(BaseModel):
     """Summary of a single job for listing."""
 
@@ -283,6 +301,44 @@ def _pipeline_result_to_response(result) -> JobResponse:
     )
 
 
+def _is_openai_image_model(model_id: str) -> bool:
+    if not model_id:
+        return False
+    if model_id in {"dall-e-2", "dall-e-3", "gpt-image-1"}:
+        return True
+    return model_id.startswith("gpt-image-")
+
+
+def _fetch_openai_image_models(openai_cfg) -> list[str]:
+    """Fetch available image-capable OpenAI models for configured credentials."""
+    api_key = (openai_cfg.api_key if openai_cfg else None) or os.environ.get("OPENAI_API_KEY") or ""
+    if not api_key:
+        return []
+
+    base_url = (openai_cfg.base_url if openai_cfg else None) or "https://api.openai.com/v1"
+    url = base_url.rstrip("/") + "/models"
+
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            resp = client.get(
+                url,
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+        resp.raise_for_status()
+        payload = resp.json()
+        items = payload.get("data") if isinstance(payload, dict) else []
+        models: list[str] = []
+        if isinstance(items, list):
+            for item in items:
+                model_id = item.get("id") if isinstance(item, dict) else None
+                if isinstance(model_id, str) and _is_openai_image_model(model_id):
+                    models.append(model_id)
+        return list(dict.fromkeys(models))
+    except Exception as e:
+        logger.warning("OpenAI model discovery failed: %s", e)
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Routes — synchronous
 # ---------------------------------------------------------------------------
@@ -298,6 +354,43 @@ def health():
 def list_styles():
     """List available style presets."""
     return STYLE_PRESETS
+
+
+@app.get("/providers", response_model=ProvidersResponse)
+def list_providers():
+    """List configured providers and models for the web UI."""
+    settings = _settings()
+
+    configured_names: set[str] = set(settings.providers.keys())
+    if settings.default_provider:
+        configured_names.add(settings.default_provider)
+
+    options: list[ProviderOption] = []
+    for name in sorted(configured_names):
+        cfg = settings.providers.get(name)
+        models: list[str] = []
+        if cfg and cfg.model:
+            models.append(cfg.model)
+        if name == settings.default_provider and settings.default_model:
+            models.append(settings.default_model)
+        if name == "openai":
+            models.extend(_fetch_openai_image_models(cfg))
+
+        unique_models = list(dict.fromkeys(models))
+        default_model = settings.default_model if name == settings.default_provider else None
+        if not default_model and cfg and cfg.model:
+            default_model = cfg.model
+
+        options.append(
+            ProviderOption(
+                name=name,
+                is_default=(name == settings.default_provider),
+                models=unique_models,
+                default_model=default_model,
+            )
+        )
+
+    return ProvidersResponse(default_provider=settings.default_provider, providers=options)
 
 
 @app.post("/generate", response_model=JobResponse)
@@ -889,6 +982,31 @@ def get_job_status(job_id: str):
     )
 
 
+@app.get("/async/jobs", response_model=list[AsyncJobDetail])
+def list_async_jobs(
+    limit: int = Query(50, ge=1, le=200, description="Maximum number of async jobs to return."),
+):
+    """List recent async jobs (newest first)."""
+    from frameart.jobs import job_store
+
+    jobs = job_store.list_jobs(limit=limit)
+    out: list[AsyncJobDetail] = []
+    for job in jobs:
+        result_response = None
+        if job.result is not None:
+            result_response = _pipeline_result_to_response(job.result)
+        out.append(
+            AsyncJobDetail(
+                job_id=job.id,
+                status=job.status.value,
+                request=job.request,
+                result=result_response,
+                error=job.error,
+            )
+        )
+    return out
+
+
 @app.post("/async/generate", response_model=AsyncJobResponse)
 def async_generate(req: GenerateRequest):
     """Submit an image generation job to the background queue."""
@@ -913,7 +1031,13 @@ def async_generate(req: GenerateRequest):
             "steps": req.steps,
             "guidance": req.guidance,
         },
-        request_summary={"type": "generate", "prompt": req.prompt, "style": req.style},
+        request_summary={
+            "type": "generate",
+            "prompt": req.prompt,
+            "style": req.style,
+            "provider": req.provider,
+            "model": req.model,
+        },
     )
 
     return AsyncJobResponse(job_id=job_id, status="pending")
@@ -951,6 +1075,10 @@ def async_generate_and_apply(req: GenerateAndApplyRequest):
             "type": "generate-and-apply",
             "prompt": req.prompt,
             "style": req.style,
+            "provider": req.provider,
+            "model": req.model,
+            "tv": req.tv,
+            "tv_ip": req.tv_ip,
         },
     )
 
