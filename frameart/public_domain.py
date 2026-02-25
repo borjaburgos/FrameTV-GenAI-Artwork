@@ -446,7 +446,7 @@ def download_artwork_image(
                                 if chunk:
                                     f.write(chunk)
                 return
-            except (httpx.TimeoutException, httpx.NetworkError) as e:
+            except httpx.RequestError as e:
                 last_error = e
                 continue
         if last_error:
@@ -454,7 +454,7 @@ def download_artwork_image(
 
     try:
         _download_to_file(image_url)
-    except (httpx.TimeoutException, httpx.NetworkError):
+    except httpx.RequestError:
         # Some providers expose large originals that can time out; fallback to
         # thumbnail when available. The existing processing pipeline still
         # normalizes output to 16:9 and 4K as needed.
