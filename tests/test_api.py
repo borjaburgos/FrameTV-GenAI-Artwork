@@ -289,6 +289,45 @@ class TestApply:
 
 
 # ---------------------------------------------------------------------------
+# POST /upload-and-apply
+# ---------------------------------------------------------------------------
+
+class TestUploadAndApply:
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_import_and_apply")
+    def test_success(self, mock_run, mock_settings, tmp_path):
+        settings = MagicMock()
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        mock_run.return_value = _fake_result()
+
+        resp = client.post(
+            "/upload-and-apply",
+            data={"tv_ip": "192.168.1.50", "matte": "none"},
+            files={"image": ("sample.jpg", b"fake-jpeg-bytes", "image/jpeg")},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["content_id"] == "MY_ART_001"
+        mock_run.assert_called_once()
+        assert mock_run.call_args.kwargs["tv_ip"] == "192.168.1.50"
+
+    @patch("frameart.api._settings")
+    def test_rejects_unsupported_file_extension(self, mock_settings, tmp_path):
+        settings = MagicMock()
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+
+        resp = client.post(
+            "/upload-and-apply",
+            data={"tv_ip": "192.168.1.50"},
+            files={"image": ("sample.gif", b"GIF89a", "image/gif")},
+        )
+        assert resp.status_code == 400
+        assert "Unsupported file type" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
 # GET /tv/status
 # ---------------------------------------------------------------------------
 

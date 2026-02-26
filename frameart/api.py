@@ -9,6 +9,7 @@ Endpoints (sync):
     POST /generate              — generate image only (no TV upload)
     POST /generate-and-apply    — generate, upload to TV, switch display
     POST /apply                 — upload an existing image to the TV
+    POST /upload-and-apply      — upload image bytes from web/mobile and apply to TV
 
 Endpoints (async — return immediately, poll for results):
     POST /async/generate            — returns {job_id, status}
@@ -40,11 +41,12 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import uuid
 from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import FastAPI, File, Form, HTTPException, Query, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -53,6 +55,10 @@ from frameart import __version__
 from frameart.config import STYLE_PRESETS, load_settings
 
 logger = logging.getLogger(__name__)
+
+_ALLOWED_UPLOAD_EXTS = {".jpg", ".jpeg", ".png"}
+_ALLOWED_UPLOAD_MIME = {"image/jpeg", "image/jpg", "image/png"}
+_MAX_UPLOAD_BYTES = 30 * 1024 * 1024
 
 app = FastAPI(
     title="FrameArt",
@@ -458,6 +464,72 @@ def apply_image(req: ApplyRequest):
         tv_ip=req.tv_ip,
         matte=req.matte,
     )
+    resp = _pipeline_result_to_response(result)
+    if result.error:
+        raise HTTPException(status_code=500, detail=resp.model_dump())
+    return resp
+
+
+@app.post("/upload-and-apply", response_model=JobResponse)
+def upload_and_apply(
+    image: UploadFile = File(..., description="Uploaded image file (jpg/png)."),  # noqa: B008
+    tv: str | None = Form(None, description="TV profile name from config."),  # noqa: B008
+    tv_ip: str | None = Form(None, description="TV IP address."),  # noqa: B008
+    matte: str = Form("none", description="Matte style."),  # noqa: B008
+    upscaler: str | None = Form(None, description="Upscaler to use."),  # noqa: B008
+    no_switch: bool = Form(False, description="Upload but do not switch displayed art."),  # noqa: B008
+):
+    """Upload user image bytes and run import+postprocess+apply pipeline."""
+    from frameart.pipeline import run_import_and_apply
+
+    filename = image.filename or "upload"
+    suffix = Path(filename).suffix.lower()
+    mime_type = (image.content_type or "").lower()
+
+    if suffix and suffix not in _ALLOWED_UPLOAD_EXTS:
+        raise HTTPException(status_code=400, detail="Unsupported file type. Use JPG or PNG.")
+    if mime_type and mime_type not in _ALLOWED_UPLOAD_MIME:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported content type. Use image/jpeg or image/png.",
+        )
+
+    payload = image.file.read(_MAX_UPLOAD_BYTES + 1)
+    if not payload:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    if len(payload) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Uploaded file is too large (max 30MB).")
+
+    if not suffix:
+        suffix = ".png" if mime_type == "image/png" else ".jpg"
+
+    settings = _settings()
+    upload_dir = settings.data_dir / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = upload_dir / f"upload-{uuid.uuid4().hex}{suffix}"
+    temp_path.write_bytes(payload)
+
+    try:
+        result = run_import_and_apply(
+            settings,
+            str(temp_path),
+            tv_name=tv,
+            tv_ip=tv_ip,
+            matte=matte,
+            upscaler_name=upscaler,
+            no_switch=no_switch,
+            source_metadata={
+                "source": "web_upload",
+                "filename": filename,
+                "content_type": image.content_type or "",
+            },
+        )
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            logger.warning("Failed to delete temporary upload file: %s", temp_path)
+
     resp = _pipeline_result_to_response(result)
     if result.error:
         raise HTTPException(status_code=500, detail=resp.model_dump())

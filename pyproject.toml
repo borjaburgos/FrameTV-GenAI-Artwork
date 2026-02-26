@@ -28,6 +28,7 @@ dev = [
 ]
 api = [
     "fastapi>=0.111,<1",
+    "python-multipart>=0.0.9,<1",
     "uvicorn[standard]>=0.29,<1",
 ]
 
