@@ -472,12 +472,12 @@ def apply_image(req: ApplyRequest):
 
 @app.post("/upload-and-apply", response_model=JobResponse)
 def upload_and_apply(
-    image: UploadFile = File(..., description="Uploaded image file (jpg/png)."),
-    tv: str | None = Form(None, description="TV profile name from config."),
-    tv_ip: str | None = Form(None, description="TV IP address."),
-    matte: str = Form("none", description="Matte style."),
-    upscaler: str | None = Form(None, description="Upscaler to use."),
-    no_switch: bool = Form(False, description="Upload but do not switch displayed art."),
+    image: UploadFile = File(..., description="Uploaded image file (jpg/png)."),  # noqa: B008
+    tv: str | None = Form(None, description="TV profile name from config."),  # noqa: B008
+    tv_ip: str | None = Form(None, description="TV IP address."),  # noqa: B008
+    matte: str = Form("none", description="Matte style."),  # noqa: B008
+    upscaler: str | None = Form(None, description="Upscaler to use."),  # noqa: B008
+    no_switch: bool = Form(False, description="Upload but do not switch displayed art."),  # noqa: B008
 ):
     """Upload user image bytes and run import+postprocess+apply pipeline."""
     from frameart.pipeline import run_import_and_apply
