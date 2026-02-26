@@ -416,6 +416,7 @@
     <button class="active" data-tab="generate">Generate</button>
     <button data-tab="gallery">Gallery</button>
     <button data-tab="public">Public Domain</button>
+    <button data-tab="upload">Upload</button>
     <button data-tab="tvs">TVs</button>
   </div>
   <div class="header-spacer"></div>
@@ -532,6 +533,37 @@
   <div class="empty" id="public-empty">Search public-domain catalogs to display art on your TV.</div>
 </div>
 
+<!-- ===== Upload ===== -->
+<div class="panel" id="panel-upload">
+  <div class="section-heading">
+    <h2>Upload Your Own Image</h2>
+  </div>
+  <p style="font-size:.9rem; color:var(--muted); margin-bottom:1rem;">
+    Upload JPG or PNG from desktop, iOS, or Android. FrameArt will process it to 16:9 and 4K as needed, then display it on your TV.
+  </p>
+  <div class="row">
+    <div>
+      <label for="own-image-file">Image File</label>
+      <input id="own-image-file" type="file" accept=".jpg,.jpeg,.png,image/jpeg,image/png">
+    </div>
+    <div>
+      <label for="own-upload-tv-select">Display on TV</label>
+      <select id="own-upload-tv-select"></select>
+    </div>
+    <div>
+      <label for="own-upload-matte-select">Matte Style</label>
+      <select id="own-upload-matte-select">
+        <option value="none">none</option>
+        <option value="shadowbox_polar">shadowbox_polar</option>
+      </select>
+    </div>
+  </div>
+  <button class="btn" id="btn-own-upload">Process and Display</button>
+  <div class="status-bar" id="own-upload-status">
+    <div class="value" id="own-upload-status-text"></div>
+  </div>
+</div>
+
 <!-- ===== TVs ===== -->
 <div class="panel" id="panel-tvs">
   <div class="section-heading">
@@ -616,6 +648,8 @@
       <div class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>Y</kbd></div>
       <div class="label">Switch to Public Domain</div>
       <div class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>P</kbd></div>
+      <div class="label">Switch to Upload</div>
+      <div class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>U</kbd></div>
       <div class="label">Switch to TVs</div>
       <div class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>T</kbd></div>
       <div class="label">Focus primary search</div>
@@ -647,11 +681,13 @@
   const storageKeys = {
     tvGenerate: 'frameart.tv.generate',
     tvPublic: 'frameart.tv.public',
+    tvOwnUpload: 'frameart.tv.own_upload',
     tvUpload: 'frameart.tv.upload',
     tvArt: 'frameart.tv.art',
     providerGenerate: 'frameart.provider.generate',
     modelGenerate: 'frameart.model.generate',
     mattePublic: 'frameart.matte.public',
+    matteOwnUpload: 'frameart.matte.own_upload',
     matteUpload: 'frameart.matte.upload',
   };
 
@@ -762,7 +798,7 @@
 
   function refreshTVSelects() {
     // Update all TV <select> elements throughout the UI
-    const selectors = ['tv-select', 'tv-art-select', 'upload-tv-select', 'public-tv-select'];
+    const selectors = ['tv-select', 'tv-art-select', 'upload-tv-select', 'public-tv-select', 'own-upload-tv-select'];
     for (const id of selectors) {
       const sel = document.getElementById(id);
       if (!sel) continue;
@@ -770,6 +806,8 @@
       if (id === 'tv-select') {
         sel.innerHTML = '<option value="">Generate only (no TV)</option>';
       } else if (id === 'public-tv-select') {
+        sel.innerHTML = '<option value="">Select TV...</option>';
+      } else if (id === 'own-upload-tv-select') {
         sel.innerHTML = '<option value="">Select TV...</option>';
       } else {
         sel.innerHTML = '';
@@ -788,6 +826,7 @@
         const remembered = localStorage.getItem(
           id === 'tv-select' ? storageKeys.tvGenerate :
           id === 'public-tv-select' ? storageKeys.tvPublic :
+          id === 'own-upload-tv-select' ? storageKeys.tvOwnUpload :
           id === 'upload-tv-select' ? storageKeys.tvUpload :
           storageKeys.tvArt
         );
@@ -912,8 +951,14 @@
   document.getElementById('public-tv-select').addEventListener('change', (e) => {
     localStorage.setItem(storageKeys.tvPublic, e.target.value || '');
   });
+  document.getElementById('own-upload-tv-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.tvOwnUpload, e.target.value || '');
+  });
   document.getElementById('public-matte-select').addEventListener('change', (e) => {
     localStorage.setItem(storageKeys.mattePublic, e.target.value || '');
+  });
+  document.getElementById('own-upload-matte-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.matteOwnUpload, e.target.value || '');
   });
   document.getElementById('upload-matte-select').addEventListener('change', (e) => {
     localStorage.setItem(storageKeys.matteUpload, e.target.value || '');
@@ -922,6 +967,11 @@
   if (rememberedPublicMatte) {
     const sel = document.getElementById('public-matte-select');
     if ([...sel.options].some(o => o.value === rememberedPublicMatte)) sel.value = rememberedPublicMatte;
+  }
+  const rememberedOwnUploadMatte = localStorage.getItem(storageKeys.matteOwnUpload);
+  if (rememberedOwnUploadMatte) {
+    const sel = document.getElementById('own-upload-matte-select');
+    if ([...sel.options].some(o => o.value === rememberedOwnUploadMatte)) sel.value = rememberedOwnUploadMatte;
   }
   const rememberedUploadMatte = localStorage.getItem(storageKeys.matteUpload);
   if (rememberedUploadMatte) {
@@ -1512,6 +1562,64 @@
   document.getElementById('public-tv-select').addEventListener('change', (e) => {
     loadMattesForSelect('public-matte-select', e.target.value);
   });
+  document.getElementById('own-upload-tv-select').addEventListener('change', (e) => {
+    loadMattesForSelect('own-upload-matte-select', e.target.value);
+  });
+
+  async function uploadOwnImage() {
+    const fileInput = document.getElementById('own-image-file');
+    const tvIp = document.getElementById('own-upload-tv-select').value;
+    const matte = document.getElementById('own-upload-matte-select').value || 'none';
+    const statusEl = document.getElementById('own-upload-status');
+    const statusTextEl = document.getElementById('own-upload-status-text');
+    const btn = document.getElementById('btn-own-upload');
+
+    const file = fileInput.files && fileInput.files[0] ? fileInput.files[0] : null;
+    if (!file) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Please choose a JPG or PNG image.';
+      return;
+    }
+    if (!tvIp) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Please select a TV.';
+      return;
+    }
+
+    const formData = new FormData();
+    formData.append('image', file);
+    formData.append('tv_ip', tvIp);
+    formData.append('matte', matte);
+
+    setButtonBusy(btn, 'Processing...');
+    statusEl.className = 'status-bar visible';
+    statusTextEl.textContent = 'Processing image, cropping/upscaling, and uploading...';
+
+    try {
+      const resp = await fetch('/upload-and-apply', {
+        method: 'POST',
+        body: formData,
+      });
+      if (!resp.ok) {
+        const detail = await readApiError(resp, 'Server returned');
+        throw new Error(detail);
+      }
+      const data = await resp.json();
+      statusEl.className = 'status-bar visible done';
+      statusTextEl.textContent = 'Displayed on TV. Job ' + data.job_id;
+      showToast('Uploaded and displayed your image on TV.', 'done');
+      fileInput.value = '';
+      loadGallery();
+    } catch (e) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Failed: ' + e.message;
+      showToast('Image upload failed: ' + e.message, 'error');
+    } finally {
+      clearButtonBusy(btn);
+    }
+  }
+
+  document.getElementById('btn-own-upload').addEventListener('click', uploadOwnImage);
 
   // =========================================================================
   // Upload-to-TV modal (from gallery)
@@ -1877,7 +1985,9 @@
         sel.appendChild(opt);
       }
       const remembered = localStorage.getItem(
-        selectId === 'public-matte-select' ? storageKeys.mattePublic : storageKeys.matteUpload
+        selectId === 'public-matte-select' ? storageKeys.mattePublic :
+        selectId === 'own-upload-matte-select' ? storageKeys.matteOwnUpload :
+        storageKeys.matteUpload
       );
       if (remembered && [...sel.options].some(o => o.value === remembered)) sel.value = remembered;
     } catch {
@@ -1885,7 +1995,9 @@
                       '<option value="shadowbox_polar">shadowbox_polar</option>' +
                       '<option value="shadowbox_noir">shadowbox_noir</option>';
       const remembered = localStorage.getItem(
-        selectId === 'public-matte-select' ? storageKeys.mattePublic : storageKeys.matteUpload
+        selectId === 'public-matte-select' ? storageKeys.mattePublic :
+        selectId === 'own-upload-matte-select' ? storageKeys.matteOwnUpload :
+        storageKeys.matteUpload
       );
       if (remembered && [...sel.options].some(o => o.value === remembered)) sel.value = remembered;
     }
@@ -1957,12 +2069,13 @@
 
     const typing = isTypingTarget(e.target);
 
-    // Alt+Shift+[G,Y,P,T]: tab jump
+    // Alt+Shift+[G,Y,P,U,T]: tab jump
     if (e.altKey && e.shiftKey) {
       const key = e.key.toLowerCase();
       if (key === 'g') setActiveTab('generate');
       else if (key === 'y') setActiveTab('gallery');
       else if (key === 'p') setActiveTab('public');
+      else if (key === 'u') setActiveTab('upload');
       else if (key === 't') setActiveTab('tvs');
       else return;
       e.preventDefault();
@@ -1977,6 +2090,9 @@
       if (activeTab === 'public') {
         e.preventDefault();
         document.getElementById('public-query').focus();
+      } else if (activeTab === 'upload') {
+        e.preventDefault();
+        document.getElementById('own-image-file').focus();
       } else if (activeTab === 'gallery') {
         e.preventDefault();
         document.getElementById('btn-refresh-gallery').focus();
