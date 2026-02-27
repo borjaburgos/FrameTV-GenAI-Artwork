@@ -171,3 +171,104 @@ class OpenAIProvider(ImageProvider):
                 "revised_prompt": revised_prompt,
             },
         )
+
+    def _parse_image_response(self, resp: httpx.Response, prompt: str) -> GeneratedImage:
+        """Parse OpenAI image API response for generations and edits."""
+        if resp.status_code >= 400:
+            try:
+                err_body = resp.json()
+                err_msg = err_body.get("error", {}).get("message", resp.text)
+            except Exception:
+                err_msg = resp.text
+            raise RuntimeError(f"OpenAI API error {resp.status_code}: {err_msg}")
+
+        data = resp.json()
+        image_entry = data["data"][0]
+        if "b64_json" in image_entry:
+            image_bytes = base64.b64decode(image_entry["b64_json"])
+        elif "url" in image_entry:
+            with httpx.Client(timeout=self._timeout) as client:
+                img_resp = client.get(image_entry["url"])
+                img_resp.raise_for_status()
+                image_bytes = img_resp.content
+        else:
+            raise RuntimeError(f"Unexpected response format: {list(image_entry.keys())}")
+
+        revised_prompt = image_entry.get("revised_prompt", prompt)
+        img = Image.open(io.BytesIO(image_bytes))
+        w, h = img.size
+
+        return GeneratedImage(
+            data=image_bytes,
+            mime_type="image/png",
+            width=w,
+            height=h,
+            metadata={
+                "provider": self.name,
+                "model": self._model,
+                "revised_prompt": revised_prompt,
+            },
+        )
+
+    def edit(
+        self,
+        image_bytes: bytes,
+        prompt: str,
+        *,
+        width: int | None = None,
+        height: int | None = None,
+        negative_prompt: str | None = None,
+        seed: int | None = None,
+        steps: int | None = None,
+        guidance: float | None = None,
+        **kwargs: Any,
+    ) -> GeneratedImage:
+        del negative_prompt, seed, steps, guidance, kwargs
+        if not self._api_key:
+            raise RuntimeError(
+                "OpenAI API key not set. "
+                "Set OPENAI_API_KEY env var or providers.openai.api_key"
+            )
+
+        # OpenAI image edits endpoint supports model-dependent behavior.
+        if not (self._model.startswith("gpt-image") or self._model == "dall-e-2"):
+            raise RuntimeError(
+                f"OpenAI model '{self._model}' may not support image edits. "
+                "Use a gpt-image-* model or dall-e-2."
+            )
+
+        size = "1536x1024"
+        if width and height and height > width:
+            size = "1024x1536"
+        elif width and height and width == height:
+            size = "1024x1024"
+
+        files = {
+            "image": ("image.png", image_bytes, "image/png"),
+        }
+        form_data: dict[str, str] = {
+            "model": self._model,
+            "prompt": prompt,
+            "n": "1",
+            "size": size,
+        }
+        if self._model.startswith("gpt-image"):
+            form_data["quality"] = "high"
+        else:
+            form_data["response_format"] = "b64_json"
+
+        with httpx.Client(timeout=self._timeout) as client:
+            resp = client.post(
+                f"{self._base_url}/images/edits",
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                data=form_data,
+                files=files,
+            )
+
+        result = self._parse_image_response(resp, prompt)
+        result.metadata.update({
+            "size_requested": size,
+            "operation": "edit",
+        })
+        logger.info("OpenAI edit returned image %dx%d", result.width, result.height)
+        return result

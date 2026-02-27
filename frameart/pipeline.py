@@ -345,6 +345,107 @@ def run_import_and_apply(
     return result
 
 
+def run_edit_and_apply(
+    settings: Settings,
+    image_path: str | Path,
+    prompt: str,
+    *,
+    provider_name: str | None = None,
+    model: str | None = None,
+    upscaler_name: str | None = None,
+    tv_name: str | None = None,
+    tv_ip: str | None = None,
+    matte: str = "none",
+    no_upload: bool = False,
+    no_switch: bool = False,
+) -> PipelineResult:
+    """Edit an uploaded image, post-process, and optionally upload to TV."""
+    job_id = generate_job_id()
+    job_dir = get_job_dir(settings.data_dir, job_id)
+    timings: dict[str, float] = {}
+    result = PipelineResult(job_id=job_id, job_dir=job_dir, timings=timings)
+
+    try:
+        source_bytes = Path(image_path).read_bytes()
+        result.source_path = save_source_image(job_dir, source_bytes)
+
+        provider = _get_provider_instance(settings, provider_name, model)
+        t0 = time.monotonic()
+        edited = provider.edit(
+            source_bytes,
+            prompt,
+            width=3840,
+            height=2160,
+        )
+        timings["edit_ms"] = (time.monotonic() - t0) * 1000
+
+        upscaler = _get_upscaler_instance(settings, upscaler_name)
+        t0 = time.monotonic()
+        pp_result = postprocess(edited.data, upscaler)
+        timings["postprocess_ms"] = (time.monotonic() - t0) * 1000
+        result.final_path = save_final_image(job_dir, pp_result.image_bytes)
+
+        result.metadata = {
+            "job_id": job_id,
+            "image_path": str(image_path),
+            "operation": "edit",
+            "edit_prompt": prompt,
+            "provider": provider.name,
+            "model": model or settings.default_model,
+            "edited_source_width": edited.width,
+            "edited_source_height": edited.height,
+            "final_width": pp_result.width,
+            "final_height": pp_result.height,
+            "postprocess_steps": pp_result.steps,
+            "upscaler": upscaler.name,
+            "content_id": None,
+            "tv_ip": None,
+            "tv_switched": False,
+            "matte": matte,
+            "no_upload": no_upload,
+            "timings": timings,
+            **edited.metadata,
+        }
+
+        if not no_upload:
+            profile = _resolve_tv_profile(settings, tv_name, tv_ip)
+            if profile is None:
+                raise RuntimeError(
+                    "No TV specified. Use --tv or --tv-ip, or configure a TV in config.yaml"
+                )
+
+            t0 = time.monotonic()
+            upload_result = tv_ctrl.upload_image(
+                profile,
+                pp_result.image_bytes,
+                file_type="PNG",
+                matte=matte,
+            )
+            timings["upload_ms"] = (time.monotonic() - t0) * 1000
+            if not upload_result.success:
+                raise RuntimeError(f"Upload failed: {upload_result.error}")
+            result.content_id = upload_result.content_id
+
+            if not no_switch:
+                t0 = time.monotonic()
+                result.tv_switched = tv_ctrl.switch_art(profile, upload_result.content_id)
+                timings["switch_ms"] = (time.monotonic() - t0) * 1000
+
+            result.metadata.update({
+                "content_id": upload_result.content_id,
+                "tv_ip": profile.ip,
+                "tv_switched": result.tv_switched,
+            })
+
+        save_metadata(job_dir, result.metadata)
+
+    except Exception as e:
+        result.error = str(e)
+        logger.error("Pipeline edit+apply failed: %s", e)
+
+    return result
+
+
 def run_generate_and_apply(
     settings: Settings,
     prompt: str,
