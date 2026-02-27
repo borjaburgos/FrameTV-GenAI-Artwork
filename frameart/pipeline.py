@@ -8,8 +8,11 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
+from io import BytesIO
 from pathlib import Path
 from typing import Any
+
+from PIL import Image
 
 from frameart.artifacts import (
     generate_job_id,
@@ -74,6 +77,41 @@ def normalize_prompt(
 
     normalized = ", ".join(parts)
     logger.info("Normalized prompt: %s", normalized)
+    return normalized
+
+
+def _read_image_size(image_bytes: bytes) -> tuple[int | None, int | None]:
+    """Best-effort source image dimensions from bytes."""
+    try:
+        with Image.open(BytesIO(image_bytes)) as im:
+            return int(im.width), int(im.height)
+    except Exception:
+        return None, None
+
+
+def normalize_edit_prompt(
+    prompt: str,
+    *,
+    source_width: int | None = None,
+    source_height: int | None = None,
+    auto_aspect_hint: bool = True,
+) -> str:
+    """Normalize edit prompts with explicit output framing guidance."""
+    parts = [prompt.strip()]
+
+    if auto_aspect_hint:
+        parts.append(
+            "final output must be 16:9 landscape, edge-to-edge, "
+            "no borders or letterboxing"
+        )
+        if source_width and source_height and source_height > source_width:
+            parts.append(
+                "source image is portrait; recompose and crop or outpaint "
+                "as needed to fit a wide 16:9 frame"
+            )
+
+    normalized = ", ".join(parts)
+    logger.info("Normalized edit prompt: %s", normalized)
     return normalized
 
 
@@ -368,12 +406,19 @@ def run_edit_and_apply(
     try:
         source_bytes = Path(image_path).read_bytes()
         result.source_path = save_source_image(job_dir, source_bytes)
+        source_width, source_height = _read_image_size(source_bytes)
+        normalized_prompt = normalize_edit_prompt(
+            prompt,
+            source_width=source_width,
+            source_height=source_height,
+            auto_aspect_hint=settings.auto_aspect_hint,
+        )
 
         provider = _get_provider_instance(settings, provider_name, model)
         t0 = time.monotonic()
         edited = provider.edit(
             source_bytes,
-            prompt,
+            normalized_prompt,
             width=3840,
             height=2160,
         )
@@ -389,9 +434,13 @@ def run_edit_and_apply(
             "job_id": job_id,
             "image_path": str(image_path),
             "operation": "edit",
-            "edit_prompt": prompt,
+            "edit_prompt": normalized_prompt,
+            "edit_prompt_original": prompt,
+            "edit_prompt_normalized": normalized_prompt,
             "provider": provider.name,
             "model": model or settings.default_model,
+            "source_width": source_width,
+            "source_height": source_height,
             "edited_source_width": edited.width,
             "edited_source_height": edited.height,
             "final_width": pp_result.width,
