@@ -634,6 +634,50 @@
   <div class="status-bar" id="own-upload-status">
     <div class="value" id="own-upload-status-text"></div>
   </div>
+
+  <div class="tv-art-section" style="margin-top:1rem;">
+    <div class="section-heading">
+      <h2>Edit Uploaded Image</h2>
+    </div>
+    <p style="font-size:.85rem; color:var(--muted); margin-bottom:.8rem;">
+      Upload a picture and describe the edit (example: impressionist rendition of this family picture).
+    </p>
+    <div class="row">
+      <div>
+        <label for="edit-image-file">Image File</label>
+        <input id="edit-image-file" type="file" accept=".jpg,.jpeg,.png,image/jpeg,image/png">
+      </div>
+      <div>
+        <label for="edit-provider">Provider</label>
+        <select id="edit-provider"></select>
+      </div>
+      <div>
+        <label for="edit-model">Model</label>
+        <select id="edit-model"></select>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="edit-prompt">Edit Prompt</label>
+        <textarea id="edit-prompt" placeholder="An impressionist rendition of this family picture"></textarea>
+      </div>
+      <div>
+        <label for="edit-upload-tv-select">Display on TV</label>
+        <select id="edit-upload-tv-select"></select>
+      </div>
+      <div>
+        <label for="edit-upload-matte-select">Matte Style</label>
+        <select id="edit-upload-matte-select">
+          <option value="none">none</option>
+          <option value="shadowbox_polar">shadowbox_polar</option>
+        </select>
+      </div>
+    </div>
+    <button class="btn" id="btn-edit-upload">Edit Image</button>
+    <div class="status-bar" id="edit-upload-status">
+      <div class="value" id="edit-upload-status-text"></div>
+    </div>
+  </div>
 </div>
 
 <!-- ===== TVs ===== -->
@@ -754,12 +798,16 @@
     tvGenerate: 'frameart.tv.generate',
     tvPublic: 'frameart.tv.public',
     tvOwnUpload: 'frameart.tv.own_upload',
+    tvEditUpload: 'frameart.tv.edit_upload',
     tvUpload: 'frameart.tv.upload',
     tvArt: 'frameart.tv.art',
     providerGenerate: 'frameart.provider.generate',
     modelGenerate: 'frameart.model.generate',
+    providerEdit: 'frameart.provider.edit',
+    modelEdit: 'frameart.model.edit',
     mattePublic: 'frameart.matte.public',
     matteOwnUpload: 'frameart.matte.own_upload',
+    matteEditUpload: 'frameart.matte.edit_upload',
     matteUpload: 'frameart.matte.upload',
   };
 
@@ -786,8 +834,9 @@
     return configuredProviders.find((p) => p.name === name) || null;
   }
 
-  function refreshModelSelect(providerName, preferredModel) {
-    const modelSel = document.getElementById('model');
+  function refreshModelSelectFor(providerName, preferredModel, modelSelectId) {
+    const modelSel = document.getElementById(modelSelectId);
+    if (!modelSel) return;
     const provider = findProviderOption(providerName);
     const models = provider?.models || [];
     const defaultLabel = provider?.default_model
@@ -814,20 +863,35 @@
     }
   }
 
+  function refreshModelSelect(providerName, preferredModel) {
+    refreshModelSelectFor(providerName, preferredModel, 'model');
+  }
+
   function refreshProviderSelects(payload) {
     configuredProviders = payload?.providers || [];
     const providerSel = document.getElementById('provider');
+    const editProviderSel = document.getElementById('edit-provider');
     const rememberedProvider = localStorage.getItem(storageKeys.providerGenerate);
     const rememberedModel = localStorage.getItem(storageKeys.modelGenerate);
+    const rememberedEditProvider = localStorage.getItem(storageKeys.providerEdit);
+    const rememberedEditModel = localStorage.getItem(storageKeys.modelEdit);
     const fallback = payload?.default_provider || configuredProviders[0]?.name || '';
     const preferredProvider = rememberedProvider || fallback;
+    const preferredEditProvider = rememberedEditProvider || fallback;
 
     providerSel.innerHTML = '';
+    if (editProviderSel) editProviderSel.innerHTML = '';
     for (const provider of configuredProviders) {
       const opt = document.createElement('option');
       opt.value = provider.name;
       opt.textContent = provider.is_default ? (provider.name + ' (default)') : provider.name;
       providerSel.appendChild(opt);
+      if (editProviderSel) {
+        const editOpt = document.createElement('option');
+        editOpt.value = provider.name;
+        editOpt.textContent = provider.is_default ? (provider.name + ' (default)') : provider.name;
+        editProviderSel.appendChild(editOpt);
+      }
     }
 
     if ([...providerSel.options].some((o) => o.value === preferredProvider)) {
@@ -837,6 +901,15 @@
     }
 
     refreshModelSelect(providerSel.value, rememberedModel || '');
+
+    if (editProviderSel) {
+      if ([...editProviderSel.options].some((o) => o.value === preferredEditProvider)) {
+        editProviderSel.value = preferredEditProvider;
+      } else if (editProviderSel.options.length) {
+        editProviderSel.selectedIndex = 0;
+      }
+      refreshModelSelectFor(editProviderSel.value, rememberedEditModel || '', 'edit-model');
+    }
   }
 
   function setButtonBusy(btn, busyText) {
@@ -870,7 +943,14 @@
 
   function refreshTVSelects() {
     // Update all TV <select> elements throughout the UI
-    const selectors = ['tv-select', 'tv-art-select', 'upload-tv-select', 'public-tv-select', 'own-upload-tv-select'];
+    const selectors = [
+      'tv-select',
+      'tv-art-select',
+      'upload-tv-select',
+      'public-tv-select',
+      'own-upload-tv-select',
+      'edit-upload-tv-select',
+    ];
     for (const id of selectors) {
       const sel = document.getElementById(id);
       if (!sel) continue;
@@ -881,6 +961,8 @@
         sel.innerHTML = '<option value="">Select TV...</option>';
       } else if (id === 'own-upload-tv-select') {
         sel.innerHTML = '<option value="">Select TV...</option>';
+      } else if (id === 'edit-upload-tv-select') {
+        sel.innerHTML = '<option value="">Edit only (no TV upload)</option>';
       } else {
         sel.innerHTML = '';
       }
@@ -899,6 +981,7 @@
           id === 'tv-select' ? storageKeys.tvGenerate :
           id === 'public-tv-select' ? storageKeys.tvPublic :
           id === 'own-upload-tv-select' ? storageKeys.tvOwnUpload :
+          id === 'edit-upload-tv-select' ? storageKeys.tvEditUpload :
           id === 'upload-tv-select' ? storageKeys.tvUpload :
           storageKeys.tvArt
         );
@@ -986,9 +1069,14 @@
   }).catch(() => {
     const providerSel = document.getElementById('provider');
     const modelSel = document.getElementById('model');
+    const editProviderSel = document.getElementById('edit-provider');
+    const editModelSel = document.getElementById('edit-model');
     providerSel.innerHTML = '<option value="openai">openai</option>';
     providerSel.value = 'openai';
     modelSel.innerHTML = '<option value="">Provider default</option>';
+    editProviderSel.innerHTML = '<option value="openai">openai</option>';
+    editProviderSel.value = 'openai';
+    editModelSel.innerHTML = '<option value="">Provider default</option>';
     showToast('Failed to load configured providers; using fallback defaults.', 'warn');
   });
 
@@ -1014,6 +1102,15 @@
   document.getElementById('model').addEventListener('change', (e) => {
     localStorage.setItem(storageKeys.modelGenerate, e.target.value || '');
   });
+  document.getElementById('edit-provider').addEventListener('change', (e) => {
+    const provider = e.target.value || '';
+    localStorage.setItem(storageKeys.providerEdit, provider);
+    refreshModelSelectFor(provider, '', 'edit-model');
+    localStorage.setItem(storageKeys.modelEdit, '');
+  });
+  document.getElementById('edit-model').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.modelEdit, e.target.value || '');
+  });
   document.getElementById('tv-art-select').addEventListener('change', (e) => {
     localStorage.setItem(storageKeys.tvArt, e.target.value || '');
   });
@@ -1026,11 +1123,17 @@
   document.getElementById('own-upload-tv-select').addEventListener('change', (e) => {
     localStorage.setItem(storageKeys.tvOwnUpload, e.target.value || '');
   });
+  document.getElementById('edit-upload-tv-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.tvEditUpload, e.target.value || '');
+  });
   document.getElementById('public-matte-select').addEventListener('change', (e) => {
     localStorage.setItem(storageKeys.mattePublic, e.target.value || '');
   });
   document.getElementById('own-upload-matte-select').addEventListener('change', (e) => {
     localStorage.setItem(storageKeys.matteOwnUpload, e.target.value || '');
+  });
+  document.getElementById('edit-upload-matte-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.matteEditUpload, e.target.value || '');
   });
   document.getElementById('upload-matte-select').addEventListener('change', (e) => {
     localStorage.setItem(storageKeys.matteUpload, e.target.value || '');
@@ -1044,6 +1147,11 @@
   if (rememberedOwnUploadMatte) {
     const sel = document.getElementById('own-upload-matte-select');
     if ([...sel.options].some(o => o.value === rememberedOwnUploadMatte)) sel.value = rememberedOwnUploadMatte;
+  }
+  const rememberedEditUploadMatte = localStorage.getItem(storageKeys.matteEditUpload);
+  if (rememberedEditUploadMatte) {
+    const sel = document.getElementById('edit-upload-matte-select');
+    if ([...sel.options].some(o => o.value === rememberedEditUploadMatte)) sel.value = rememberedEditUploadMatte;
   }
   const rememberedUploadMatte = localStorage.getItem(storageKeys.matteUpload);
   if (rememberedUploadMatte) {
@@ -1637,6 +1745,9 @@
   document.getElementById('own-upload-tv-select').addEventListener('change', (e) => {
     loadMattesForSelect('own-upload-matte-select', e.target.value);
   });
+  document.getElementById('edit-upload-tv-select').addEventListener('change', (e) => {
+    loadMattesForSelect('edit-upload-matte-select', e.target.value);
+  });
 
   async function uploadOwnImage() {
     const fileInput = document.getElementById('own-image-file');
@@ -1692,6 +1803,78 @@
   }
 
   document.getElementById('btn-own-upload').addEventListener('click', uploadOwnImage);
+
+  async function uploadEditImage() {
+    const fileInput = document.getElementById('edit-image-file');
+    const promptInput = document.getElementById('edit-prompt');
+    const providerInput = document.getElementById('edit-provider');
+    const modelInput = document.getElementById('edit-model');
+    const tvIp = document.getElementById('edit-upload-tv-select').value;
+    const matte = document.getElementById('edit-upload-matte-select').value || 'none';
+    const statusEl = document.getElementById('edit-upload-status');
+    const statusTextEl = document.getElementById('edit-upload-status-text');
+    const btn = document.getElementById('btn-edit-upload');
+
+    const file = fileInput.files && fileInput.files[0] ? fileInput.files[0] : null;
+    const editPrompt = promptInput.value.trim();
+    if (!file) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Please choose a JPG or PNG image.';
+      return;
+    }
+    if (!editPrompt) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Please provide an edit prompt.';
+      return;
+    }
+    const noUpload = !tvIp;
+
+    const formData = new FormData();
+    formData.append('image', file);
+    formData.append('prompt', editPrompt);
+    if (tvIp) formData.append('tv_ip', tvIp);
+    formData.append('matte', matte);
+    if (noUpload) formData.append('no_upload', 'true');
+    if (providerInput.value) formData.append('provider', providerInput.value);
+    if (modelInput.value) formData.append('model', modelInput.value);
+
+    setButtonBusy(btn, 'Editing...');
+    statusEl.className = 'status-bar visible';
+    statusTextEl.textContent = noUpload
+      ? 'Editing image and preparing gallery output...'
+      : 'Editing image and preparing TV output...';
+
+    try {
+      const resp = await fetch('/edit-and-apply', {
+        method: 'POST',
+        body: formData,
+      });
+      if (!resp.ok) {
+        const detail = await readApiError(resp, 'Server returned');
+        throw new Error(detail);
+      }
+      const data = await resp.json();
+      statusEl.className = 'status-bar visible done';
+      statusTextEl.textContent = noUpload
+        ? ('Edited image saved. Job ' + data.job_id)
+        : ('Edited image displayed on TV. Job ' + data.job_id);
+      showToast(
+        noUpload ? 'Edited image saved to Gallery.' : 'Edited image displayed on TV.',
+        'done'
+      );
+      fileInput.value = '';
+      promptInput.value = '';
+      loadGallery();
+    } catch (e) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Failed: ' + e.message;
+      showToast('Image edit failed: ' + e.message, 'error');
+    } finally {
+      clearButtonBusy(btn);
+    }
+  }
+
+  document.getElementById('btn-edit-upload').addEventListener('click', uploadEditImage);
 
   // =========================================================================
   // Upload-to-TV modal (from gallery)
@@ -2059,6 +2242,7 @@
       const remembered = localStorage.getItem(
         selectId === 'public-matte-select' ? storageKeys.mattePublic :
         selectId === 'own-upload-matte-select' ? storageKeys.matteOwnUpload :
+        selectId === 'edit-upload-matte-select' ? storageKeys.matteEditUpload :
         storageKeys.matteUpload
       );
       if (remembered && [...sel.options].some(o => o.value === remembered)) sel.value = remembered;
@@ -2069,6 +2253,7 @@
       const remembered = localStorage.getItem(
         selectId === 'public-matte-select' ? storageKeys.mattePublic :
         selectId === 'own-upload-matte-select' ? storageKeys.matteOwnUpload :
+        selectId === 'edit-upload-matte-select' ? storageKeys.matteEditUpload :
         storageKeys.matteUpload
       );
       if (remembered && [...sel.options].some(o => o.value === remembered)) sel.value = remembered;

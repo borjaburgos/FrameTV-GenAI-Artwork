@@ -413,6 +413,70 @@ class TestUploadAndApply:
         assert "Unsupported file type" in resp.json()["detail"]
 
 
+class TestEditAndApply:
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_edit_and_apply")
+    def test_success(self, mock_run, mock_settings, tmp_path):
+        settings = MagicMock()
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        mock_run.return_value = _fake_result()
+
+        resp = client.post(
+            "/edit-and-apply",
+            data={
+                "prompt": "an impressionist rendition of this family picture",
+                "provider": "openai",
+                "model": "gpt-image-1",
+                "tv_ip": "192.168.1.50",
+            },
+            files={"image": ("sample.jpg", b"fake-jpeg-bytes", "image/jpeg")},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["content_id"] == "MY_ART_001"
+        mock_run.assert_called_once()
+        assert mock_run.call_args.kwargs["provider_name"] == "openai"
+        assert mock_run.call_args.kwargs["model"] == "gpt-image-1"
+        assert mock_run.call_args.kwargs["tv_ip"] == "192.168.1.50"
+
+    @patch("frameart.api._settings")
+    def test_requires_prompt(self, mock_settings, tmp_path):
+        settings = MagicMock()
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+
+        resp = client.post(
+            "/edit-and-apply",
+            data={"prompt": "   ", "tv_ip": "192.168.1.50"},
+            files={"image": ("sample.jpg", b"fake-jpeg-bytes", "image/jpeg")},
+        )
+        assert resp.status_code == 400
+        assert "Edit prompt cannot be empty" in resp.json()["detail"]
+
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_edit_and_apply")
+    def test_no_upload_allows_missing_tv(self, mock_run, mock_settings, tmp_path):
+        settings = MagicMock()
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        mock_run.return_value = _fake_result(content_id=None, tv_switched=False)
+
+        resp = client.post(
+            "/edit-and-apply",
+            data={
+                "prompt": "impressionist rendition",
+                "provider": "openai",
+                "no_upload": "true",
+            },
+            files={"image": ("sample.jpg", b"fake-jpeg-bytes", "image/jpeg")},
+        )
+        assert resp.status_code == 200
+        mock_run.assert_called_once()
+        assert mock_run.call_args.kwargs["no_upload"] is True
+        assert mock_run.call_args.kwargs["tv_ip"] is None
+
+
 # ---------------------------------------------------------------------------
 # GET /tv/status
 # ---------------------------------------------------------------------------

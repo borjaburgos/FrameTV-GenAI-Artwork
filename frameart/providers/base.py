@@ -63,3 +63,23 @@ class ImageProvider(abc.ABC):
     @abc.abstractmethod
     def name(self) -> str:
         """Human-readable provider name."""
+
+    def edit(
+        self,
+        image_bytes: bytes,
+        prompt: str,
+        *,
+        width: int | None = None,
+        height: int | None = None,
+        negative_prompt: str | None = None,
+        seed: int | None = None,
+        steps: int | None = None,
+        guidance: float | None = None,
+        **kwargs: Any,
+    ) -> GeneratedImage:
+        """Edit an existing image using a text prompt.
+
+        Providers that do not support edits should keep this default behavior.
+        """
+        del image_bytes, prompt, width, height, negative_prompt, seed, steps, guidance, kwargs
+        raise NotImplementedError(f"Provider '{self.name}' does not support image edits")

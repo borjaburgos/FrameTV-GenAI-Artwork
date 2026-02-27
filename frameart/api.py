@@ -10,6 +10,7 @@ Endpoints (sync):
     POST /generate-and-apply    — generate, upload to TV, switch display
     POST /apply                 — upload an existing image to the TV
     POST /upload-and-apply      — upload image bytes from web/mobile and apply to TV
+    POST /edit-and-apply        — upload + edit image with prompt, then apply to TV
 
 Endpoints (async — return immediately, poll for results):
     POST /async/generate            — returns {job_id, status}
@@ -658,6 +659,79 @@ def upload_and_apply(
                 "filename": filename,
                 "content_type": image.content_type or "",
             },
+        )
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            logger.warning("Failed to delete temporary upload file: %s", temp_path)
+
+    resp = _pipeline_result_to_response(result)
+    if result.error:
+        raise HTTPException(status_code=500, detail=resp.model_dump())
+    return resp
+
+
+@app.post("/edit-and-apply", response_model=JobResponse)
+def edit_and_apply(
+    image: UploadFile = File(..., description="Uploaded image file (jpg/png)."),  # noqa: B008
+    prompt: str = Form(..., description="Edit instruction prompt."),  # noqa: B008
+    provider: str | None = Form(None, description="Provider name (e.g., openai)."),  # noqa: B008
+    model: str | None = Form(None, description="Provider model ID."),  # noqa: B008
+    upscaler: str | None = Form(None, description="Upscaler to use."),  # noqa: B008
+    tv: str | None = Form(None, description="TV profile name from config."),  # noqa: B008
+    tv_ip: str | None = Form(None, description="TV IP address."),  # noqa: B008
+    matte: str = Form("none", description="Matte style."),  # noqa: B008
+    no_upload: bool = Form(False, description="Edit and process only; skip TV upload."),  # noqa: B008
+    no_switch: bool = Form(False, description="Upload but do not switch displayed art."),  # noqa: B008
+):
+    """Upload + edit an image with prompt, then post-process and apply to TV."""
+    from frameart.pipeline import run_edit_and_apply
+
+    edit_prompt = prompt.strip()
+    if not edit_prompt:
+        raise HTTPException(status_code=400, detail="Edit prompt cannot be empty.")
+
+    filename = image.filename or "upload"
+    suffix = Path(filename).suffix.lower()
+    mime_type = (image.content_type or "").lower()
+
+    if suffix and suffix not in _ALLOWED_UPLOAD_EXTS:
+        raise HTTPException(status_code=400, detail="Unsupported file type. Use JPG or PNG.")
+    if mime_type and mime_type not in _ALLOWED_UPLOAD_MIME:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported content type. Use image/jpeg or image/png.",
+        )
+
+    payload = image.file.read(_MAX_UPLOAD_BYTES + 1)
+    if not payload:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    if len(payload) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Uploaded file is too large (max 30MB).")
+
+    if not suffix:
+        suffix = ".png" if mime_type == "image/png" else ".jpg"
+
+    settings = _settings()
+    upload_dir = settings.data_dir / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = upload_dir / f"edit-upload-{uuid.uuid4().hex}{suffix}"
+    temp_path.write_bytes(payload)
+
+    try:
+        result = run_edit_and_apply(
+            settings,
+            str(temp_path),
+            edit_prompt,
+            provider_name=provider,
+            model=model,
+            upscaler_name=upscaler,
+            tv_name=tv,
+            tv_ip=tv_ip,
+            matte=matte,
+            no_upload=no_upload,
+            no_switch=no_switch,
         )
     finally:
         try:

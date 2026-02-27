@@ -16,6 +16,14 @@ from frameart.providers.base import GeneratedImage, ImageProvider
 
 logger = logging.getLogger(__name__)
 
+_SUPPORTED_INPUT_MIME = {
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/heic",
+    "image/heif",
+}
+
 
 class GoogleProvider(ImageProvider):
     """Generate images via Google's Generative Language API."""
@@ -84,6 +92,57 @@ class GoogleProvider(ImageProvider):
 
         return payload
 
+    def _detect_mime_type(self, image_bytes: bytes) -> str:
+        try:
+            img = Image.open(io.BytesIO(image_bytes))
+            if img.format:
+                return f"image/{img.format.lower()}"
+        except Exception:
+            pass
+        return "image/png"
+
+    def _normalize_edit_input(self, image_bytes: bytes) -> tuple[bytes, str]:
+        """Convert unsupported input formats to PNG for Google edit requests."""
+        mime_type = self._detect_mime_type(image_bytes)
+        if mime_type in _SUPPORTED_INPUT_MIME:
+            return image_bytes, mime_type
+
+        try:
+            img = Image.open(io.BytesIO(image_bytes))
+            if img.mode not in ("RGB", "RGBA"):
+                img = img.convert("RGB")
+            out = io.BytesIO()
+            img.save(out, format="PNG")
+            return out.getvalue(), "image/png"
+        except Exception:
+            # Last-resort fallback to raw bytes with PNG mime; upstream may still
+            # reject, but this avoids hard-failing for common camera formats.
+            return image_bytes, "image/png"
+
+    def _build_edit_payload(
+        self,
+        image_bytes: bytes,
+        prompt: str,
+        *,
+        negative_prompt: str | None = None,
+    ) -> dict[str, Any]:
+        payload = self._build_payload(prompt, negative_prompt=negative_prompt)
+        normalized_bytes, mime_type = self._normalize_edit_input(image_bytes)
+        b64_image = base64.b64encode(normalized_bytes).decode("ascii")
+        edit_text = prompt if not negative_prompt else f"{prompt}\n\nAvoid: {negative_prompt}"
+
+        # Include both text instruction and image input in the same user turn.
+        payload["contents"] = [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": edit_text},
+                    {"inlineData": {"mimeType": mime_type, "data": b64_image}},
+                ],
+            }
+        ]
+        return payload
+
     def _extract_image_part(self, data: dict[str, Any]) -> tuple[bytes, str]:
         """Extract base64 inline image bytes from API response."""
         candidates = data.get("candidates")
@@ -146,6 +205,86 @@ class GoogleProvider(ImageProvider):
         except Exception:
             return []
 
+    def _post_generate_content(
+        self,
+        *,
+        client: httpx.Client,
+        model_name: str,
+        payload: dict[str, Any],
+        operation: str,
+    ) -> httpx.Response:
+        url = f"{self._base_url.rstrip('/')}/models/{model_name}:generateContent"
+        resp = client.post(
+            url,
+            params={"key": self._api_key},
+            headers={"Content-Type": "application/json"},
+            json=payload,
+        )
+
+        # Compatibility retry: if IMAGE-only was rejected, retry with TEXT+IMAGE.
+        if resp.status_code == 400:
+            try:
+                err_payload = resp.json()
+            except Exception:
+                err_payload = {}
+            err_msg = (
+                err_payload.get("error", {}).get("message", "")
+                if isinstance(err_payload, dict)
+                else ""
+            )
+            modalities = payload.get("generationConfig", {}).get("responseModalities")
+            if (
+                isinstance(modalities, list)
+                and modalities == ["IMAGE"]
+                and isinstance(err_msg, str)
+                and "response modalities" in err_msg.lower()
+            ):
+                retry_payload = dict(payload)
+                retry_cfg = dict(payload.get("generationConfig", {}))
+                retry_cfg["responseModalities"] = ["TEXT", "IMAGE"]
+                retry_payload["generationConfig"] = retry_cfg
+                resp = client.post(
+                    url,
+                    params={"key": self._api_key},
+                    headers={"Content-Type": "application/json"},
+                    json=retry_payload,
+                )
+
+        if resp.status_code >= 400:
+            try:
+                body = resp.json()
+            except Exception:
+                body = resp.text
+
+            if resp.status_code == 404:
+                available = self._list_available_models(client)
+                hint = (
+                    f" Available models for this key: {', '.join(available[:10])}"
+                    if available
+                    else " Could not list available models for this key."
+                )
+                raise RuntimeError(
+                    "Google model "
+                    f"'{model_name}' not found or unsupported for generateContent.{hint}"
+                )
+
+            if resp.status_code == 400 and operation == "edit":
+                msg = ""
+                if isinstance(body, dict):
+                    msg = str(body.get("error", {}).get("message", ""))
+                elif isinstance(body, str):
+                    msg = body
+                lowered = msg.lower()
+                if "image input" in lowered or "inline" in lowered:
+                    raise RuntimeError(
+                        f"Google model '{model_name}' does not support image edits. "
+                        "Choose an image-edit-capable model."
+                    )
+
+            raise RuntimeError(f"Google API error {resp.status_code}: {body}")
+
+        return resp
+
     def generate(
         self,
         prompt: str,
@@ -168,64 +307,15 @@ class GoogleProvider(ImageProvider):
 
         payload = self._build_payload(prompt, negative_prompt=negative_prompt)
         model_name = self._normalized_model_name()
-        url = f"{self._base_url.rstrip('/')}/models/{model_name}:generateContent"
         logger.info("Google generate: model=%s", model_name)
 
         with httpx.Client(timeout=self._timeout) as client:
-            resp = client.post(
-                url,
-                params={"key": self._api_key},
-                headers={"Content-Type": "application/json"},
-                json=payload,
+            resp = self._post_generate_content(
+                client=client,
+                model_name=model_name,
+                payload=payload,
+                operation="generate",
             )
-
-            # Compatibility retry: if IMAGE-only was rejected, retry with TEXT+IMAGE.
-            if resp.status_code == 400:
-                try:
-                    err_payload = resp.json()
-                except Exception:
-                    err_payload = {}
-                err_msg = (
-                    err_payload.get("error", {}).get("message", "")
-                    if isinstance(err_payload, dict)
-                    else ""
-                )
-                modalities = payload.get("generationConfig", {}).get("responseModalities")
-                if (
-                    isinstance(modalities, list)
-                    and modalities == ["IMAGE"]
-                    and isinstance(err_msg, str)
-                    and "response modalities" in err_msg.lower()
-                ):
-                    retry_payload = dict(payload)
-                    retry_cfg = dict(payload.get("generationConfig", {}))
-                    retry_cfg["responseModalities"] = ["TEXT", "IMAGE"]
-                    retry_payload["generationConfig"] = retry_cfg
-                    resp = client.post(
-                        url,
-                        params={"key": self._api_key},
-                        headers={"Content-Type": "application/json"},
-                        json=retry_payload,
-                    )
-
-        if resp.status_code >= 400:
-            try:
-                body = resp.json()
-            except Exception:
-                body = resp.text
-            if resp.status_code == 404:
-                with httpx.Client(timeout=self._timeout) as client:
-                    available = self._list_available_models(client)
-                hint = (
-                    f" Available models for this key: {', '.join(available[:10])}"
-                    if available
-                    else " Could not list available models for this key."
-                )
-                raise RuntimeError(
-                    "Google model "
-                    f"'{model_name}' not found or unsupported for generateContent.{hint}"
-                )
-            raise RuntimeError(f"Google API error {resp.status_code}: {body}")
 
         data = resp.json()
         image_bytes, mime_type = self._extract_image_part(data)
@@ -242,5 +332,59 @@ class GoogleProvider(ImageProvider):
                 "provider": self.name,
                 "model": model_name,
                 "base_url": self._base_url,
+            },
+        )
+
+    def edit(
+        self,
+        image_bytes: bytes,
+        prompt: str,
+        *,
+        width: int | None = None,
+        height: int | None = None,
+        negative_prompt: str | None = None,
+        seed: int | None = None,
+        steps: int | None = None,
+        guidance: float | None = None,
+        **kwargs: Any,
+    ) -> GeneratedImage:
+        del width, height, seed, steps, guidance, kwargs
+        if not self._api_key:
+            raise RuntimeError(
+                "Google API key not set. "
+                "Set GOOGLE_API_KEY env var or providers.google.api_key"
+            )
+
+        model_name = self._normalized_model_name()
+        payload = self._build_edit_payload(
+            image_bytes,
+            prompt,
+            negative_prompt=negative_prompt,
+        )
+        logger.info("Google edit: model=%s", model_name)
+
+        with httpx.Client(timeout=self._timeout) as client:
+            resp = self._post_generate_content(
+                client=client,
+                model_name=model_name,
+                payload=payload,
+                operation="edit",
+            )
+
+        data = resp.json()
+        edited_bytes, mime_type = self._extract_image_part(data)
+        img = Image.open(io.BytesIO(edited_bytes))
+        w, h = img.size
+
+        return GeneratedImage(
+            data=edited_bytes,
+            mime_type=mime_type,
+            width=w,
+            height=h,
+            metadata={
+                "provider": self.name,
+                "model": model_name,
+                "base_url": self._base_url,
+                "operation": "edit",
             },
         )
