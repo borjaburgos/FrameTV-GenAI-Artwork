@@ -222,7 +222,8 @@ class GoogleProvider(ImageProvider):
                     else " Could not list available models for this key."
                 )
                 raise RuntimeError(
-                    f"Google model '{model_name}' not found or unsupported for generateContent.{hint}"
+                    "Google model "
+                    f"'{model_name}' not found or unsupported for generateContent.{hint}"
                 )
             raise RuntimeError(f"Google API error {resp.status_code}: {body}")
 
