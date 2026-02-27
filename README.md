@@ -8,7 +8,7 @@ FrameArt is a self-hosted tool that accepts a text description, generates an ima
 
 ## Features
 
-- **Multiple AI providers**: OpenAI DALL-E and Ollama/local models (pluggable registry)
+- **Multiple AI providers**: OpenAI, Ollama/local models, and Google Gemini image models (pluggable registry)
 - **Automatic post-processing**: Smart crop to 16:9, upscale/downscale to 4K UHD
 - **Samsung Frame TV integration**: Upload art and switch display via WebSocket API
 - **TV auto-discovery**: Find Frame TVs on your LAN automatically via UPnP/SSDP
@@ -410,6 +410,8 @@ See [`config.example.yaml`](config.example.yaml) for all options.
 | Variable | Description |
 |----------|-------------|
 | `OPENAI_API_KEY` | OpenAI API key for DALL-E |
+| `GOOGLE_API_KEY` | Google API key for Gemini image models |
+| `GOOGLE_BASE_URL` | Override Google API base URL (default: `https://generativelanguage.googleapis.com/v1beta`) |
 | `OLLAMA_BASE_URL` | Ollama server URL (default: `http://localhost:11434`) |
 | `FRAMEART_DATA_DIR` | Data directory (default: `/data/frameart` or `~/.local/share/frameart`) |
 | `FRAMEART_CONFIG` | Path to config file |
@@ -578,6 +580,7 @@ FrameArt attempts to switch to Art Mode automatically. If it fails, press the po
 ### Provider API errors
 
 - **OpenAI**: Ensure `OPENAI_API_KEY` is set and valid. DALL-E 3 requires a paid account.
+- **Google**: Ensure `GOOGLE_API_KEY` is set (or `providers.google.api_key`) and your configured model supports image generation.
 - **Ollama**: Ensure the Ollama server is running and reachable at the configured URL. Image generation requires a compatible model.
 
 ---
@@ -612,6 +615,7 @@ frameart/
     base.py           # ImageProvider interface
     registry.py       # Provider name -> class mapping
     openai_adapter.py # DALL-E integration
+    google_adapter.py # Google Gemini image generation integration
     ollama_adapter.py # Local model integration
   upscalers/
     base.py           # Upscaler interface
@@ -631,7 +635,7 @@ frameart/
 - **No authentication on the HTTP API.** The server binds to `127.0.0.1` by default. For LAN-only use this is typically fine; for anything else, put it behind a reverse proxy with authentication (e.g., Caddy, nginx + basic auth, or Authelia).
 - **No HTTPS on the API server.** Same recommendation: use a reverse proxy to terminate TLS.
 - **No rate limiting.** Each request triggers an AI provider API call. If exposed without rate limiting, it could rack up provider costs quickly.
-- **No image upload via HTTP multipart.** The `/apply` endpoint takes a filesystem path, not a file upload. This works for local and Docker-volume use cases but not for remote clients sending image bytes over HTTP.
+- **`/apply` is path-based.** The `/apply` endpoint takes a filesystem path, while multipart uploads are handled by `/upload-and-apply`.
 - **Async jobs are in-memory only.** They do not survive server restarts. Completed jobs are evicted after 200 entries to bound memory usage.
 
 ### Potential Future Work

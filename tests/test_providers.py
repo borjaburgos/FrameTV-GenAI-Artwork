@@ -13,6 +13,8 @@ class TestProviderRegistry:
         providers = available_providers()
         assert "openai" in providers
         assert "ollama" in providers
+        assert "google" in providers
+        assert "gemini" in providers
 
     def test_get_provider_openai(self):
         provider = get_provider("openai")
@@ -23,6 +25,11 @@ class TestProviderRegistry:
         provider = get_provider("ollama")
         assert isinstance(provider, ImageProvider)
         assert provider.name == "ollama"
+
+    def test_get_provider_google(self):
+        provider = get_provider("google")
+        assert isinstance(provider, ImageProvider)
+        assert provider.name == "google"
 
     def test_get_unknown_provider(self):
         with pytest.raises(KeyError, match="Unknown provider"):
