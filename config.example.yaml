@@ -4,7 +4,7 @@
 # Where artifacts, logs, and secrets are stored
 data_dir: /data/frameart
 
-# Default image generation provider: openai | ollama | gemini | anthropic
+# Default image generation provider: openai | ollama | google (or gemini alias)
 default_provider: openai
 # default_model: dall-e-3  # provider-specific model ID
 
@@ -41,11 +41,16 @@ providers:
     base_url: "http://localhost:11434"
     model: "sdxl"
     timeout: 300
-  # gemini:
+  # google:
   #   api_key: "..."
-  #   model: "imagen-3"
-  # anthropic:
-  #   api_key: "..."
+  #   # base_url: "https://generativelanguage.googleapis.com/v1beta"
+  #   model: "gemini-2.5-flash-image-preview"
+  #   # optional: expose multiple selectable models in web UI
+  #   extra:
+  #     models:
+  #       - "gemini-2.5-flash-image-preview"
+  #       - "nano-banana"
+  #       - "nano-banana-2"
 
 # --- Upscaler configurations ------------------------------------------------
 upscalers:

@@ -345,6 +345,88 @@ def _fetch_openai_image_models(openai_cfg) -> list[str]:
         return []
 
 
+def _is_google_image_model_name(model_id: str) -> bool:
+    """Heuristic filter for Google model IDs that can output images."""
+    if not model_id:
+        return False
+    lowered = model_id.lower()
+    image_markers = (
+        "image",
+        "imagen",
+        "nano-banana",
+    )
+    return any(marker in lowered for marker in image_markers)
+
+
+def _google_entry_supports_image(entry: dict[str, Any]) -> bool:
+    """Detect whether a Google model entry indicates image output support."""
+    for key in ("responseModalities", "outputModalities", "supportedOutputModalities"):
+        vals = entry.get(key)
+        if isinstance(vals, list):
+            normalized = {str(v).upper() for v in vals}
+            if "IMAGE" in normalized:
+                return True
+
+    methods = entry.get("supportedGenerationMethods")
+    if isinstance(methods, list):
+        normalized = {str(v) for v in methods}
+        if any(
+            m in normalized
+            for m in ("generateImages", "predictImage", "generateImage", "generateContent")
+        ):
+            # generateContent alone is not sufficient for image output, so keep
+            # this as a weak signal and fall back to name filter below.
+            pass
+
+    model_name = entry.get("name")
+    if isinstance(model_name, str) and model_name.startswith("models/"):
+        return _is_google_image_model_name(model_name[len("models/") :])
+    return False
+
+
+def _fetch_google_image_models(google_cfg) -> list[str]:
+    """Fetch available Google models supporting generateContent."""
+    api_key = (
+        (google_cfg.api_key if google_cfg else None)
+        or os.environ.get("GOOGLE_API_KEY")
+        or os.environ.get("GOOGLE_AI_API_KEY")
+        or ""
+    )
+    if not api_key:
+        return []
+
+    base_url = (
+        (google_cfg.base_url if google_cfg else None)
+        or os.environ.get("GOOGLE_BASE_URL")
+        or "https://generativelanguage.googleapis.com/v1beta"
+    )
+    url = base_url.rstrip("/") + "/models"
+
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            resp = client.get(url, params={"key": api_key})
+        resp.raise_for_status()
+        payload = resp.json()
+        items = payload.get("models") if isinstance(payload, dict) else []
+        models: list[str] = []
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                methods = item.get("supportedGenerationMethods")
+                if isinstance(methods, list) and "generateContent" not in methods:
+                    continue
+                if not _google_entry_supports_image(item):
+                    continue
+                model_name = item.get("name")
+                if isinstance(model_name, str) and model_name.startswith("models/"):
+                    models.append(model_name[len("models/") :])
+        return list(dict.fromkeys(models))
+    except Exception as e:
+        logger.warning("Google model discovery failed: %s", e)
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Routes — synchronous
 # ---------------------------------------------------------------------------
@@ -374,17 +456,70 @@ def list_providers():
     options: list[ProviderOption] = []
     for name in sorted(configured_names):
         cfg = settings.providers.get(name)
+        is_openai_family = name == "openai"
+        is_google_family = name in {"google", "gemini"}
         models: list[str] = []
-        if cfg and cfg.model:
+        if cfg and cfg.model and (
+            (not is_openai_family or _is_openai_image_model(cfg.model))
+            and (not is_google_family or _is_google_image_model_name(cfg.model))
+        ):
             models.append(cfg.model)
-        if name == settings.default_provider and settings.default_model:
+        extra_models = cfg.extra.get("models") if (cfg and isinstance(cfg.extra, dict)) else None
+        if isinstance(extra_models, list):
+            if is_openai_family:
+                models.extend(
+                    [
+                        m for m in extra_models
+                        if isinstance(m, str) and m and _is_openai_image_model(m)
+                    ]
+                )
+            elif is_google_family:
+                models.extend(
+                    [
+                        m for m in extra_models
+                        if isinstance(m, str) and m and _is_google_image_model_name(m)
+                    ]
+                )
+            else:
+                models.extend([m for m in extra_models if isinstance(m, str) and m])
+        if (
+            name == settings.default_provider
+            and settings.default_model
+            and (not is_openai_family or _is_openai_image_model(settings.default_model))
+            and (not is_google_family or _is_google_image_model_name(settings.default_model))
+        ):
             models.append(settings.default_model)
-        if name == "openai":
-            models.extend(_fetch_openai_image_models(cfg))
+        if is_openai_family:
+            models.extend(
+                [
+                    m for m in _fetch_openai_image_models(cfg)
+                    if _is_openai_image_model(m)
+                ]
+            )
+        if is_google_family:
+            models.extend(
+                [
+                    m for m in _fetch_google_image_models(cfg)
+                    if _is_google_image_model_name(m)
+                ]
+            )
 
         unique_models = list(dict.fromkeys(models))
-        default_model = settings.default_model if name == settings.default_provider else None
-        if not default_model and cfg and cfg.model:
+        default_model = None
+        if (
+            name == settings.default_provider
+            and settings.default_model
+            and (not is_openai_family or _is_openai_image_model(settings.default_model))
+            and (not is_google_family or _is_google_image_model_name(settings.default_model))
+        ):
+            default_model = settings.default_model
+        if (
+            not default_model
+            and cfg
+            and cfg.model
+            and (not is_openai_family or _is_openai_image_model(cfg.model))
+            and (not is_google_family or _is_google_image_model_name(cfg.model))
+        ):
             default_model = cfg.model
 
         options.append(

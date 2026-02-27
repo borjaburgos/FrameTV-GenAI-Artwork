@@ -10,11 +10,14 @@ _REGISTRY: dict[str, type[ImageProvider]] = {}
 
 def _populate_registry() -> None:
     """Lazily import and register all built-in providers."""
+    from frameart.providers.google_adapter import GoogleProvider
     from frameart.providers.ollama_adapter import OllamaProvider
     from frameart.providers.openai_adapter import OpenAIProvider
 
     _REGISTRY["openai"] = OpenAIProvider
     _REGISTRY["ollama"] = OllamaProvider
+    _REGISTRY["google"] = GoogleProvider
+    _REGISTRY["gemini"] = GoogleProvider
 
 
 def get_provider(name: str, config: ProviderConfig | None = None) -> ImageProvider:

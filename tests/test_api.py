@@ -138,6 +138,92 @@ class TestProviders:
         assert openai["models"] == ["dall-e-3", "gpt-image-1", "gpt-image-2"]
         mock_live_models.assert_called_once()
 
+    @patch("frameart.api._settings")
+    def test_extra_models_are_included(self, mock_settings):
+        settings = MagicMock()
+        settings.default_provider = "google"
+        settings.default_model = "nano-banana-2"
+        settings.providers = {
+            "google": MagicMock(
+                model="nano-banana",
+                extra={
+                    "models": [
+                        "nano-banana",
+                        "nano-banana-2",
+                        "gemini-2.5-flash-image-preview",
+                        "gemini-2.5-pro",
+                    ]
+                },
+            ),
+        }
+        mock_settings.return_value = settings
+
+        resp = client.get("/providers")
+        assert resp.status_code == 200
+        data = resp.json()
+        google = next(p for p in data["providers"] if p["name"] == "google")
+        assert google["models"] == [
+            "nano-banana",
+            "nano-banana-2",
+            "gemini-2.5-flash-image-preview",
+        ]
+
+    @patch("frameart.api._settings")
+    @patch("frameart.api._fetch_google_image_models")
+    def test_google_live_models_are_merged(self, mock_google_models, mock_settings):
+        settings = MagicMock()
+        settings.default_provider = "google"
+        settings.default_model = None
+        settings.providers = {
+            "google": MagicMock(
+                model="gemini-2.5-flash-image-preview",
+                extra={"models": ["nano-banana-2", "gemini-2.5-pro"]},
+            ),
+        }
+        mock_settings.return_value = settings
+        mock_google_models.return_value = [
+            "gemini-2.0-flash-exp-image-generation",
+            "nano-banana-2",
+            "gemini-2.5-flash",
+        ]
+
+        resp = client.get("/providers")
+        assert resp.status_code == 200
+        data = resp.json()
+        google = next(p for p in data["providers"] if p["name"] == "google")
+        assert google["models"] == [
+            "gemini-2.5-flash-image-preview",
+            "nano-banana-2",
+            "gemini-2.0-flash-exp-image-generation",
+        ]
+        mock_google_models.assert_called_once()
+
+    @patch("frameart.api._settings")
+    @patch("frameart.api._fetch_openai_image_models")
+    def test_openai_non_image_models_are_filtered(self, mock_openai_models, mock_settings):
+        settings = MagicMock()
+        settings.default_provider = "openai"
+        settings.default_model = "gpt-4o"
+        settings.providers = {
+            "openai": MagicMock(
+                model="gpt-4o-mini",
+                extra={"models": ["dall-e-3", "gpt-4o", "gpt-image-1.5"]},
+            ),
+        }
+        mock_settings.return_value = settings
+        mock_openai_models.return_value = ["gpt-image-1.5", "gpt-4o", "dall-e-2"]
+
+        resp = client.get("/providers")
+        assert resp.status_code == 200
+        data = resp.json()
+        openai = next(p for p in data["providers"] if p["name"] == "openai")
+        assert openai["models"] == [
+            "dall-e-3",
+            "gpt-image-1.5",
+            "dall-e-2",
+        ]
+        assert openai["default_model"] is None
+
 
 # ---------------------------------------------------------------------------
 # POST /generate
