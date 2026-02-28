@@ -19,6 +19,7 @@
     --warn: #f0bf5a;
     --surface2: #202a3c;
     --shadow: 0 20px 40px rgba(0, 0, 0, .32);
+    --mobile-nav-height: 66px;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -79,6 +80,134 @@
   .content { max-width: 1180px; margin: 0 auto; padding: 1.6rem 1.5rem 2rem; }
   .panel { display: none; }
   .panel.active { display: block; animation: fadeUp .24s ease; }
+  .page-eyebrow {
+    font-size: .74rem;
+    text-transform: uppercase;
+    letter-spacing: .8px;
+    color: var(--accent2);
+    margin-bottom: .4rem;
+  }
+  .page-intro {
+    margin-bottom: 1rem;
+    color: var(--muted);
+    font-size: .9rem;
+    line-height: 1.4;
+  }
+  .create-modes {
+    display: flex;
+    gap: .45rem;
+    flex-wrap: wrap;
+    margin-bottom: 1.1rem;
+  }
+  .create-modes button {
+    background: rgba(20, 27, 39, .78);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    border-radius: 999px;
+    padding: .48rem .9rem;
+    font-size: .86rem;
+    cursor: pointer;
+    transition: border-color .16s ease, color .16s ease, background .16s ease;
+  }
+  .create-modes button.active {
+    color: var(--text);
+    border-color: rgba(87, 166, 255, .5);
+    background: rgba(87, 166, 255, .15);
+  }
+  .create-modes button:hover { color: var(--text); border-color: rgba(87, 166, 255, .35); }
+  .create-panel { display: none; }
+  .create-panel.active { display: block; }
+  .create-panel {
+    background: linear-gradient(180deg, rgba(28, 36, 52, .88) 0%, rgba(20, 27, 39, .92) 100%);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 1rem;
+    box-shadow: var(--shadow);
+  }
+  .create-panel + .create-panel { margin-top: 1rem; }
+  .create-panel .section-heading h2 { font-size: 1.1rem; }
+  .create-panel .page-intro { margin-bottom: .8rem; }
+  .selection-bar {
+    position: sticky;
+    bottom: .7rem;
+    z-index: 14;
+    margin-top: 1rem;
+    background: rgba(20, 29, 43, .95);
+    border: 1px solid rgba(87, 166, 255, .35);
+    border-radius: 12px;
+    padding: .65rem .75rem;
+    display: none;
+    align-items: center;
+    justify-content: space-between;
+    gap: .8rem;
+    box-shadow: 0 10px 28px rgba(0, 0, 0, .35);
+    backdrop-filter: blur(5px);
+  }
+  .selection-bar.visible { display: flex; }
+  .selection-meta { font-size: .86rem; color: var(--text); }
+  .selection-actions { display: flex; gap: .45rem; flex-wrap: wrap; }
+  .selection-actions .btn { margin: 0; }
+  .mobile-nav {
+    display: none;
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: var(--mobile-nav-height);
+    z-index: 80;
+    background: rgba(9, 12, 18, .95);
+    border-top: 1px solid var(--border);
+    backdrop-filter: blur(8px);
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    padding: .35rem .5rem max(.5rem, env(safe-area-inset-bottom));
+    gap: .35rem;
+  }
+  .mobile-nav button {
+    border: 1px solid transparent;
+    border-radius: 10px;
+    background: transparent;
+    color: var(--muted);
+    font-size: .78rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .mobile-nav button.active {
+    color: var(--text);
+    border-color: rgba(95, 218, 150, .45);
+    background: rgba(95, 218, 150, .12);
+  }
+  .settings-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 1rem;
+    margin-top: 1rem;
+  }
+  .settings-card {
+    background: linear-gradient(180deg, rgba(28, 36, 52, .92) 0%, rgba(21, 28, 40, .95) 100%);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1rem;
+    box-shadow: var(--shadow);
+  }
+  .settings-card h3 { font-size: 1rem; margin-bottom: .4rem; }
+  .settings-card p { color: var(--muted); font-size: .86rem; line-height: 1.4; }
+  .settings-list {
+    margin-top: .7rem;
+    display: flex;
+    flex-direction: column;
+    gap: .5rem;
+  }
+  .settings-item {
+    display: flex;
+    justify-content: space-between;
+    gap: .6rem;
+    padding: .45rem .6rem;
+    border: 1px solid rgba(168, 179, 200, .12);
+    border-radius: 8px;
+    font-size: .82rem;
+    color: var(--muted);
+  }
+  .settings-item strong { color: var(--text); font-weight: 600; }
 
   /* --- Forms --- */
   label { display: block; color: var(--muted); font-size: .8rem; margin-bottom: .25rem; }
@@ -418,8 +547,7 @@
     }
     .header h1 { font-size: 1.25rem; }
     .header-spacer { display: none; }
-    .tabs { order: 3; width: 100%; padding-bottom: .15rem; }
-    .tabs button { padding: .48rem .85rem; font-size: .9rem; }
+    .tabs { display: none; }
     #btn-shortcuts { margin-left: auto; }
     .row { flex-direction: column; gap: .6rem; }
     .row > * { min-width: 0; }
@@ -430,6 +558,7 @@
       flex: 1 1 180px;
       margin-bottom: 0;
     }
+    .create-modes button { flex: 1 1 140px; text-align: center; }
     #tv-art-select { width: 100% !important; margin-bottom: 0 !important; }
     .modal-dialog {
       width: min(96vw, 620px);
@@ -438,7 +567,15 @@
       overflow: auto;
       padding: 1rem;
     }
-    .content { padding: 1.1rem .9rem 1.5rem; }
+    .content { padding: 1.1rem .9rem calc(var(--mobile-nav-height) + 1.4rem); }
+    .mobile-nav { display: grid; }
+    .selection-bar {
+      bottom: calc(var(--mobile-nav-height) + .4rem);
+      flex-direction: column;
+      align-items: flex-start;
+    }
+    .selection-actions { width: 100%; }
+    .selection-actions .btn { flex: 1 1 145px; justify-content: center; }
   }
 
   @media (max-width: 640px) {
@@ -447,6 +584,8 @@
     input, select, textarea { font-size: .92rem; padding: .62rem .74rem; }
     .btn { width: 100%; justify-content: center; }
     .btn-small { width: auto; }
+    .create-modes { display: grid; grid-template-columns: 1fr 1fr; gap: .45rem; }
+    .create-modes button { width: 100%; }
     .gallery { grid-template-columns: 1fr; gap: .85rem; }
     .gen-jobs-grid { grid-template-columns: 1fr; }
     .tv-art-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -477,6 +616,8 @@
       flex: 1 1 140px;
       width: auto;
     }
+    .selection-actions .btn { width: 100%; }
+    .content { padding-bottom: calc(var(--mobile-nav-height) + 1.6rem); }
   }
 </style>
 </head>
@@ -485,161 +626,160 @@
 <div class="header">
   <h1>Frame<span>Art</span></h1>
   <div class="tabs">
-    <button class="active" data-tab="generate">Generate</button>
-    <button data-tab="gallery">Gallery</button>
-    <button data-tab="public">Public Domain</button>
-    <button data-tab="upload">Upload</button>
-    <button data-tab="tvs">TVs</button>
+    <button class="active" data-page="create">Create</button>
+    <button data-page="library">Library</button>
+    <button data-page="tvs">TVs</button>
+    <button data-page="settings">Settings</button>
   </div>
   <div class="header-spacer"></div>
   <button class="btn btn-ghost btn-small" id="btn-shortcuts">Shortcuts</button>
 </div>
 
-<!-- ===== Generate ===== -->
 <div class="content">
-<div class="panel active" id="panel-generate">
-  <label for="prompt">Prompt</label>
-  <textarea id="prompt" placeholder="A peaceful mountain lake at sunset, reflections in still water..."></textarea>
-
-  <div class="row">
-    <div>
-      <label for="style">Style</label>
-      <select id="style"><option value="">None</option></select>
-    </div>
-    <div>
-      <label for="tv-select">Send to TV</label>
-      <select id="tv-select"><option value="">Generate only (no TV)</option></select>
-    </div>
+<div class="panel active" id="panel-create">
+  <div class="page-eyebrow">Create</div>
+  <div class="section-heading">
+    <h2>Create Artwork</h2>
+  </div>
+  <p class="page-intro">
+    Choose how you want to create artwork. All outputs are processed through the same 16:9 + 4K pipeline before showing in Library or sending to TV.
+  </p>
+  <div class="create-modes">
+    <button class="active" data-mode="ai">AI</button>
+    <button data-mode="public">Public Domain</button>
+    <button data-mode="upload">Upload</button>
+    <button data-mode="edit">Edit</button>
   </div>
 
-  <div class="row">
-    <div>
-      <label for="provider">Provider</label>
-      <select id="provider"></select>
-    </div>
-    <div>
-      <label for="model">Model</label>
-      <select id="model"></select>
-    </div>
-  </div>
+  <div class="create-panel active" id="create-panel-ai">
+    <p class="page-intro">Generate new artwork with your configured image provider and optional style.</p>
+    <label for="prompt">Prompt</label>
+    <textarea id="prompt" placeholder="A peaceful mountain lake at sunset, reflections in still water..."></textarea>
 
-  <button class="btn" id="btn-generate">Generate</button>
-
-  <div class="status-bar" id="gen-status">
-    <div class="label">Status</div>
-    <div class="value" id="gen-status-text">...</div>
-  </div>
-
-  <div id="gen-preview" style="margin-top:1rem; display:none;">
-    <img id="gen-preview-img" style="width:100%; border-radius:8px; aspect-ratio:16/9; object-fit:cover;">
-  </div>
-
-  <div class="gen-jobs">
-    <div class="section-heading" style="margin-bottom:.5rem;">
-      <h3>In Progress Jobs</h3>
-      <div class="btn-group">
-        <button class="btn btn-secondary btn-small" id="btn-gen-jobs-clear">Clear Finished</button>
+    <div class="row">
+      <div>
+        <label for="style">Style</label>
+        <select id="style"><option value="">None</option></select>
+      </div>
+      <div>
+        <label for="tv-select">Send to TV</label>
+        <select id="tv-select"><option value="">Generate only (no TV)</option></select>
       </div>
     </div>
-    <div class="gen-jobs-grid" id="gen-jobs-grid"></div>
-    <div class="empty" id="gen-jobs-empty">No active generation jobs.</div>
-  </div>
-</div>
 
-<!-- ===== Gallery ===== -->
-<div class="panel" id="panel-gallery">
-  <div class="section-heading">
-    <h2>Recent Artwork</h2>
-    <div class="btn-group">
-      <button class="btn btn-secondary" id="btn-refresh-gallery">Refresh</button>
-      <button class="btn btn-secondary" id="btn-gallery-select-all">Select All</button>
-      <button class="btn btn-secondary" id="btn-gallery-clear-selection">Clear</button>
-      <button class="btn btn-danger" id="btn-gallery-delete-selected" disabled>Delete Selected</button>
+    <div class="row">
+      <div>
+        <label for="provider">Provider</label>
+        <select id="provider"></select>
+      </div>
+      <div>
+        <label for="model">Model</label>
+        <select id="model"></select>
+      </div>
     </div>
-  </div>
-  <div class="gallery" id="gallery-grid"></div>
-  <div class="empty" id="gallery-empty" style="display:none;">No artwork generated yet.</div>
-</div>
 
-<!-- ===== Public Domain ===== -->
-<div class="panel" id="panel-public">
-  <div class="section-heading">
-    <h2>Public Domain Artwork</h2>
-  </div>
-  <div class="row">
-    <div>
-      <label for="public-source">Source</label>
-      <select id="public-source">
-        <option value="met">The Met</option>
-        <option value="aic">Art Institute of Chicago</option>
-        <option value="cma">Cleveland Museum of Art</option>
-        <option value="europeana">Europeana</option>
-      </select>
-    </div>
-    <div>
-      <label for="public-query">Search</label>
-      <input id="public-query" placeholder="e.g. monet, landscape, ukiyo-e">
-      <span class="hint-inline">Tip: press <kbd>/</kbd> to focus search</span>
-    </div>
-    <div style="align-self:end;">
-      <button class="btn btn-secondary" id="btn-public-search">Search</button>
-    </div>
-  </div>
-  <div class="row">
-    <div>
-      <label for="public-tv-select">Display on TV</label>
-      <select id="public-tv-select"></select>
-    </div>
-    <div>
-      <label for="public-matte-select">Matte Style</label>
-      <select id="public-matte-select">
-        <option value="none">none</option>
-        <option value="shadowbox_polar">shadowbox_polar</option>
-      </select>
-    </div>
-  </div>
-  <div class="status-bar" id="public-status">
-    <div class="value" id="public-status-text"></div>
-  </div>
-  <div class="gallery" id="public-grid"></div>
-  <div class="empty" id="public-empty">Search public-domain catalogs to display art on your TV.</div>
-</div>
+    <button class="btn" id="btn-generate">Generate</button>
 
-<!-- ===== Upload ===== -->
-<div class="panel" id="panel-upload">
-  <div class="section-heading">
-    <h2>Upload Your Own Image</h2>
-  </div>
-  <p style="font-size:.9rem; color:var(--muted); margin-bottom:1rem;">
-    Upload JPG or PNG from desktop, iOS, or Android. FrameArt will process it to 16:9 and 4K as needed, then display it on your TV.
-  </p>
-  <div class="row">
-    <div>
-      <label for="own-image-file">Image File</label>
-      <input id="own-image-file" type="file" accept=".jpg,.jpeg,.png,image/jpeg,image/png">
+    <div class="status-bar" id="gen-status">
+      <div class="label">Status</div>
+      <div class="value" id="gen-status-text">...</div>
     </div>
-    <div>
-      <label for="own-upload-tv-select">Display on TV</label>
-      <select id="own-upload-tv-select"></select>
+
+    <div id="gen-preview" style="margin-top:1rem; display:none;">
+      <img id="gen-preview-img" style="width:100%; border-radius:8px; aspect-ratio:16/9; object-fit:cover;">
     </div>
-    <div>
-      <label for="own-upload-matte-select">Matte Style</label>
-      <select id="own-upload-matte-select">
-        <option value="none">none</option>
-        <option value="shadowbox_polar">shadowbox_polar</option>
-      </select>
+
+    <div class="gen-jobs">
+      <div class="section-heading" style="margin-bottom:.5rem;">
+        <h3>In Progress Jobs</h3>
+        <div class="btn-group">
+          <button class="btn btn-secondary btn-small" id="btn-gen-jobs-clear">Clear Finished</button>
+        </div>
+      </div>
+      <div class="gen-jobs-grid" id="gen-jobs-grid"></div>
+      <div class="empty" id="gen-jobs-empty">No active generation jobs.</div>
     </div>
-  </div>
-  <button class="btn" id="btn-own-upload">Process and Display</button>
-  <div class="status-bar" id="own-upload-status">
-    <div class="value" id="own-upload-status-text"></div>
   </div>
 
-  <div class="tv-art-section" style="margin-top:1rem;">
+  <div class="create-panel" id="create-panel-public">
+    <div class="section-heading">
+      <h2>Public Domain Artwork</h2>
+    </div>
+    <p class="page-intro">Search open-access museum catalogs and display processed artwork directly on your TV.</p>
+    <div class="row">
+      <div>
+        <label for="public-source">Source</label>
+        <select id="public-source">
+          <option value="met">The Met</option>
+          <option value="aic">Art Institute of Chicago</option>
+          <option value="cma">Cleveland Museum of Art</option>
+          <option value="europeana">Europeana</option>
+        </select>
+      </div>
+      <div>
+        <label for="public-query">Search</label>
+        <input id="public-query" placeholder="e.g. monet, landscape, ukiyo-e">
+        <span class="hint-inline">Tip: press <kbd>/</kbd> to focus search</span>
+      </div>
+      <div style="align-self:end;">
+        <button class="btn btn-secondary" id="btn-public-search">Search</button>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="public-tv-select">Display on TV</label>
+        <select id="public-tv-select"></select>
+      </div>
+      <div>
+        <label for="public-matte-select">Matte Style</label>
+        <select id="public-matte-select">
+          <option value="none">none</option>
+          <option value="shadowbox_polar">shadowbox_polar</option>
+        </select>
+      </div>
+    </div>
+    <div class="status-bar" id="public-status">
+      <div class="value" id="public-status-text"></div>
+    </div>
+    <div class="gallery" id="public-grid"></div>
+    <div class="empty" id="public-empty">Search public-domain catalogs to display art on your TV.</div>
+  </div>
+
+  <div class="create-panel" id="create-panel-upload">
+    <div class="section-heading">
+      <h2>Upload Your Own Image</h2>
+    </div>
+    <p class="page-intro">
+      Upload JPG or PNG from desktop, iOS, or Android. FrameArt will process it to 16:9 and 4K as needed, then display it on your TV.
+    </p>
+    <div class="row">
+      <div>
+        <label for="own-image-file">Image File</label>
+        <input id="own-image-file" type="file" accept=".jpg,.jpeg,.png,image/jpeg,image/png">
+      </div>
+      <div>
+        <label for="own-upload-tv-select">Display on TV</label>
+        <select id="own-upload-tv-select"></select>
+      </div>
+      <div>
+        <label for="own-upload-matte-select">Matte Style</label>
+        <select id="own-upload-matte-select">
+          <option value="none">none</option>
+          <option value="shadowbox_polar">shadowbox_polar</option>
+        </select>
+      </div>
+    </div>
+    <button class="btn" id="btn-own-upload">Process and Display</button>
+    <div class="status-bar" id="own-upload-status">
+      <div class="value" id="own-upload-status-text"></div>
+    </div>
+  </div>
+
+  <div class="create-panel" id="create-panel-edit">
     <div class="section-heading">
       <h2>Edit Uploaded Image</h2>
     </div>
-    <p style="font-size:.85rem; color:var(--muted); margin-bottom:.8rem;">
+    <p class="page-intro">
       Upload a picture and describe the edit (example: impressionist rendition of this family picture).
     </p>
     <div class="row">
@@ -680,12 +820,38 @@
   </div>
 </div>
 
+<div class="panel" id="panel-library">
+  <div class="page-eyebrow">Library</div>
+  <div class="section-heading">
+    <h2>Artwork Library</h2>
+    <div class="btn-group">
+      <button class="btn btn-secondary" id="btn-refresh-gallery">Refresh</button>
+      <button class="btn btn-secondary" id="btn-gallery-select-all">Select All</button>
+      <button class="btn btn-secondary" id="btn-gallery-clear-selection">Clear</button>
+      <button class="btn btn-danger" id="btn-gallery-delete-selected" disabled>Delete Selected</button>
+    </div>
+  </div>
+  <p class="page-intro">Browse everything processed by FrameArt. Select multiple items for bulk actions.</p>
+  <div class="gallery" id="gallery-grid"></div>
+  <div class="empty" id="gallery-empty" style="display:none;">No artwork generated yet.</div>
+  <div class="selection-bar" id="library-selection-bar">
+    <div class="selection-meta" id="library-selection-text">0 selected</div>
+    <div class="selection-actions">
+      <button class="btn btn-secondary btn-small" id="btn-library-display-selected" disabled>Display Selected</button>
+      <button class="btn btn-danger btn-small" id="btn-library-delete-selected-inline" disabled>Delete Selected</button>
+      <button class="btn btn-ghost btn-small" id="btn-library-clear-selection-inline" disabled>Clear</button>
+    </div>
+  </div>
+</div>
+
 <!-- ===== TVs ===== -->
 <div class="panel" id="panel-tvs">
+  <div class="page-eyebrow">TVs</div>
   <div class="section-heading">
     <h2>TVs</h2>
     <button class="btn btn-secondary" id="btn-discover">Scan Network</button>
   </div>
+  <p class="page-intro">Manage connected TVs and control the art already stored on each device.</p>
   <div id="tv-list"></div>
   <div class="empty" id="tv-empty">Loading configured TVs...</div>
 
@@ -703,6 +869,43 @@
     </div>
     <div class="tv-art-grid" id="tv-art-grid"></div>
     <div class="empty" id="tv-art-empty" style="display:none;">Select a TV and click "Load Art".</div>
+    <div class="selection-bar" id="tv-selection-bar">
+      <div class="selection-meta" id="tv-selection-text">0 selected</div>
+      <div class="selection-actions">
+        <button class="btn btn-secondary btn-small" id="btn-tv-display-selected" disabled>Display Selected</button>
+        <button class="btn btn-secondary btn-small" id="btn-tv-matte-selected" disabled>Change Matte</button>
+        <button class="btn btn-danger btn-small" id="btn-tv-delete-selected-inline" disabled>Delete Selected</button>
+        <button class="btn btn-ghost btn-small" id="btn-tv-clear-selection-inline" disabled>Clear</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="panel" id="panel-settings">
+  <div class="page-eyebrow">Settings</div>
+  <div class="section-heading">
+    <h2>Settings</h2>
+  </div>
+  <p class="page-intro">Manage providers and defaults. Generation and edit settings live under Create.</p>
+  <div class="settings-grid">
+    <div class="settings-card">
+      <h3>Providers</h3>
+      <p>Configured providers and image-capable models currently available.</p>
+      <div class="settings-list" id="settings-provider-list">
+        <div class="settings-item"><strong>Loading...</strong><span></span></div>
+      </div>
+    </div>
+    <div class="settings-card">
+      <h3>TV Availability</h3>
+      <p>Configured and discovered TVs in this session.</p>
+      <div class="settings-list" id="settings-tv-list">
+        <div class="settings-item"><strong>Configured TVs</strong><span id="settings-tv-count">0</span></div>
+      </div>
+    </div>
+    <div class="settings-card">
+      <h3>Hints</h3>
+      <p>Use <kbd>Ctrl</kbd>+<kbd>Enter</kbd> to generate quickly in Create > AI. Use <kbd>/</kbd> to focus search fields.</p>
+    </div>
   </div>
 </div>
 </div>
@@ -752,22 +955,52 @@
   </div>
 </div>
 
+<!-- Batch Upload-to-TV modal (for multiple library items) -->
+<div class="modal-overlay" id="batch-upload-modal">
+  <div class="modal-dialog">
+    <h3>Display Selected Artwork</h3>
+    <p style="font-size:.85rem; color:var(--muted); margin-bottom:.8rem;">
+      Selected: <strong id="batch-upload-count">0</strong>
+    </p>
+    <label for="batch-upload-tv-select">TV</label>
+    <select id="batch-upload-tv-select"></select>
+    <label for="batch-upload-matte-select">Matte Style</label>
+    <select id="batch-upload-matte-select">
+      <option value="none">none (default)</option>
+      <option value="shadowbox_polar">shadowbox_polar</option>
+    </select>
+    <div class="modal-actions">
+      <button class="btn btn-secondary btn-small" id="btn-batch-upload-cancel">Cancel</button>
+      <button class="btn btn-small" id="btn-batch-upload-apply">Display Selected</button>
+    </div>
+    <div class="status-bar" id="batch-upload-status" style="margin-top:.8rem;">
+      <div class="value" id="batch-upload-status-text"></div>
+    </div>
+  </div>
+</div>
+
 <div class="modal-overlay" id="shortcuts-modal">
   <div class="modal-dialog">
     <h3>Keyboard Shortcuts</h3>
     <div class="shortcut-grid">
-      <div class="label">Generate on Generate tab</div>
+      <div class="label">Generate on Create &gt; AI</div>
       <div class="keys"><kbd>Ctrl</kbd><kbd>Enter</kbd></div>
-      <div class="label">Switch to Generate</div>
-      <div class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>G</kbd></div>
-      <div class="label">Switch to Gallery</div>
-      <div class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>Y</kbd></div>
-      <div class="label">Switch to Public Domain</div>
-      <div class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>P</kbd></div>
-      <div class="label">Switch to Upload</div>
-      <div class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>U</kbd></div>
+      <div class="label">Switch to Create</div>
+      <div class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>C</kbd></div>
+      <div class="label">Switch to Library</div>
+      <div class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>L</kbd></div>
       <div class="label">Switch to TVs</div>
       <div class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>T</kbd></div>
+      <div class="label">Switch to Settings</div>
+      <div class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>S</kbd></div>
+      <div class="label">Create mode: AI</div>
+      <div class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>A</kbd></div>
+      <div class="label">Create mode: Public Domain</div>
+      <div class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>P</kbd></div>
+      <div class="label">Create mode: Upload</div>
+      <div class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>U</kbd></div>
+      <div class="label">Create mode: Edit</div>
+      <div class="keys"><kbd>Alt</kbd><kbd>Shift</kbd><kbd>E</kbd></div>
       <div class="label">Focus primary search</div>
       <div class="keys"><kbd>/</kbd></div>
       <div class="label">Close open modal</div>
@@ -780,6 +1013,12 @@
 </div>
 
 <div class="toast-wrap" id="toast-wrap" aria-live="polite"></div>
+<div class="mobile-nav" id="mobile-nav">
+  <button class="active" data-page="create">Create</button>
+  <button data-page="library">Library</button>
+  <button data-page="tvs">TVs</button>
+  <button data-page="settings">Settings</button>
+</div>
 
 <script>
 (function() {
@@ -795,6 +1034,8 @@
   const generationJobs = new Map();
   let generationPollTimer = null;
   const storageKeys = {
+    page: 'frameart.page',
+    createMode: 'frameart.create.mode',
     tvGenerate: 'frameart.tv.generate',
     tvPublic: 'frameart.tv.public',
     tvOwnUpload: 'frameart.tv.own_upload',
@@ -910,6 +1151,24 @@
       }
       refreshModelSelectFor(editProviderSel.value, rememberedEditModel || '', 'edit-model');
     }
+    renderSettingsProviders();
+  }
+
+  function renderSettingsProviders() {
+    const container = document.getElementById('settings-provider-list');
+    if (!container) return;
+    if (!configuredProviders.length) {
+      container.innerHTML = '<div class="settings-item"><strong>No providers configured</strong><span></span></div>';
+      return;
+    }
+    container.innerHTML = configuredProviders.map((provider) => {
+      const modelCount = Array.isArray(provider.models) ? provider.models.length : 0;
+      const suffix = provider.is_default ? 'default' : (provider.default_model || 'custom');
+      return '<div class="settings-item">' +
+        '<strong>' + esc(provider.name) + '</strong>' +
+        '<span>' + modelCount + ' model(s) · ' + esc(suffix) + '</span>' +
+        '</div>';
+    }).join('');
   }
 
   function setButtonBusy(btn, busyText) {
@@ -947,6 +1206,7 @@
       'tv-select',
       'tv-art-select',
       'upload-tv-select',
+      'batch-upload-tv-select',
       'public-tv-select',
       'own-upload-tv-select',
       'edit-upload-tv-select',
@@ -982,7 +1242,7 @@
           id === 'public-tv-select' ? storageKeys.tvPublic :
           id === 'own-upload-tv-select' ? storageKeys.tvOwnUpload :
           id === 'edit-upload-tv-select' ? storageKeys.tvEditUpload :
-          id === 'upload-tv-select' ? storageKeys.tvUpload :
+          id === 'upload-tv-select' || id === 'batch-upload-tv-select' ? storageKeys.tvUpload :
           storageKeys.tvArt
         );
         if (remembered && [...sel.options].some(o => o.value === remembered)) {
@@ -1002,6 +1262,7 @@
       list.innerHTML = '';
       empty.textContent = 'No TVs found. Click "Scan Network" or configure TVs in config.yaml.';
       empty.style.display = 'block';
+      renderSettingsTVSummary();
       return;
     }
     empty.style.display = 'none';
@@ -1023,34 +1284,72 @@
         </div>`;
     }).join('');
     animateStaggeredChildren(list, '.tv-card');
+    renderSettingsTVSummary();
+  }
+
+  function renderSettingsTVSummary() {
+    const countEl = document.getElementById('settings-tv-count');
+    if (countEl) countEl.textContent = String(knownTVs.length);
   }
 
   // =========================================================================
-  // Tabs
+  // Navigation (top-level pages + create modes)
   // =========================================================================
-  const tabs = document.querySelectorAll('.tabs button');
+  const pageTabs = document.querySelectorAll('.tabs button, .mobile-nav button');
   const panels = document.querySelectorAll('.panel');
+  const createModeTabs = document.querySelectorAll('.create-modes button');
+  const createPanels = document.querySelectorAll('.create-panel');
 
-  function setActiveTab(tabName) {
-    tabs.forEach(t => t.classList.toggle('active', t.dataset.tab === tabName));
-    panels.forEach(p => p.classList.toggle('active', p.id === ('panel-' + tabName)));
-    if (tabName === 'gallery') loadGallery();
-    if (tabName === 'generate') loadGenerationJobsFromAPI();
+  function setActiveCreateMode(modeName) {
+    createModeTabs.forEach((tab) => tab.classList.toggle('active', tab.dataset.mode === modeName));
+    createPanels.forEach((panel) => panel.classList.toggle('active', panel.id === ('create-panel-' + modeName)));
+    localStorage.setItem(storageKeys.createMode, modeName);
+    if (modeName === 'ai') loadGenerationJobsFromAPI();
   }
 
-  tabs.forEach(btn => {
+  function setActivePage(pageName) {
+    pageTabs.forEach((tab) => tab.classList.toggle('active', tab.dataset.page === pageName));
+    panels.forEach((panel) => panel.classList.toggle('active', panel.id === ('panel-' + pageName)));
+    localStorage.setItem(storageKeys.page, pageName);
+    if (pageName === 'library') loadGallery();
+    if (pageName === 'create' && getActiveCreateModeName() === 'ai') loadGenerationJobsFromAPI();
+  }
+
+  pageTabs.forEach(btn => {
     btn.addEventListener('click', () => {
-      setActiveTab(btn.dataset.tab);
+      setActivePage(btn.dataset.page);
     });
   });
 
-  function getActiveTabName() {
+  createModeTabs.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      setActiveCreateMode(btn.dataset.mode);
+    });
+  });
+
+  function getActivePageName() {
     const activeTab = document.querySelector('.tabs button.active');
-    return activeTab ? activeTab.dataset.tab : 'generate';
+    return activeTab ? activeTab.dataset.page : 'create';
   }
 
-  // Hydrate generate jobs from API on initial load.
-  loadGenerationJobsFromAPI();
+  function getActiveCreateModeName() {
+    const activeMode = document.querySelector('.create-modes button.active');
+    return activeMode ? activeMode.dataset.mode : 'ai';
+  }
+
+  const rememberedCreateMode = localStorage.getItem(storageKeys.createMode);
+  if (rememberedCreateMode && [...createModeTabs].some((tab) => tab.dataset.mode === rememberedCreateMode)) {
+    setActiveCreateMode(rememberedCreateMode);
+  } else {
+    setActiveCreateMode('ai');
+  }
+
+  const rememberedPage = localStorage.getItem(storageKeys.page);
+  if (rememberedPage && [...pageTabs].some((tab) => tab.dataset.page === rememberedPage)) {
+    setActivePage(rememberedPage);
+  } else {
+    setActivePage('create');
+  }
 
   // =========================================================================
   // Startup: load styles + configured TVs in parallel
@@ -1067,6 +1366,12 @@
   fetch('/providers').then(r => r.json()).then((payload) => {
     refreshProviderSelects(payload);
   }).catch(() => {
+    configuredProviders = [{
+      name: 'openai',
+      is_default: true,
+      models: [],
+      default_model: '',
+    }];
     const providerSel = document.getElementById('provider');
     const modelSel = document.getElementById('model');
     const editProviderSel = document.getElementById('edit-provider');
@@ -1077,6 +1382,7 @@
     editProviderSel.innerHTML = '<option value="openai">openai</option>';
     editProviderSel.value = 'openai';
     editModelSel.innerHTML = '<option value="">Provider default</option>';
+    renderSettingsProviders();
     showToast('Failed to load configured providers; using fallback defaults.', 'warn');
   });
 
@@ -1117,6 +1423,9 @@
   document.getElementById('upload-tv-select').addEventListener('change', (e) => {
     localStorage.setItem(storageKeys.tvUpload, e.target.value || '');
   });
+  document.getElementById('batch-upload-tv-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.tvUpload, e.target.value || '');
+  });
   document.getElementById('public-tv-select').addEventListener('change', (e) => {
     localStorage.setItem(storageKeys.tvPublic, e.target.value || '');
   });
@@ -1138,6 +1447,9 @@
   document.getElementById('upload-matte-select').addEventListener('change', (e) => {
     localStorage.setItem(storageKeys.matteUpload, e.target.value || '');
   });
+  document.getElementById('batch-upload-matte-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.matteUpload, e.target.value || '');
+  });
   const rememberedPublicMatte = localStorage.getItem(storageKeys.mattePublic);
   if (rememberedPublicMatte) {
     const sel = document.getElementById('public-matte-select');
@@ -1157,6 +1469,8 @@
   if (rememberedUploadMatte) {
     const sel = document.getElementById('upload-matte-select');
     if ([...sel.options].some(o => o.value === rememberedUploadMatte)) sel.value = rememberedUploadMatte;
+    const batchSel = document.getElementById('batch-upload-matte-select');
+    if ([...batchSel.options].some(o => o.value === rememberedUploadMatte)) batchSel.value = rememberedUploadMatte;
   }
 
   // =========================================================================
@@ -1418,11 +1732,24 @@
   // =========================================================================
   // Gallery
   // =========================================================================
-  function updateDeleteGalleryButton() {
+  function updateGallerySelectionUI() {
     const btn = document.getElementById('btn-gallery-delete-selected');
+    const inlineDeleteBtn = document.getElementById('btn-library-delete-selected-inline');
+    const inlineDisplayBtn = document.getElementById('btn-library-display-selected');
+    const inlineClearBtn = document.getElementById('btn-library-clear-selection-inline');
+    const bar = document.getElementById('library-selection-bar');
+    const text = document.getElementById('library-selection-text');
     const n = selectedGalleryJobIds.size;
+    const hasSelection = n > 0;
+    const label = n === 1 ? '1 artwork selected' : (n + ' artwork selected');
+
     btn.disabled = n === 0;
     btn.textContent = n > 0 ? ('Delete Selected (' + n + ')') : 'Delete Selected';
+    inlineDeleteBtn.disabled = !hasSelection;
+    inlineDisplayBtn.disabled = !hasSelection;
+    inlineClearBtn.disabled = !hasSelection;
+    text.textContent = label;
+    bar.classList.toggle('visible', hasSelection);
   }
 
   function bindGallerySelectionHandlers() {
@@ -1436,7 +1763,7 @@
         if (checkbox.checked) selectedGalleryJobIds.add(jobId);
         else selectedGalleryJobIds.delete(jobId);
         if (card) card.classList.toggle('selected', checkbox.checked);
-        updateDeleteGalleryButton();
+        updateGallerySelectionUI();
       });
     });
   }
@@ -1451,7 +1778,7 @@
       if (checked) selectedGalleryJobIds.add(jobId);
       else selectedGalleryJobIds.delete(jobId);
     });
-    updateDeleteGalleryButton();
+    updateGallerySelectionUI();
   }
 
   async function deleteSelectedGalleryJobs() {
@@ -1478,22 +1805,102 @@
         showToast('Some items were not found: ' + data.not_found.join(', '), 'warn');
       }
       selectedGalleryJobIds = new Set();
-      updateDeleteGalleryButton();
+      updateGallerySelectionUI();
       await loadGallery();
       showToast('Deleted selected gallery items.', 'done');
     } catch (e) {
       showToast('Failed to delete selected artwork: ' + e.message, 'error');
-      updateDeleteGalleryButton();
+      updateGallerySelectionUI();
     } finally {
       clearButtonBusy(btn);
     }
+  }
+
+  function openBatchUploadModal() {
+    const selectedIds = Array.from(selectedGalleryJobIds);
+    if (!selectedIds.length) return;
+    document.getElementById('batch-upload-count').textContent = String(selectedIds.length);
+    const statusEl = document.getElementById('batch-upload-status');
+    const statusTextEl = document.getElementById('batch-upload-status-text');
+    statusEl.classList.remove('visible');
+
+    refreshTVSelects();
+    const batchTvSel = document.getElementById('batch-upload-tv-select');
+    const rememberedTv = localStorage.getItem(storageKeys.tvUpload);
+    if (rememberedTv && [...batchTvSel.options].some((o) => o.value === rememberedTv)) {
+      batchTvSel.value = rememberedTv;
+    }
+    if (!knownTVs.length) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'No TVs available. Configure one or run Scan Network first.';
+    }
+    loadMattesForSelect('batch-upload-matte-select', batchTvSel.value || knownTVs[0]?.ip);
+    openModal('batch-upload-modal', '#batch-upload-tv-select');
+  }
+
+  async function applyBatchUpload() {
+    const selectedIds = Array.from(selectedGalleryJobIds);
+    const tvIp = document.getElementById('batch-upload-tv-select').value;
+    const matte = document.getElementById('batch-upload-matte-select').value || 'none';
+    const statusEl = document.getElementById('batch-upload-status');
+    const statusTextEl = document.getElementById('batch-upload-status-text');
+    const btn = document.getElementById('btn-batch-upload-apply');
+
+    if (!selectedIds.length) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'No library items selected.';
+      return;
+    }
+    if (!tvIp) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Please select a TV.';
+      return;
+    }
+
+    setButtonBusy(btn, 'Displaying...');
+    statusEl.className = 'status-bar visible';
+    statusTextEl.textContent = 'Uploading selected artwork...';
+
+    let success = 0;
+    const failed = [];
+    for (const jobId of selectedIds) {
+      try {
+        const resp = await fetch('/jobs/' + encodeURIComponent(jobId) + '/apply', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ tv_ip: tvIp, matte: matte }),
+        });
+        if (!resp.ok) throw new Error('Server returned ' + resp.status);
+        success += 1;
+      } catch {
+        failed.push(jobId);
+      }
+    }
+
+    if (success > 0) {
+      selectedGalleryJobIds = new Set();
+      updateGallerySelectionUI();
+      await loadGallery();
+    }
+
+    if (failed.length) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Displayed ' + success + ', failed ' + failed.length + '.';
+      showToast('Some selected items failed to display on TV.', 'warn');
+    } else {
+      statusEl.className = 'status-bar visible done';
+      statusTextEl.textContent = 'Displayed ' + success + ' selected artwork on TV.';
+      showToast('Displayed selected artwork on TV.', 'done');
+      closeModal('batch-upload-modal');
+    }
+    clearButtonBusy(btn);
   }
 
   async function loadGallery() {
     const grid = document.getElementById('gallery-grid');
     const empty = document.getElementById('gallery-empty');
     selectedGalleryJobIds = new Set();
-    updateDeleteGalleryButton();
+    updateGallerySelectionUI();
     grid.innerHTML = gallerySkeleton(6);
     empty.style.display = 'none';
     try {
@@ -1529,6 +1936,8 @@
     } catch (e) {
       grid.innerHTML = '<div class="empty">Failed to load gallery. Use Refresh to retry.</div>';
       showToast('Failed to load gallery: ' + e.message, 'error');
+    } finally {
+      updateGallerySelectionUI();
     }
   }
 
@@ -1536,8 +1945,18 @@
   document.getElementById('btn-gallery-select-all').addEventListener('click', () => setAllGallerySelections(true));
   document.getElementById('btn-gallery-clear-selection').addEventListener('click', () => setAllGallerySelections(false));
   document.getElementById('btn-gallery-delete-selected').addEventListener('click', deleteSelectedGalleryJobs);
+  document.getElementById('btn-library-display-selected').addEventListener('click', openBatchUploadModal);
+  document.getElementById('btn-library-delete-selected-inline').addEventListener('click', deleteSelectedGalleryJobs);
+  document.getElementById('btn-library-clear-selection-inline').addEventListener('click', () => setAllGallerySelections(false));
+  document.getElementById('btn-batch-upload-cancel').addEventListener('click', () => {
+    closeModal('batch-upload-modal');
+  });
+  document.getElementById('btn-batch-upload-apply').addEventListener('click', applyBatchUpload);
+  document.getElementById('batch-upload-tv-select').addEventListener('change', (e) => {
+    loadMattesForSelect('batch-upload-matte-select', e.target.value);
+  });
 
-  const modalIds = ['modal', 'matte-modal', 'upload-modal', 'shortcuts-modal'];
+  const modalIds = ['modal', 'matte-modal', 'upload-modal', 'batch-upload-modal', 'shortcuts-modal'];
   let lastFocusedBeforeModal = null;
 
   function openModal(modalId, focusSelector) {
@@ -1991,7 +2410,7 @@
   document.getElementById('tv-art-select').addEventListener('change', () => {
     selectedTVArtIds = new Set();
     loadedTVArtById = {};
-    updateDeleteSelectedButton();
+    updateTVSelectionUI();
     document.getElementById('tv-art-grid').innerHTML = '';
     const empty = document.getElementById('tv-art-empty');
     empty.textContent = 'Select a TV and click "Load Art".';
@@ -2001,12 +2420,32 @@
   document.getElementById('btn-delete-selected').addEventListener('click', deleteSelectedTVArt);
   document.getElementById('btn-tv-art-select-all').addEventListener('click', () => setAllTVArtSelections(true));
   document.getElementById('btn-tv-art-clear').addEventListener('click', () => setAllTVArtSelections(false));
+  document.getElementById('btn-tv-delete-selected-inline').addEventListener('click', deleteSelectedTVArt);
+  document.getElementById('btn-tv-clear-selection-inline').addEventListener('click', () => setAllTVArtSelections(false));
+  document.getElementById('btn-tv-display-selected').addEventListener('click', (e) => displaySelectedTVArt(e.currentTarget));
+  document.getElementById('btn-tv-matte-selected').addEventListener('click', openMatteForSelectedTVArt);
 
-  function updateDeleteSelectedButton() {
+  function updateTVSelectionUI() {
     const btn = document.getElementById('btn-delete-selected');
+    const inlineDeleteBtn = document.getElementById('btn-tv-delete-selected-inline');
+    const inlineDisplayBtn = document.getElementById('btn-tv-display-selected');
+    const inlineMatteBtn = document.getElementById('btn-tv-matte-selected');
+    const inlineClearBtn = document.getElementById('btn-tv-clear-selection-inline');
+    const bar = document.getElementById('tv-selection-bar');
+    const text = document.getElementById('tv-selection-text');
     const n = selectedTVArtIds.size;
+    const hasSelection = n > 0;
+    const isSingle = n === 1;
+    const label = n === 1 ? '1 artwork selected on TV' : (n + ' artwork selected on TV');
+
     btn.disabled = n === 0;
     btn.textContent = n > 0 ? ('Delete Selected (' + n + ')') : 'Delete Selected';
+    inlineDeleteBtn.disabled = !hasSelection;
+    inlineDisplayBtn.disabled = !isSingle;
+    inlineMatteBtn.disabled = !isSingle;
+    inlineClearBtn.disabled = !hasSelection;
+    text.textContent = label;
+    bar.classList.toggle('visible', hasSelection);
   }
 
   function setAllTVArtSelections(checked) {
@@ -2019,7 +2458,7 @@
       if (checked) selectedTVArtIds.add(cid);
       else selectedTVArtIds.delete(cid);
     });
-    updateDeleteSelectedButton();
+    updateTVSelectionUI();
   }
 
   async function loadTVArt() {
@@ -2029,7 +2468,7 @@
 
     selectedTVArtIds = new Set();
     loadedTVArtById = {};
-    updateDeleteSelectedButton();
+    updateTVSelectionUI();
 
     if (!tvIp) {
       empty.textContent = 'Please select a TV.';
@@ -2097,12 +2536,14 @@
             selectedTVArtIds.delete(cid);
           }
           if (card) card.classList.toggle('selected', checkbox.checked);
-          updateDeleteSelectedButton();
+          updateTVSelectionUI();
         });
       });
     } catch (e) {
       grid.innerHTML = '<div class="empty">Failed to load art: ' + esc(e.message) + '</div>';
       showToast('Failed to load TV art: ' + e.message, 'error');
+    } finally {
+      updateTVSelectionUI();
     }
   }
 
@@ -2128,6 +2569,25 @@
       clearButtonBusy(btn);
     }
   };
+
+  function getSingleSelectedTVArtId() {
+    const selected = Array.from(selectedTVArtIds);
+    return selected.length === 1 ? selected[0] : null;
+  }
+
+  async function displaySelectedTVArt(btn) {
+    const tvIp = document.getElementById('tv-art-select').value;
+    const contentId = getSingleSelectedTVArtId();
+    if (!tvIp || !contentId) return;
+    await window.displayTVArt(contentId, tvIp, btn);
+  }
+
+  function openMatteForSelectedTVArt() {
+    const tvIp = document.getElementById('tv-art-select').value;
+    const contentId = getSingleSelectedTVArtId();
+    if (!tvIp || !contentId) return;
+    window.openMatteModal(contentId, tvIp);
+  }
 
   // =========================================================================
   // Delete TV Art
@@ -2198,7 +2658,7 @@
       showToast('Failed to delete selected artwork: ' + e.message, 'error');
     } finally {
       clearButtonBusy(btn);
-      updateDeleteSelectedButton();
+      updateTVSelectionUI();
     }
   }
 
@@ -2316,8 +2776,9 @@
 
     // Cmd/Ctrl+Enter: generate from prompt
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-      const activeTab = getActiveTabName();
-      if (activeTab === 'generate') {
+      const activePage = getActivePageName();
+      const createMode = getActiveCreateModeName();
+      if (activePage === 'create' && createMode === 'ai') {
         e.preventDefault();
         document.getElementById('btn-generate').click();
       }
@@ -2326,14 +2787,17 @@
 
     const typing = isTypingTarget(e.target);
 
-    // Alt+Shift+[G,Y,P,U,T]: tab jump
+    // Alt+Shift shortcuts for page + create mode navigation.
     if (e.altKey && e.shiftKey) {
       const key = e.key.toLowerCase();
-      if (key === 'g') setActiveTab('generate');
-      else if (key === 'y') setActiveTab('gallery');
-      else if (key === 'p') setActiveTab('public');
-      else if (key === 'u') setActiveTab('upload');
-      else if (key === 't') setActiveTab('tvs');
+      if (key === 'c') setActivePage('create');
+      else if (key === 'l') setActivePage('library');
+      else if (key === 't') setActivePage('tvs');
+      else if (key === 's') setActivePage('settings');
+      else if (key === 'a') { setActivePage('create'); setActiveCreateMode('ai'); }
+      else if (key === 'p') { setActivePage('create'); setActiveCreateMode('public'); }
+      else if (key === 'u') { setActivePage('create'); setActiveCreateMode('upload'); }
+      else if (key === 'e') { setActivePage('create'); setActiveCreateMode('edit'); }
       else return;
       e.preventDefault();
       return;
@@ -2341,18 +2805,22 @@
 
     if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
 
-    // Slash focuses primary search by active tab.
+    // Slash focuses primary input in current context.
     if (e.key === '/') {
-      const activeTab = getActiveTabName();
-      if (activeTab === 'public') {
+      const activePage = getActivePageName();
+      if (activePage === 'create') {
+        const mode = getActiveCreateModeName();
         e.preventDefault();
-        document.getElementById('public-query').focus();
-      } else if (activeTab === 'upload') {
-        e.preventDefault();
-        document.getElementById('own-image-file').focus();
-      } else if (activeTab === 'gallery') {
+        if (mode === 'public') document.getElementById('public-query').focus();
+        else if (mode === 'upload') document.getElementById('own-image-file').focus();
+        else if (mode === 'edit') document.getElementById('edit-prompt').focus();
+        else document.getElementById('prompt').focus();
+      } else if (activePage === 'library') {
         e.preventDefault();
         document.getElementById('btn-refresh-gallery').focus();
+      } else if (activePage === 'tvs') {
+        e.preventDefault();
+        document.getElementById('tv-art-select').focus();
       }
     }
   });
