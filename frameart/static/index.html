@@ -979,6 +979,48 @@
   </div>
 </div>
 
+<!-- Edit/generate from existing source (library or TV art) -->
+<div class="modal-overlay" id="remix-modal">
+  <div class="modal-dialog">
+    <h3>Edit / Generate from Existing Art</h3>
+    <p style="font-size:.85rem; color:var(--muted); margin-bottom:.8rem;">
+      Source: <strong id="remix-source-label">-</strong>
+    </p>
+    <label for="remix-prompt">Prompt</label>
+    <textarea id="remix-prompt" placeholder="Create a new variation inspired by this artwork"></textarea>
+    <div class="row">
+      <div>
+        <label for="remix-provider">Provider</label>
+        <select id="remix-provider"></select>
+      </div>
+      <div>
+        <label for="remix-model">Model</label>
+        <select id="remix-model"></select>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="remix-tv-select">Display on TV</label>
+        <select id="remix-tv-select"></select>
+      </div>
+      <div>
+        <label for="remix-matte-select">Matte Style</label>
+        <select id="remix-matte-select">
+          <option value="none">none</option>
+          <option value="shadowbox_polar">shadowbox_polar</option>
+        </select>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary btn-small" id="btn-remix-cancel">Cancel</button>
+      <button class="btn btn-small" id="btn-remix-apply">Create New Image</button>
+    </div>
+    <div class="status-bar" id="remix-status" style="margin-top:.8rem;">
+      <div class="value" id="remix-status-text"></div>
+    </div>
+  </div>
+</div>
+
 <div class="modal-overlay" id="shortcuts-modal">
   <div class="modal-dialog">
     <h3>Keyboard Shortcuts</h3>
@@ -1040,15 +1082,19 @@
     tvPublic: 'frameart.tv.public',
     tvOwnUpload: 'frameart.tv.own_upload',
     tvEditUpload: 'frameart.tv.edit_upload',
+    tvRemix: 'frameart.tv.remix',
     tvUpload: 'frameart.tv.upload',
     tvArt: 'frameart.tv.art',
     providerGenerate: 'frameart.provider.generate',
     modelGenerate: 'frameart.model.generate',
     providerEdit: 'frameart.provider.edit',
     modelEdit: 'frameart.model.edit',
+    providerRemix: 'frameart.provider.remix',
+    modelRemix: 'frameart.model.remix',
     mattePublic: 'frameart.matte.public',
     matteOwnUpload: 'frameart.matte.own_upload',
     matteEditUpload: 'frameart.matte.edit_upload',
+    matteRemix: 'frameart.matte.remix',
     matteUpload: 'frameart.matte.upload',
   };
 
@@ -1112,16 +1158,21 @@
     configuredProviders = payload?.providers || [];
     const providerSel = document.getElementById('provider');
     const editProviderSel = document.getElementById('edit-provider');
+    const remixProviderSel = document.getElementById('remix-provider');
     const rememberedProvider = localStorage.getItem(storageKeys.providerGenerate);
     const rememberedModel = localStorage.getItem(storageKeys.modelGenerate);
     const rememberedEditProvider = localStorage.getItem(storageKeys.providerEdit);
     const rememberedEditModel = localStorage.getItem(storageKeys.modelEdit);
+    const rememberedRemixProvider = localStorage.getItem(storageKeys.providerRemix);
+    const rememberedRemixModel = localStorage.getItem(storageKeys.modelRemix);
     const fallback = payload?.default_provider || configuredProviders[0]?.name || '';
     const preferredProvider = rememberedProvider || fallback;
     const preferredEditProvider = rememberedEditProvider || fallback;
+    const preferredRemixProvider = rememberedRemixProvider || preferredEditProvider;
 
     providerSel.innerHTML = '';
     if (editProviderSel) editProviderSel.innerHTML = '';
+    if (remixProviderSel) remixProviderSel.innerHTML = '';
     for (const provider of configuredProviders) {
       const opt = document.createElement('option');
       opt.value = provider.name;
@@ -1132,6 +1183,12 @@
         editOpt.value = provider.name;
         editOpt.textContent = provider.is_default ? (provider.name + ' (default)') : provider.name;
         editProviderSel.appendChild(editOpt);
+      }
+      if (remixProviderSel) {
+        const remixOpt = document.createElement('option');
+        remixOpt.value = provider.name;
+        remixOpt.textContent = provider.is_default ? (provider.name + ' (default)') : provider.name;
+        remixProviderSel.appendChild(remixOpt);
       }
     }
 
@@ -1150,6 +1207,18 @@
         editProviderSel.selectedIndex = 0;
       }
       refreshModelSelectFor(editProviderSel.value, rememberedEditModel || '', 'edit-model');
+    }
+    if (remixProviderSel) {
+      if ([...remixProviderSel.options].some((o) => o.value === preferredRemixProvider)) {
+        remixProviderSel.value = preferredRemixProvider;
+      } else if (remixProviderSel.options.length) {
+        remixProviderSel.selectedIndex = 0;
+      }
+      refreshModelSelectFor(
+        remixProviderSel.value,
+        rememberedRemixModel || rememberedEditModel || '',
+        'remix-model',
+      );
     }
     renderSettingsProviders();
   }
@@ -1207,6 +1276,7 @@
       'tv-art-select',
       'upload-tv-select',
       'batch-upload-tv-select',
+      'remix-tv-select',
       'public-tv-select',
       'own-upload-tv-select',
       'edit-upload-tv-select',
@@ -1223,6 +1293,8 @@
         sel.innerHTML = '<option value="">Select TV...</option>';
       } else if (id === 'edit-upload-tv-select') {
         sel.innerHTML = '<option value="">Edit only (no TV upload)</option>';
+      } else if (id === 'remix-tv-select') {
+        sel.innerHTML = '<option value="">Create only (save to Gallery)</option>';
       } else {
         sel.innerHTML = '';
       }
@@ -1242,6 +1314,7 @@
           id === 'public-tv-select' ? storageKeys.tvPublic :
           id === 'own-upload-tv-select' ? storageKeys.tvOwnUpload :
           id === 'edit-upload-tv-select' ? storageKeys.tvEditUpload :
+          id === 'remix-tv-select' ? storageKeys.tvRemix :
           id === 'upload-tv-select' || id === 'batch-upload-tv-select' ? storageKeys.tvUpload :
           storageKeys.tvArt
         );
@@ -1376,12 +1449,17 @@
     const modelSel = document.getElementById('model');
     const editProviderSel = document.getElementById('edit-provider');
     const editModelSel = document.getElementById('edit-model');
+    const remixProviderSel = document.getElementById('remix-provider');
+    const remixModelSel = document.getElementById('remix-model');
     providerSel.innerHTML = '<option value="openai">openai</option>';
     providerSel.value = 'openai';
     modelSel.innerHTML = '<option value="">Provider default</option>';
     editProviderSel.innerHTML = '<option value="openai">openai</option>';
     editProviderSel.value = 'openai';
     editModelSel.innerHTML = '<option value="">Provider default</option>';
+    remixProviderSel.innerHTML = '<option value="openai">openai</option>';
+    remixProviderSel.value = 'openai';
+    remixModelSel.innerHTML = '<option value="">Provider default</option>';
     renderSettingsProviders();
     showToast('Failed to load configured providers; using fallback defaults.', 'warn');
   });
@@ -1417,6 +1495,15 @@
   document.getElementById('edit-model').addEventListener('change', (e) => {
     localStorage.setItem(storageKeys.modelEdit, e.target.value || '');
   });
+  document.getElementById('remix-provider').addEventListener('change', (e) => {
+    const provider = e.target.value || '';
+    localStorage.setItem(storageKeys.providerRemix, provider);
+    refreshModelSelectFor(provider, '', 'remix-model');
+    localStorage.setItem(storageKeys.modelRemix, '');
+  });
+  document.getElementById('remix-model').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.modelRemix, e.target.value || '');
+  });
   document.getElementById('tv-art-select').addEventListener('change', (e) => {
     localStorage.setItem(storageKeys.tvArt, e.target.value || '');
   });
@@ -1425,6 +1512,9 @@
   });
   document.getElementById('batch-upload-tv-select').addEventListener('change', (e) => {
     localStorage.setItem(storageKeys.tvUpload, e.target.value || '');
+  });
+  document.getElementById('remix-tv-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.tvRemix, e.target.value || '');
   });
   document.getElementById('public-tv-select').addEventListener('change', (e) => {
     localStorage.setItem(storageKeys.tvPublic, e.target.value || '');
@@ -1450,6 +1540,9 @@
   document.getElementById('batch-upload-matte-select').addEventListener('change', (e) => {
     localStorage.setItem(storageKeys.matteUpload, e.target.value || '');
   });
+  document.getElementById('remix-matte-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.matteRemix, e.target.value || '');
+  });
   const rememberedPublicMatte = localStorage.getItem(storageKeys.mattePublic);
   if (rememberedPublicMatte) {
     const sel = document.getElementById('public-matte-select');
@@ -1471,6 +1564,11 @@
     if ([...sel.options].some(o => o.value === rememberedUploadMatte)) sel.value = rememberedUploadMatte;
     const batchSel = document.getElementById('batch-upload-matte-select');
     if ([...batchSel.options].some(o => o.value === rememberedUploadMatte)) batchSel.value = rememberedUploadMatte;
+  }
+  const rememberedRemixMatte = localStorage.getItem(storageKeys.matteRemix);
+  if (rememberedRemixMatte) {
+    const sel = document.getElementById('remix-matte-select');
+    if ([...sel.options].some(o => o.value === rememberedRemixMatte)) sel.value = rememberedRemixMatte;
   }
 
   // =========================================================================
@@ -1928,6 +2026,9 @@
             <button class="btn btn-secondary btn-small"
                     onclick="openUploadModal('${esc(j.job_id)}', '${esc(j.prompt || j.job_id)}')">
               Upload to TV</button>
+            <button class="btn btn-secondary btn-small"
+                    onclick="openRemixFromJob('${esc(j.job_id)}', '${esc(j.prompt || j.job_id)}')">
+              Edit / Generate New</button>
           </div>
         </div>`;
       }).join('');
@@ -1956,7 +2057,14 @@
     loadMattesForSelect('batch-upload-matte-select', e.target.value);
   });
 
-  const modalIds = ['modal', 'matte-modal', 'upload-modal', 'batch-upload-modal', 'shortcuts-modal'];
+  const modalIds = [
+    'modal',
+    'matte-modal',
+    'upload-modal',
+    'batch-upload-modal',
+    'remix-modal',
+    'shortcuts-modal',
+  ];
   let lastFocusedBeforeModal = null;
 
   function openModal(modalId, focusSelector) {
@@ -2167,6 +2275,9 @@
   document.getElementById('edit-upload-tv-select').addEventListener('change', (e) => {
     loadMattesForSelect('edit-upload-matte-select', e.target.value);
   });
+  document.getElementById('remix-tv-select').addEventListener('change', (e) => {
+    loadMattesForSelect('remix-matte-select', e.target.value);
+  });
 
   async function uploadOwnImage() {
     const fileInput = document.getElementById('own-image-file');
@@ -2294,6 +2405,129 @@
   }
 
   document.getElementById('btn-edit-upload').addEventListener('click', uploadEditImage);
+
+  // =========================================================================
+  // Remix modal (edit / generate from existing library or TV artwork)
+  // =========================================================================
+  let remixSource = null;
+
+  window.openRemixFromJob = function(jobId, label) {
+    remixSource = { kind: 'job', jobId: jobId, label: label || jobId };
+    document.getElementById('remix-source-label').textContent = 'Library · ' + (label || jobId);
+    document.getElementById('remix-status').classList.remove('visible');
+    refreshTVSelects();
+
+    const remixTvSel = document.getElementById('remix-tv-select');
+    const rememberedTv = localStorage.getItem(storageKeys.tvRemix);
+    if (rememberedTv && [...remixTvSel.options].some((o) => o.value === rememberedTv)) {
+      remixTvSel.value = rememberedTv;
+    }
+    loadMattesForSelect('remix-matte-select', remixTvSel.value || knownTVs[0]?.ip);
+    openModal('remix-modal', '#remix-prompt');
+  };
+
+  window.openRemixFromTVArt = function(contentId, tvIp) {
+    remixSource = { kind: 'tv_art', contentId: contentId, tvIp: tvIp };
+    document.getElementById('remix-source-label').textContent = 'TV · ' + contentId;
+    document.getElementById('remix-status').classList.remove('visible');
+    refreshTVSelects();
+
+    const remixTvSel = document.getElementById('remix-tv-select');
+    if (tvIp && [...remixTvSel.options].some((o) => o.value === tvIp)) {
+      remixTvSel.value = tvIp;
+    } else {
+      const rememberedTv = localStorage.getItem(storageKeys.tvRemix);
+      if (rememberedTv && [...remixTvSel.options].some((o) => o.value === rememberedTv)) {
+        remixTvSel.value = rememberedTv;
+      }
+    }
+    loadMattesForSelect('remix-matte-select', remixTvSel.value || tvIp || knownTVs[0]?.ip);
+    openModal('remix-modal', '#remix-prompt');
+  };
+
+  async function applyRemixFromExisting() {
+    if (!remixSource) return;
+
+    const promptInput = document.getElementById('remix-prompt');
+    const providerInput = document.getElementById('remix-provider');
+    const modelInput = document.getElementById('remix-model');
+    const tvInput = document.getElementById('remix-tv-select');
+    const matteInput = document.getElementById('remix-matte-select');
+    const statusEl = document.getElementById('remix-status');
+    const statusTextEl = document.getElementById('remix-status-text');
+    const btn = document.getElementById('btn-remix-apply');
+
+    const prompt = promptInput.value.trim();
+    if (!prompt) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Please provide an edit prompt.';
+      return;
+    }
+
+    const tvIp = tvInput.value || '';
+    const noUpload = !tvIp;
+    const body = {
+      prompt: prompt,
+      matte: matteInput.value || 'none',
+      no_upload: noUpload,
+    };
+    if (providerInput.value) body.provider = providerInput.value;
+    if (modelInput.value) body.model = modelInput.value;
+    if (tvIp) body.tv_ip = tvIp;
+
+    let endpoint = '';
+    if (remixSource.kind === 'job') {
+      endpoint = '/jobs/' + encodeURIComponent(remixSource.jobId) + '/edit-and-apply';
+    } else if (remixSource.kind === 'tv_art') {
+      endpoint = '/tv/art/edit-and-apply';
+      body.content_id = remixSource.contentId;
+      if (remixSource.tvIp) body.source_tv_ip = remixSource.tvIp;
+    } else {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Invalid remix source.';
+      return;
+    }
+
+    setButtonBusy(btn, 'Creating...');
+    statusEl.className = 'status-bar visible';
+    statusTextEl.textContent = noUpload
+      ? 'Creating new image and saving to Gallery...'
+      : 'Creating new image and displaying on TV...';
+
+    try {
+      const resp = await fetch(endpoint, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body),
+      });
+      if (!resp.ok) {
+        const detail = await readApiError(resp, 'Server returned');
+        throw new Error(detail);
+      }
+      const data = await resp.json();
+      statusEl.className = 'status-bar visible done';
+      statusTextEl.textContent = noUpload
+        ? ('Created new image and saved to Gallery. Job ' + data.job_id)
+        : ('Created new image and displayed on TV. Job ' + data.job_id);
+      showToast(
+        noUpload ? 'New image created from existing art.' : 'New image created and displayed on TV.',
+        'done'
+      );
+      loadGallery();
+      if (getActivePageName() === 'tvs') loadTVArt();
+    } catch (e) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Failed: ' + e.message;
+      showToast('Failed to create image from existing art: ' + e.message, 'error');
+    } finally {
+      clearButtonBusy(btn);
+    }
+  }
+
+  document.getElementById('btn-remix-cancel').addEventListener('click', () => {
+    closeModal('remix-modal');
+  });
+  document.getElementById('btn-remix-apply').addEventListener('click', applyRemixFromExisting);
 
   // =========================================================================
   // Upload-to-TV modal (from gallery)
@@ -2516,6 +2750,9 @@
             <button class="btn btn-secondary btn-small"
                     onclick="openMatteModal('${esc(a.content_id)}', '${esc(tvIp)}')">
               Change Matte</button>
+            <button class="btn btn-secondary btn-small"
+                    onclick="openRemixFromTVArt('${esc(a.content_id)}', '${esc(tvIp)}')">
+              Edit / Generate New</button>
             <button class="btn btn-danger btn-small"
                     onclick="deleteTVArt('${esc(a.content_id)}', '${esc(tvIp)}', ${a.is_favourite})">
               Delete</button>
@@ -2703,6 +2940,7 @@
         selectId === 'public-matte-select' ? storageKeys.mattePublic :
         selectId === 'own-upload-matte-select' ? storageKeys.matteOwnUpload :
         selectId === 'edit-upload-matte-select' ? storageKeys.matteEditUpload :
+        selectId === 'remix-matte-select' ? storageKeys.matteRemix :
         storageKeys.matteUpload
       );
       if (remembered && [...sel.options].some(o => o.value === remembered)) sel.value = remembered;
@@ -2714,6 +2952,7 @@
         selectId === 'public-matte-select' ? storageKeys.mattePublic :
         selectId === 'own-upload-matte-select' ? storageKeys.matteOwnUpload :
         selectId === 'edit-upload-matte-select' ? storageKeys.matteEditUpload :
+        selectId === 'remix-matte-select' ? storageKeys.matteRemix :
         storageKeys.matteUpload
       );
       if (remembered && [...sel.options].some(o => o.value === remembered)) sel.value = remembered;

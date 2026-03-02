@@ -11,6 +11,8 @@ Endpoints (sync):
     POST /apply                 — upload an existing image to the TV
     POST /upload-and-apply      — upload image bytes from web/mobile and apply to TV
     POST /edit-and-apply        — upload + edit image with prompt, then apply to TV
+    POST /jobs/{job_id}/edit-and-apply — edit from existing server artwork
+    POST /tv/art/edit-and-apply — edit from artwork currently stored on TV
 
 Endpoints (async — return immediately, poll for results):
     POST /async/generate            — returns {job_id, status}
@@ -1113,6 +1115,200 @@ class JobApplyRequest(BaseModel):
     )
 
 
+class EditFromExistingRequest(BaseModel):
+    """Request body for creating a new image from existing artwork."""
+
+    prompt: str = Field(..., description="Edit/generation instruction prompt.")
+    provider: str | None = Field(None, description="Provider name (e.g., openai).")
+    model: str | None = Field(None, description="Provider model ID.")
+    upscaler: str | None = Field(None, description="Upscaler to use.")
+    tv: str | None = Field(None, description="Target TV profile name from config.")
+    tv_ip: str | None = Field(None, description="Target TV IP address.")
+    matte: str = Field("none", description="Matte style.")
+    no_upload: bool = Field(False, description="Edit/process only; skip TV upload.")
+    no_switch: bool = Field(False, description="Upload but do not switch displayed art.")
+
+
+class TVArtEditRequest(EditFromExistingRequest):
+    """Request body for creating a new image from art already stored on a TV."""
+
+    content_id: str = Field(..., description="Source TV artwork content ID.")
+    source_tv: str | None = Field(None, description="Source TV profile name from config.")
+    source_tv_ip: str | None = Field(None, description="Source TV IP address.")
+
+
+def _find_job_image_path(settings, job_id: str) -> Path:
+    """Find a generated job image path (prefer final, then source) or raise 404."""
+    artifacts_dir = settings.data_dir / "artifacts"
+    final_matches = list(artifacts_dir.rglob(f"{job_id}/final.png"))
+    if final_matches:
+        return final_matches[0]
+
+    source_matches = list(artifacts_dir.rglob(f"{job_id}/source.png"))
+    if source_matches:
+        return source_matches[0]
+
+    raise HTTPException(status_code=404, detail=f"No image found for job {job_id}")
+
+
+def _find_artifact_image_by_content_id(
+    settings,
+    content_id: str,
+    source_tv_ip: str | None = None,
+) -> Path | None:
+    """Find the newest local artifact image that maps to a TV ``content_id``."""
+    import json as _json
+
+    artifacts_dir = settings.data_dir / "artifacts"
+    if not artifacts_dir.exists():
+        return None
+
+    for meta_path in sorted(artifacts_dir.rglob("meta.json"), reverse=True):
+        try:
+            meta = _json.loads(meta_path.read_text())
+        except Exception:
+            continue
+
+        matched = False
+        if meta.get("content_id") == content_id:
+            matched = True
+
+        tv_map = meta.get("tv_content_ids")
+        if (
+            not matched
+            and isinstance(tv_map, dict)
+            and (
+                (source_tv_ip and tv_map.get(source_tv_ip) == content_id)
+                or any(str(v) == content_id for v in tv_map.values())
+            )
+        ):
+            matched = True
+
+        if not matched:
+            continue
+
+        job_dir = meta_path.parent
+        final_path = job_dir / "final.png"
+        if final_path.exists():
+            return final_path
+        source_path = job_dir / "source.png"
+        if source_path.exists():
+            return source_path
+
+    return None
+
+
+@app.post("/jobs/{job_id}/edit-and-apply", response_model=JobResponse)
+def edit_job_artwork(job_id: str, req: EditFromExistingRequest):
+    """Create a new image by editing an existing server-side artwork job image."""
+    from frameart.pipeline import run_edit_and_apply
+
+    settings = _settings()
+    selected_image = _find_job_image_path(settings, job_id)
+    edit_prompt = req.prompt.strip()
+    if not edit_prompt:
+        raise HTTPException(status_code=400, detail="Edit prompt cannot be empty.")
+
+    result = run_edit_and_apply(
+        settings,
+        str(selected_image),
+        edit_prompt,
+        provider_name=req.provider,
+        model=req.model,
+        upscaler_name=req.upscaler,
+        tv_name=req.tv,
+        tv_ip=req.tv_ip,
+        matte=req.matte,
+        no_upload=req.no_upload,
+        no_switch=req.no_switch,
+    )
+    resp = _pipeline_result_to_response(result)
+    if result.error:
+        raise HTTPException(status_code=500, detail=resp.model_dump())
+    return resp
+
+
+@app.post("/tv/art/edit-and-apply", response_model=JobResponse)
+def edit_tv_artwork(req: TVArtEditRequest):
+    """Create a new image by editing artwork currently stored on a TV."""
+    from frameart.pipeline import run_edit_and_apply
+    from frameart.tv.controller import get_art_thumbnail
+
+    settings = _settings()
+    edit_prompt = req.prompt.strip()
+    if not edit_prompt:
+        raise HTTPException(status_code=400, detail="Edit prompt cannot be empty.")
+
+    source_profile = None
+    try:
+        source_profile = _resolve_tv_profile(req.source_tv, req.source_tv_ip)
+    except HTTPException:
+        source_profile = None
+
+    source_image = _find_artifact_image_by_content_id(
+        settings,
+        req.content_id,
+        source_tv_ip=(source_profile.ip if source_profile else req.source_tv_ip),
+    )
+    source_temp_path: Path | None = None
+    if source_image is None:
+        if source_profile is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "No source TV specified and no local artifact match found. "
+                    "Provide source_tv/source_tv_ip."
+                ),
+            )
+
+        source_bytes = get_art_thumbnail(source_profile, req.content_id)
+        if not source_bytes:
+            raise HTTPException(status_code=404, detail="TV artwork thumbnail not available.")
+
+        upload_dir = settings.data_dir / "uploads"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        source_temp_path = upload_dir / f"tv-art-edit-{uuid.uuid4().hex}.jpg"
+        source_temp_path.write_bytes(source_bytes)
+        source_image = source_temp_path
+
+    target_tv = req.tv
+    target_tv_ip = req.tv_ip
+    if not req.no_upload and not (target_tv or target_tv_ip):
+        # Default target is the same TV as source when available.
+        target_tv = req.source_tv
+        if source_profile is not None:
+            target_tv_ip = source_profile.ip
+
+    try:
+        result = run_edit_and_apply(
+            settings,
+            str(source_image),
+            edit_prompt,
+            provider_name=req.provider,
+            model=req.model,
+            upscaler_name=req.upscaler,
+            tv_name=target_tv,
+            tv_ip=target_tv_ip,
+            matte=req.matte,
+            no_upload=req.no_upload,
+            no_switch=req.no_switch,
+        )
+    finally:
+        if source_temp_path is not None:
+            try:
+                source_temp_path.unlink(missing_ok=True)
+            except Exception:
+                logger.warning(
+                    "Failed to delete temporary TV edit source file: %s",
+                    source_temp_path,
+                )
+
+    resp = _pipeline_result_to_response(result)
+    if result.error:
+        raise HTTPException(status_code=500, detail=resp.model_dump())
+    return resp
+
+
 @app.post("/jobs/{job_id}/apply", response_model=JobResponse)
 def apply_job_to_tv(job_id: str, req: JobApplyRequest):
     """Upload a previously generated job's image to a TV."""
@@ -1122,17 +1318,7 @@ def apply_job_to_tv(job_id: str, req: JobApplyRequest):
     from frameart.tv.controller import list_art_deduplicated, switch_art
 
     settings = _settings()
-    artifacts_dir = settings.data_dir / "artifacts"
-    final_matches = list(artifacts_dir.rglob(f"{job_id}/final.png"))
-    source_matches = list(artifacts_dir.rglob(f"{job_id}/source.png"))
-
-    selected_image: Path | None = None
-    if final_matches:
-        selected_image = final_matches[0]
-    elif source_matches:
-        selected_image = source_matches[0]
-    if selected_image is None:
-        raise HTTPException(status_code=404, detail=f"No image found for job {job_id}")
+    selected_image = _find_job_image_path(settings, job_id)
 
     # Reuse existing TV content when possible to avoid duplicate uploads.
     job_dir = selected_image.parent
