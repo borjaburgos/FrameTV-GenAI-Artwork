@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import io
 import logging
+import threading
 import time
 import warnings
 from dataclasses import dataclass
@@ -32,6 +33,9 @@ DEFAULT_TIMEOUT = 10  # seconds for websocket operations
 # Convert images to JPEG to keep size reasonable.
 _JPEG_QUALITY = 95
 _MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB safety threshold
+
+_TV_OP_LOCKS: dict[str, threading.Lock] = {}
+_TV_OP_LOCKS_GUARD = threading.Lock()
 
 
 @dataclass
@@ -162,6 +166,30 @@ def _retry(func, description: str) -> Any:
     raise RuntimeError(f"{description} failed after {MAX_RETRIES} attempts: {last_error}")
 
 
+def _tv_operation_lock(profile: TVProfile) -> threading.Lock:
+    """Return a per-TV lock to serialize websocket art operations."""
+    key = f"{profile.ip}:{profile.port}"
+    with _TV_OP_LOCKS_GUARD:
+        lock = _TV_OP_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _TV_OP_LOCKS[key] = lock
+        return lock
+
+
+def _run_serialized(profile: TVProfile, func, description: str) -> Any:
+    """Run a TV operation under a per-device lock."""
+    lock = _tv_operation_lock(profile)
+    logger.debug(
+        "Acquiring TV operation lock for %s:%d (%s)",
+        profile.ip,
+        profile.port,
+        description,
+    )
+    with lock:
+        return func()
+
+
 def pair(profile: TVProfile) -> bool:
     """Initiate pairing with the TV.
 
@@ -238,20 +266,34 @@ def get_status(profile: TVProfile) -> TVStatus:
     current_artwork = None
 
     def _query_art_mode():
-        art = _connect_art(profile)
-        return art.get_artmode()
+        art = None
+        try:
+            art = _connect_art(profile)
+            return art.get_artmode()
+        finally:
+            with contextlib.suppress(Exception):
+                art.close()
 
     def _query_current():
-        art = _connect_art(profile)
-        return art.get_current()
+        art = None
+        try:
+            art = _connect_art(profile)
+            return art.get_current()
+        finally:
+            with contextlib.suppress(Exception):
+                art.close()
 
-    result, err = _run_with_timeout(_query_art_mode)
+    result, err = _run_with_timeout(
+        lambda: _run_serialized(profile, _query_art_mode, "Get art mode status"),
+    )
     if err:
         logger.warning("Could not get art mode status: %s", err)
     else:
         art_mode_on = bool(result)
 
-    result, err = _run_with_timeout(_query_current)
+    result, err = _run_with_timeout(
+        lambda: _run_serialized(profile, _query_current, "Get current artwork"),
+    )
     if err:
         logger.warning("Could not get current artwork: %s", err)
     else:
@@ -386,7 +428,11 @@ def upload_image(
         return content_id
 
     try:
-        content_id = _retry(_do_upload, "Upload image")
+        content_id = _run_serialized(
+            profile,
+            lambda: _retry(_do_upload, "Upload image"),
+            "Upload image",
+        )
         logger.info("Uploaded image, content_id=%s", content_id)
         return UploadResult(content_id=content_id, success=True)
     except Exception as e:
@@ -423,18 +469,27 @@ def switch_art(profile: TVProfile, content_id: str) -> bool:
     """
 
     def _do_switch() -> None:
-        art = _connect_art(profile)
-
-        # Try to enter art mode first
+        art = None
         try:
-            art.set_artmode(True)
-        except Exception as e:
-            logger.warning("Could not set art mode (may already be on): %s", e)
+            art = _connect_art(profile)
 
-        art.select_image(content_id)
+            # Try to enter art mode first
+            try:
+                art.set_artmode(True)
+            except Exception as e:
+                logger.warning("Could not set art mode (may already be on): %s", e)
+
+            art.select_image(content_id)
+        finally:
+            with contextlib.suppress(Exception):
+                art.close()
 
     try:
-        _retry(_do_switch, f"Switch art to {content_id}")
+        _run_serialized(
+            profile,
+            lambda: _retry(_do_switch, f"Switch art to {content_id}"),
+            f"Switch art to {content_id}",
+        )
         logger.info("Switched display to content_id=%s", content_id)
         return True
     except Exception as e:
@@ -444,8 +499,16 @@ def switch_art(profile: TVProfile, content_id: str) -> bool:
 
 def list_art(profile: TVProfile) -> list[dict[str, Any]]:
     """List all artworks available on the TV (raw, includes duplicates across categories)."""
-    art = _connect_art(profile)
-    return art.available()
+    def _do_list() -> list[dict[str, Any]]:
+        art = None
+        try:
+            art = _connect_art(profile)
+            return art.available()
+        finally:
+            with contextlib.suppress(Exception):
+                art.close()
+
+    return _run_serialized(profile, lambda: _retry(_do_list, "List art"), "List art")
 
 
 def list_art_deduplicated(profile: TVProfile) -> list[dict[str, Any]]:
@@ -479,12 +542,24 @@ def get_art_thumbnail(profile: TVProfile, content_id: str) -> bytes | None:
 
     Returns ``None`` if the TV does not provide a thumbnail for the content.
     """
-    art = _connect_art(profile)
+    def _do_thumbnail() -> bytes | None:
+        art = None
+        try:
+            art = _connect_art(profile)
+            data = art.get_thumbnail(content_id)
+            if isinstance(data, (bytes, bytearray)):
+                return bytes(data)
+            return None
+        finally:
+            with contextlib.suppress(Exception):
+                art.close()
+
     try:
-        data = art.get_thumbnail(content_id)
-        if isinstance(data, (bytes, bytearray)):
-            return bytes(data)
-        return None
+        return _run_serialized(
+            profile,
+            lambda: _retry(_do_thumbnail, f"Fetch thumbnail for {content_id}"),
+            f"Fetch thumbnail for {content_id}",
+        )
     except Exception as e:
         logger.warning("Failed to fetch thumbnail for %s: %s", content_id, e)
         return None
@@ -497,8 +572,20 @@ def get_matte_list(profile: TVProfile) -> list[dict[str, Any]]:
     The samsungtvws v3.x library handles both ``matte_type_list`` (modern)
     and ``matte_list`` (API 0.97) response keys internally.
     """
-    art = _connect_art(profile)
-    result = art.get_matte_list()
+    def _do_get_mattes():
+        art = None
+        try:
+            art = _connect_art(profile)
+            return art.get_matte_list()
+        finally:
+            with contextlib.suppress(Exception):
+                art.close()
+
+    result = _run_serialized(
+        profile,
+        lambda: _retry(_do_get_mattes, "Get matte list"),
+        "Get matte list",
+    )
     # v3.x returns {"matte_types": [...], "matte_colors": [...]}
     if isinstance(result, dict):
         return result.get("matte_types", [])
@@ -520,9 +607,21 @@ def delete_art(profile: TVProfile, content_ids: list[str]) -> bool:
     -------
     True on success, False on failure.
     """
-    art = _connect_art(profile)
+    def _do_delete() -> None:
+        art = None
+        try:
+            art = _connect_art(profile)
+            art.delete_list(content_ids)
+        finally:
+            with contextlib.suppress(Exception):
+                art.close()
+
     try:
-        art.delete_list(content_ids)
+        _run_serialized(
+            profile,
+            lambda: _retry(_do_delete, f"Delete {len(content_ids)} artwork(s)"),
+            f"Delete {len(content_ids)} artwork(s)",
+        )
         logger.info("Deleted %d artwork(s): %s", len(content_ids), ", ".join(content_ids))
         return True
     except Exception as e:
@@ -546,9 +645,21 @@ def change_matte(profile: TVProfile, content_id: str, matte_id: str) -> bool:
     -------
     True on success, False on failure.
     """
-    art = _connect_art(profile)
+    def _do_change_matte() -> None:
+        art = None
+        try:
+            art = _connect_art(profile)
+            art.change_matte(content_id, matte_id)
+        finally:
+            with contextlib.suppress(Exception):
+                art.close()
+
     try:
-        art.change_matte(content_id, matte_id)
+        _run_serialized(
+            profile,
+            lambda: _retry(_do_change_matte, f"Change matte on {content_id}"),
+            f"Change matte on {content_id}",
+        )
         logger.info("Changed matte on %s to %s", content_id, matte_id)
         return True
     except Exception as e:

@@ -710,6 +710,18 @@ class TestTVListArt:
         resp = client.get("/tv/art")
         assert resp.status_code == 400
 
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.list_art_deduplicated")
+    def test_upstream_timeout_returns_502(self, mock_list, mock_settings):
+        settings = MagicMock()
+        settings.tvs = {}
+        mock_settings.return_value = settings
+        mock_list.side_effect = TimeoutError("timed out")
+
+        resp = client.get("/tv/art?tv_ip=192.168.1.100")
+        assert resp.status_code == 502
+        assert "TV art list failed" in resp.json()["detail"]
+
 
 # ---------------------------------------------------------------------------
 # GET /tv/art/thumbnail
@@ -955,6 +967,18 @@ class TestTVMattes:
 
         resp = client.get("/tv/mattes")
         assert resp.status_code == 400
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.get_matte_list")
+    def test_upstream_failure_returns_502(self, mock_mattes, mock_settings):
+        settings = MagicMock()
+        settings.tvs = {}
+        mock_settings.return_value = settings
+        mock_mattes.side_effect = TimeoutError("timed out")
+
+        resp = client.get("/tv/mattes?tv_ip=192.168.1.100")
+        assert resp.status_code == 502
+        assert "TV matte list failed" in resp.json()["detail"]
 
 
 # ---------------------------------------------------------------------------

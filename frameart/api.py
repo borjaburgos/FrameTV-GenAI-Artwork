@@ -831,7 +831,13 @@ def tv_list_art(
     from frameart.tv.controller import list_art_deduplicated
 
     profile = _resolve_tv_profile(tv, tv_ip)
-    artworks = list_art_deduplicated(profile)
+    try:
+        artworks = list_art_deduplicated(profile)
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"TV art list failed: {e}",
+        ) from e
     return [
         TVArtItem(
             content_id=a.get("content_id", "unknown"),
@@ -926,7 +932,10 @@ def tv_mattes(
     from frameart.tv.controller import get_matte_list
 
     profile = _resolve_tv_profile(tv, tv_ip)
-    return get_matte_list(profile)
+    try:
+        return get_matte_list(profile)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"TV matte list failed: {e}") from e
 
 
 @app.get("/tv/configured", response_model=list[ConfiguredTVResponse])
