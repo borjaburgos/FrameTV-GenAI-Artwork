@@ -477,6 +477,175 @@ class TestEditAndApply:
         assert mock_run.call_args.kwargs["tv_ip"] is None
 
 
+class TestEditFromExistingArtwork:
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_edit_and_apply")
+    def test_edit_from_job_success(self, mock_run, mock_settings):
+        import tempfile
+
+        settings = MagicMock()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifacts = Path(tmpdir) / "artifacts" / "2026" / "02" / "28" / "test-job"
+            artifacts.mkdir(parents=True)
+            (artifacts / "final.png").write_bytes(b"fakepng")
+            settings.data_dir = Path(tmpdir)
+            mock_settings.return_value = settings
+            mock_run.return_value = _fake_result(content_id=None, tv_switched=False)
+
+            resp = client.post(
+                "/jobs/test-job/edit-and-apply",
+                json={
+                    "prompt": "create a colorful variation",
+                    "provider": "openai",
+                    "model": "gpt-image-1",
+                    "no_upload": True,
+                },
+            )
+            assert resp.status_code == 200
+            mock_run.assert_called_once()
+            assert mock_run.call_args.args[1].endswith("final.png")
+            assert mock_run.call_args.args[2] == "create a colorful variation"
+            assert mock_run.call_args.kwargs["provider_name"] == "openai"
+            assert mock_run.call_args.kwargs["model"] == "gpt-image-1"
+            assert mock_run.call_args.kwargs["no_upload"] is True
+
+    @patch("frameart.api._settings")
+    def test_edit_from_job_not_found(self, mock_settings):
+        settings = MagicMock()
+        settings.data_dir = Path("/tmp/nonexistent_frameart_test")
+        mock_settings.return_value = settings
+
+        resp = client.post(
+            "/jobs/nonexistent/edit-and-apply",
+            json={"prompt": "variation"},
+        )
+        assert resp.status_code == 404
+
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_edit_and_apply")
+    @patch("frameart.tv.controller.get_art_thumbnail")
+    def test_edit_from_tv_art_success(
+        self,
+        mock_thumbnail,
+        mock_run,
+        mock_settings,
+        tmp_path,
+    ):
+        settings = MagicMock()
+        settings.data_dir = tmp_path
+        settings.tvs = {}
+        mock_settings.return_value = settings
+        mock_thumbnail.return_value = b"fake-jpeg-bytes"
+        mock_run.return_value = _fake_result(content_id=None, tv_switched=False)
+
+        resp = client.post(
+            "/tv/art/edit-and-apply",
+            json={
+                "content_id": "MY_F0001",
+                "source_tv_ip": "192.168.1.50",
+                "prompt": "turn this into impressionist style",
+                "no_upload": True,
+            },
+        )
+        assert resp.status_code == 200
+        mock_thumbnail.assert_called_once()
+        mock_run.assert_called_once()
+        assert mock_run.call_args.kwargs["no_upload"] is True
+
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_edit_and_apply")
+    @patch("frameart.tv.controller.get_art_thumbnail")
+    def test_edit_from_tv_art_prefers_local_artifact_over_thumbnail(
+        self,
+        mock_thumbnail,
+        mock_run,
+        mock_settings,
+    ):
+        import tempfile
+
+        settings = MagicMock()
+        settings.tvs = {}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job_dir = Path(tmpdir) / "artifacts" / "2026" / "03" / "02" / "job-1"
+            job_dir.mkdir(parents=True)
+            (job_dir / "final.png").write_bytes(b"fake-local-png")
+            (job_dir / "meta.json").write_text(
+                '{"job_id":"job-1","content_id":"MY_F0001","tv_ip":"192.168.1.50"}'
+            )
+            settings.data_dir = Path(tmpdir)
+            mock_settings.return_value = settings
+            mock_thumbnail.return_value = b"fake-thumb"
+            mock_run.return_value = _fake_result(content_id=None, tv_switched=False)
+
+            resp = client.post(
+                "/tv/art/edit-and-apply",
+                json={
+                    "content_id": "MY_F0001",
+                    "source_tv_ip": "192.168.1.50",
+                    "prompt": "turn this into impressionist style",
+                    "no_upload": True,
+                },
+            )
+
+            assert resp.status_code == 200
+            mock_thumbnail.assert_not_called()
+            mock_run.assert_called_once()
+            assert mock_run.call_args.args[1].endswith("final.png")
+
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_edit_and_apply")
+    @patch("frameart.tv.controller.get_art_thumbnail")
+    def test_edit_from_tv_defaults_target_to_source_tv(
+        self,
+        mock_thumbnail,
+        mock_run,
+        mock_settings,
+        tmp_path,
+    ):
+        settings = MagicMock()
+        settings.data_dir = tmp_path
+        settings.tvs = {}
+        mock_settings.return_value = settings
+        mock_thumbnail.return_value = b"fake-jpeg-bytes"
+        mock_run.return_value = _fake_result()
+
+        resp = client.post(
+            "/tv/art/edit-and-apply",
+            json={
+                "content_id": "MY_F0001",
+                "source_tv_ip": "192.168.1.77",
+                "prompt": "make a surreal variant",
+            },
+        )
+        assert resp.status_code == 200
+        assert mock_run.call_args.kwargs["tv_ip"] == "192.168.1.77"
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.get_art_thumbnail")
+    def test_edit_from_tv_thumbnail_missing_returns_404(
+        self,
+        mock_thumbnail,
+        mock_settings,
+        tmp_path,
+    ):
+        settings = MagicMock()
+        settings.data_dir = tmp_path
+        settings.tvs = {}
+        mock_settings.return_value = settings
+        mock_thumbnail.return_value = None
+
+        resp = client.post(
+            "/tv/art/edit-and-apply",
+            json={
+                "content_id": "MY_F0001",
+                "source_tv_ip": "192.168.1.50",
+                "prompt": "variation",
+                "no_upload": True,
+            },
+        )
+        assert resp.status_code == 404
+
+
 # ---------------------------------------------------------------------------
 # GET /tv/status
 # ---------------------------------------------------------------------------
