@@ -865,6 +865,8 @@
         <button class="btn btn-secondary btn-small" id="btn-tv-art-select-all">Select All</button>
         <button class="btn btn-secondary btn-small" id="btn-tv-art-clear">Clear</button>
         <button class="btn btn-danger btn-small" id="btn-delete-selected" disabled>Delete Selected</button>
+        <button class="btn btn-danger btn-small" id="btn-delete-all-except-fav">Delete All Except Favorites</button>
+        <button class="btn btn-danger btn-small" id="btn-delete-all-art">Delete All</button>
       </div>
     </div>
     <div class="tv-art-grid" id="tv-art-grid"></div>
@@ -2658,6 +2660,8 @@
   document.getElementById('btn-tv-clear-selection-inline').addEventListener('click', () => setAllTVArtSelections(false));
   document.getElementById('btn-tv-display-selected').addEventListener('click', (e) => displaySelectedTVArt(e.currentTarget));
   document.getElementById('btn-tv-matte-selected').addEventListener('click', openMatteForSelectedTVArt);
+  document.getElementById('btn-delete-all-art').addEventListener('click', deleteAllTVArt);
+  document.getElementById('btn-delete-all-except-fav').addEventListener('click', deleteAllExceptFavoritesTVArt);
 
   function updateTVSelectionUI() {
     const btn = document.getElementById('btn-delete-selected');
@@ -2896,6 +2900,63 @@
     } finally {
       clearButtonBusy(btn);
       updateTVSelectionUI();
+    }
+  }
+
+  async function deleteAllTVArt() {
+    const tvIp = document.getElementById('tv-art-select').value;
+    if (!tvIp) return;
+    const allIds = Object.keys(loadedTVArtById);
+    if (!allIds.length) { showToast('No artwork loaded. Click "Load Art" first.', 'warn'); return; }
+    if (!confirm('Delete ALL ' + allIds.length + ' artworks from TV? This includes favourites and cannot be undone.')) return;
+
+    const btn = document.getElementById('btn-delete-all-art');
+    setButtonBusy(btn, 'Deleting all...');
+    try {
+      const resp = await fetch('/tv/art/delete', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ content_ids: allIds, tv_ip: tvIp, include_favorites: true }),
+      });
+      if (!resp.ok) throw new Error('Server returned ' + resp.status);
+      const data = await resp.json();
+      await loadTVArt();
+      showToast('Deleted ' + data.deleted.length + ' artwork(s) from TV.', 'done');
+    } catch (e) {
+      showToast('Failed to delete all: ' + e.message, 'error');
+    } finally {
+      clearButtonBusy(btn);
+    }
+  }
+
+  async function deleteAllExceptFavoritesTVArt() {
+    const tvIp = document.getElementById('tv-art-select').value;
+    if (!tvIp) return;
+    const nonFavIds = Object.entries(loadedTVArtById)
+      .filter(([, a]) => !a.is_favourite)
+      .map(([cid]) => cid);
+    if (!nonFavIds.length) { showToast('All artwork on this TV is favourited.', 'warn'); return; }
+    const favCount = Object.keys(loadedTVArtById).length - nonFavIds.length;
+    const msg = 'Delete ' + nonFavIds.length + ' non-favourite artwork(s) from TV?'
+      + (favCount > 0 ? ' (' + favCount + ' favourite(s) will be kept.)' : '');
+    if (!confirm(msg)) return;
+
+    const btn = document.getElementById('btn-delete-all-except-fav');
+    setButtonBusy(btn, 'Deleting...');
+    try {
+      const resp = await fetch('/tv/art/delete', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ content_ids: nonFavIds, tv_ip: tvIp, include_favorites: false }),
+      });
+      if (!resp.ok) throw new Error('Server returned ' + resp.status);
+      const data = await resp.json();
+      await loadTVArt();
+      showToast('Deleted ' + data.deleted.length + ' artwork(s), kept ' + favCount + ' favourite(s).', 'done');
+    } catch (e) {
+      showToast('Failed to delete: ' + e.message, 'error');
+    } finally {
+      clearButtonBusy(btn);
     }
   }
 
