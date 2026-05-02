@@ -226,7 +226,10 @@ def pair(profile: TVProfile) -> bool:
         raise
 
 
-def _run_with_timeout(func, timeout_sec: int = 8):
+TV_OP_TIMEOUT = 20  # seconds — cap for any single TV WebSocket operation
+
+
+def _run_with_timeout(func, timeout_sec: int = TV_OP_TIMEOUT):
     """Run a function in a thread with a timeout. Returns (result, error)."""
     import concurrent.futures
 
@@ -238,6 +241,24 @@ def _run_with_timeout(func, timeout_sec: int = 8):
             return None, "timed out"
         except Exception as e:
             return None, str(e)
+
+
+def _run_tv_op(profile: TVProfile, func, description: str, timeout_sec: int = TV_OP_TIMEOUT):
+    """Run a TV WebSocket operation with serialization, retry, and timeout.
+
+    Raises RuntimeError if the operation fails or times out.
+    """
+    def _inner():
+        return _run_serialized(
+            profile,
+            lambda: _retry(func, description),
+            description,
+        )
+
+    result, err = _run_with_timeout(_inner, timeout_sec=timeout_sec)
+    if err:
+        raise RuntimeError(f"{description}: {err}")
+    return result
 
 
 def get_status(profile: TVProfile) -> TVStatus:
@@ -428,11 +449,7 @@ def upload_image(
         return content_id
 
     try:
-        content_id = _run_serialized(
-            profile,
-            lambda: _retry(_do_upload, "Upload image"),
-            "Upload image",
-        )
+        content_id = _run_tv_op(profile, _do_upload, "Upload image", timeout_sec=60)
         logger.info("Uploaded image, content_id=%s", content_id)
         return UploadResult(content_id=content_id, success=True)
     except Exception as e:
@@ -485,11 +502,7 @@ def switch_art(profile: TVProfile, content_id: str) -> bool:
                 art.close()
 
     try:
-        _run_serialized(
-            profile,
-            lambda: _retry(_do_switch, f"Switch art to {content_id}"),
-            f"Switch art to {content_id}",
-        )
+        _run_tv_op(profile, _do_switch, f"Switch art to {content_id}")
         logger.info("Switched display to content_id=%s", content_id)
         return True
     except Exception as e:
@@ -508,7 +521,7 @@ def list_art(profile: TVProfile) -> list[dict[str, Any]]:
             with contextlib.suppress(Exception):
                 art.close()
 
-    return _run_serialized(profile, lambda: _retry(_do_list, "List art"), "List art")
+    return _run_tv_op(profile, _do_list, "List art")
 
 
 def list_art_deduplicated(profile: TVProfile) -> list[dict[str, Any]]:
@@ -555,11 +568,7 @@ def get_art_thumbnail(profile: TVProfile, content_id: str) -> bytes | None:
                 art.close()
 
     try:
-        return _run_serialized(
-            profile,
-            lambda: _retry(_do_thumbnail, f"Fetch thumbnail for {content_id}"),
-            f"Fetch thumbnail for {content_id}",
-        )
+        return _run_tv_op(profile, _do_thumbnail, f"Fetch thumbnail for {content_id}")
     except Exception as e:
         logger.warning("Failed to fetch thumbnail for %s: %s", content_id, e)
         return None
@@ -581,11 +590,7 @@ def get_matte_list(profile: TVProfile) -> list[dict[str, Any]]:
             with contextlib.suppress(Exception):
                 art.close()
 
-    result = _run_serialized(
-        profile,
-        lambda: _retry(_do_get_mattes, "Get matte list"),
-        "Get matte list",
-    )
+    result = _run_tv_op(profile, _do_get_mattes, "Get matte list")
     # v3.x returns {"matte_types": [...], "matte_colors": [...]}
     if isinstance(result, dict):
         return result.get("matte_types", [])
@@ -617,11 +622,7 @@ def delete_art(profile: TVProfile, content_ids: list[str]) -> bool:
                 art.close()
 
     try:
-        _run_serialized(
-            profile,
-            lambda: _retry(_do_delete, f"Delete {len(content_ids)} artwork(s)"),
-            f"Delete {len(content_ids)} artwork(s)",
-        )
+        _run_tv_op(profile, _do_delete, f"Delete {len(content_ids)} artwork(s)")
         logger.info("Deleted %d artwork(s): %s", len(content_ids), ", ".join(content_ids))
         return True
     except Exception as e:
@@ -655,11 +656,7 @@ def change_matte(profile: TVProfile, content_id: str, matte_id: str) -> bool:
                 art.close()
 
     try:
-        _run_serialized(
-            profile,
-            lambda: _retry(_do_change_matte, f"Change matte on {content_id}"),
-            f"Change matte on {content_id}",
-        )
+        _run_tv_op(profile, _do_change_matte, f"Change matte on {content_id}")
         logger.info("Changed matte on %s to %s", content_id, matte_id)
         return True
     except Exception as e:

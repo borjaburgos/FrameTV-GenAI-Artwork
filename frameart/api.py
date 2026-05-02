@@ -1611,4 +1611,4 @@ def run_server(host: str = "127.0.0.1", port: int = 8000) -> None:
     """Start the uvicorn server."""
     import uvicorn
 
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(app, host=host, port=port, workers=2)
