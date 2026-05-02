@@ -12,7 +12,7 @@ import logging
 from dataclasses import dataclass
 from statistics import mean, pstdev
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 from frameart.upscalers.base import Upscaler
 
@@ -214,6 +214,7 @@ def postprocess(
     steps: list[str] = []
 
     img = Image.open(io.BytesIO(image_bytes))
+    img = ImageOps.exif_transpose(img)
     img = img.convert("RGB")
 
     # Step 1: Embedded border trim
