@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from PIL import Image
+from PIL import Image, ImageOps
 from samsungtvws import SamsungTVArt, SamsungTVWS
 
 from frameart.config import TVProfile
@@ -356,6 +356,7 @@ def _prepare_image_for_tv(
             file_type, size_mb,
         )
         img = Image.open(io.BytesIO(image_bytes))
+        img = ImageOps.exif_transpose(img)
         logger.debug("Image dimensions: %dx%d mode=%s", img.width, img.height, img.mode)
         img = img.convert("RGB")  # drop alpha if present
         buf = io.BytesIO()
