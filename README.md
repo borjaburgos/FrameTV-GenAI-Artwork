@@ -647,7 +647,15 @@ pytest
 
 # Lint
 ruff check frameart/ tests/
+
+# Browser end-to-end tests (Node 20+; first run also needs the browser runtime)
+npm ci
+npx playwright install chromium
+npm run test:e2e
 ```
+
+Pull requests run the Python matrix, container build, and Playwright browser suite in
+GitHub Actions. Failed browser runs upload a trace, screenshot, and HTML report for diagnosis.
 
 ## Architecture
 
@@ -661,7 +669,9 @@ frameart/
   postprocess.py      # 16:9 crop + 4K resize logic
   artifacts.py        # File storage and metadata
   static/
-    index.html        # Web UI (single-page, no build step)
+    index.html        # Semantic Web UI markup (no frontend build step)
+    app.css           # Responsive visual design
+    app.js            # UI state, API client, and interactions
   providers/
     base.py           # ImageProvider interface
     registry.py       # Provider name -> class mapping
