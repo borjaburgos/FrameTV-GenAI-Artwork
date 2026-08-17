@@ -1,0 +1,12 @@
+# Run Caddy on the same Linux host as frameart-api-lan. The local CA certificate
+# must be trusted on browsers/phones that open this hostname.
+{$FRAMEART_DOMAIN:frameart.home.arpa} {
+	tls internal
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8000
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "same-origin"
+	}
+}
