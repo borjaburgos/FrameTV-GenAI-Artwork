@@ -53,17 +53,20 @@ from io import BytesIO
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from PIL import Image, UnidentifiedImageError
-from pydantic import AfterValidator, BaseModel, Field, SecretStr
+from pydantic import AfterValidator, BaseModel, Field, SecretStr, field_validator
 
 import frameart.public_domain as public_domain
 from frameart import __version__
-from frameart.config import STYLE_PRESETS, TVProfile, load_settings
+from frameart.config import STYLE_PRESETS, ProviderConfig, TVProfile, load_settings
 from frameart.jobs import JobQueueFullError
+from frameart.providers.registry import available_providers
+from frameart.settings_store import read_provider_secrets, update_management_state
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +86,7 @@ _PUBLIC_PATHS = {
     "/redoc",
 }
 _ADMIN_PATHS = {"/jobs/delete", "/tv/art/delete", "/tv/art/matte"}
+_ADMIN_PREFIXES = ("/settings",)
 _rate_limit_events: dict[str, deque[float]] = defaultdict(deque)
 _rate_limit_lock = threading.Lock()
 
@@ -145,6 +149,8 @@ def _token_scopes(settings, token: str | None) -> set[str]:
 
 
 def _required_scope(request: Request) -> str:
+    if request.url.path.startswith(_ADMIN_PREFIXES):
+        return "admin"
     if request.method in {"GET", "HEAD", "OPTIONS"}:
         return "read"
     if request.url.path in _ADMIN_PATHS:
@@ -387,6 +393,136 @@ class ProvidersResponse(BaseModel):
     providers: list[ProviderOption] = Field(default_factory=list)
 
 
+ProviderId = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")]
+ProfileId = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")]
+ModelId = Annotated[str, Field(min_length=1, max_length=200)]
+
+
+class ProviderSettingsRequest(BaseModel):
+    """Editable non-secret provider settings plus optional key rotation."""
+
+    base_url: str | None = Field(None, max_length=2048)
+    model: str | None = Field(None, max_length=200)
+    timeout: int = Field(120, ge=1, le=600)
+    models: list[ModelId] = Field(default_factory=list, max_length=100)
+    api_key: SecretStr | None = Field(None, min_length=1, max_length=8192)
+    clear_api_key: bool = False
+
+    @field_validator("base_url", "model", mode="before")
+    @classmethod
+    def strip_optional_text(cls, value):
+        if value is None:
+            return None
+        stripped = str(value).strip()
+        return stripped or None
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("base_url must be an absolute http(s) URL")
+        return value.rstrip("/")
+
+    @field_validator("models")
+    @classmethod
+    def normalize_models(cls, value: list[str]) -> list[str]:
+        normalized = [model.strip() for model in value if model.strip()]
+        return list(dict.fromkeys(normalized))
+
+
+class ProviderCreateRequest(ProviderSettingsRequest):
+    """Create a built-in provider configuration."""
+
+    name: ProviderId
+
+
+class ManagedProviderResponse(BaseModel):
+    """Provider configuration safe to return to an administrator."""
+
+    name: str
+    base_url: str | None = None
+    model: str | None = None
+    timeout: int = 120
+    models: list[str] = Field(default_factory=list)
+    has_api_key: bool = False
+    api_key_source: str | None = None
+    is_default: bool = False
+
+
+class ManagedProvidersResponse(BaseModel):
+    """Editable provider configuration and available adapter types."""
+
+    default_provider: str
+    default_model: str | None = None
+    available_types: list[str] = Field(default_factory=list)
+    providers: list[ManagedProviderResponse] = Field(default_factory=list)
+
+
+class DefaultsSettingsRequest(BaseModel):
+    """Default provider/model selection."""
+
+    provider: ProviderId
+    model: str | None = Field(None, max_length=200)
+
+    @field_validator("model", mode="before")
+    @classmethod
+    def strip_model(cls, value):
+        if value is None:
+            return None
+        stripped = str(value).strip()
+        return stripped or None
+
+
+class TVSettingsRequest(BaseModel):
+    """Editable TV profile settings."""
+
+    ip: PrivateTVIPv4
+    port: int = Field(8002, ge=1, le=65535)
+    client_name: str = Field("FrameArt", min_length=1, max_length=100)
+    ssl: bool = True
+
+    @field_validator("client_name")
+    @classmethod
+    def strip_client_name(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("client_name must not be empty")
+        return stripped
+
+
+class TVCreateRequest(TVSettingsRequest):
+    """Create a persisted TV profile."""
+
+    profile_id: ProfileId
+
+
+class ManagedTVResponse(BaseModel):
+    """Persisted TV profile safe for the management UI."""
+
+    profile_id: str
+    ip: str
+    port: int
+    client_name: str
+    ssl: bool
+    token_configured: bool = False
+
+
+class ManagedTVsResponse(BaseModel):
+    """Persisted TV profiles."""
+
+    tvs: list[ManagedTVResponse] = Field(default_factory=list)
+
+
+class ConnectionTestResponse(BaseModel):
+    """Result of a provider or TV connectivity test."""
+
+    ok: bool
+    detail: str
+
+
 class JobSummary(BaseModel):
     """Summary of a single job for listing."""
 
@@ -448,6 +584,182 @@ class PublicDomainApplyRequest(BaseModel):
 def _settings():
     """Load settings for the current request."""
     return load_settings()
+
+
+def _provider_environment_key(name: str) -> str | None:
+    candidates = {
+        "openai": ("OPENAI_API_KEY",),
+        "google": ("GOOGLE_API_KEY", "GOOGLE_AI_API_KEY"),
+        "gemini": ("GOOGLE_API_KEY", "GOOGLE_AI_API_KEY"),
+    }.get(name, ())
+    for candidate in candidates:
+        if os.environ.get(candidate):
+            return candidate
+    return None
+
+
+def _provider_payload(config: ProviderConfig) -> dict[str, Any]:
+    return config.model_dump(exclude={"api_key"}, exclude_none=True)
+
+
+def _tv_payload(profile: TVProfile) -> dict[str, Any]:
+    return profile.model_dump(exclude_none=True)
+
+
+def _ensure_managed_providers(
+    managed: dict[str, Any],
+    provider_keys: dict[str, str],
+    settings,
+) -> dict[str, Any]:
+    providers = managed.get("providers")
+    if isinstance(providers, dict):
+        return providers
+
+    names = set(settings.providers)
+    names.add(settings.default_provider)
+    providers = {}
+    for name in sorted(names):
+        config = settings.providers.get(name) or ProviderConfig()
+        providers[name] = _provider_payload(config)
+        if config.api_key:
+            provider_keys.setdefault(name, config.api_key)
+    managed["providers"] = providers
+    return providers
+
+
+def _ensure_managed_tvs(managed: dict[str, Any], settings) -> dict[str, Any]:
+    tvs = managed.get("tvs")
+    if isinstance(tvs, dict):
+        return tvs
+    tvs = {name: _tv_payload(profile) for name, profile in settings.tvs.items()}
+    managed["tvs"] = tvs
+    return tvs
+
+
+def _persist_management(settings, updater) -> None:
+    try:
+        update_management_state(settings.data_dir, updater)
+    except OSError as exc:
+        logger.exception("Could not persist managed settings")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not save settings. Check the FrameArt data-directory permissions.",
+        ) from exc
+
+
+def _managed_providers_response(settings=None) -> ManagedProvidersResponse:
+    settings = settings or _settings()
+    managed_keys = read_provider_secrets(settings.data_dir)
+    names = set(settings.providers)
+    names.add(settings.default_provider)
+    providers: list[ManagedProviderResponse] = []
+
+    for name in sorted(names):
+        config = settings.providers.get(name) or ProviderConfig()
+        environment_key = _provider_environment_key(name)
+        if name in managed_keys:
+            key_source = "managed"
+        elif environment_key:
+            key_source = "environment"
+        elif config.api_key:
+            key_source = "config"
+        else:
+            key_source = None
+        configured_models = config.extra.get("models") if isinstance(config.extra, dict) else []
+        models = [model for model in configured_models or [] if isinstance(model, str) and model]
+        providers.append(
+            ManagedProviderResponse(
+                name=name,
+                base_url=config.base_url,
+                model=config.model,
+                timeout=config.timeout,
+                models=models,
+                has_api_key=bool(config.api_key or environment_key),
+                api_key_source=key_source,
+                is_default=name == settings.default_provider,
+            )
+        )
+
+    return ManagedProvidersResponse(
+        default_provider=settings.default_provider,
+        default_model=settings.default_model,
+        available_types=available_providers(),
+        providers=providers,
+    )
+
+
+def _managed_tvs_response(settings=None) -> ManagedTVsResponse:
+    settings = settings or _settings()
+    return ManagedTVsResponse(
+        tvs=[
+            ManagedTVResponse(
+                profile_id=name,
+                ip=profile.ip,
+                port=profile.port,
+                client_name=profile.name,
+                ssl=profile.ssl,
+                token_configured=bool(
+                    profile.token_file and Path(profile.token_file).is_file()
+                ),
+            )
+            for name, profile in sorted(settings.tvs.items())
+        ]
+    )
+
+
+def _validate_provider_name(name: str) -> str:
+    if name not in available_providers():
+        available = ", ".join(available_providers())
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown provider type. Available: {available}",
+        )
+    return name
+
+
+def _test_provider_connection(name: str, config: ProviderConfig) -> str:
+    headers: dict[str, str] = {}
+    if name == "openai":
+        api_key = config.api_key or os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise HTTPException(status_code=400, detail="No OpenAI API key is configured.")
+        headers["Authorization"] = f"Bearer {api_key}"
+        url = (config.base_url or "https://api.openai.com/v1").rstrip("/") + "/models"
+        params = None
+    elif name in {"google", "gemini"}:
+        api_key = (
+            config.api_key
+            or os.environ.get("GOOGLE_API_KEY")
+            or os.environ.get("GOOGLE_AI_API_KEY")
+        )
+        if not api_key:
+            raise HTTPException(status_code=400, detail="No Google API key is configured.")
+        base_url = config.base_url or "https://generativelanguage.googleapis.com/v1beta"
+        url = base_url.rstrip("/") + "/models"
+        params = {"key": api_key}
+    elif name == "ollama":
+        url = (config.base_url or "http://localhost:11434").rstrip("/") + "/api/tags"
+        params = None
+        if config.api_key:
+            headers["Authorization"] = f"Bearer {config.api_key}"
+    else:  # guarded by _validate_provider_name
+        raise HTTPException(status_code=400, detail="Unsupported provider type.")
+
+    try:
+        with httpx.Client(timeout=min(config.timeout, 15)) as client:
+            response = client.get(url, headers=headers, params=params)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Provider returned HTTP {exc.response.status_code}.",
+        ) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Could not reach the provider endpoint.",
+        ) from exc
+    return f"Connected to {name}."
 
 
 def _pipeline_result_to_response(result) -> JobResponse:
@@ -815,6 +1127,246 @@ def list_providers():
         )
 
     return ProvidersResponse(default_provider=settings.default_provider, providers=options)
+
+
+@app.get("/settings/providers", response_model=ManagedProvidersResponse)
+def get_managed_providers():
+    """Return editable provider settings without exposing API keys."""
+    return _managed_providers_response()
+
+
+@app.post("/settings/providers", response_model=ManagedProvidersResponse, status_code=201)
+def create_managed_provider(req: ProviderCreateRequest):
+    """Create a built-in provider configuration and optionally store its key."""
+    name = _validate_provider_name(req.name)
+    settings = _settings()
+    existing_names = set(settings.providers) | {settings.default_provider}
+    if name in existing_names:
+        raise HTTPException(status_code=409, detail=f"Provider {name!r} already exists.")
+    if req.clear_api_key:
+        raise HTTPException(status_code=400, detail="clear_api_key is not valid when creating.")
+
+    extra = {"models": req.models} if req.models else {}
+    provider = ProviderConfig(
+        base_url=req.base_url,
+        model=req.model,
+        timeout=req.timeout,
+        extra=extra,
+    )
+    new_key = req.api_key.get_secret_value().strip() if req.api_key else None
+
+    def update(managed, provider_keys):
+        providers = _ensure_managed_providers(managed, provider_keys, settings)
+        providers[name] = _provider_payload(provider)
+        if new_key:
+            provider_keys[name] = new_key
+
+    _persist_management(settings, update)
+    return _managed_providers_response(load_settings())
+
+
+@app.put("/settings/providers/{name}", response_model=ManagedProvidersResponse)
+def update_managed_provider(name: ProviderId, req: ProviderSettingsRequest):
+    """Replace editable settings for a configured provider."""
+    name = _validate_provider_name(name)
+    settings = _settings()
+    existing = settings.providers.get(name)
+    if existing is None and name != settings.default_provider:
+        raise HTTPException(status_code=404, detail=f"Provider {name!r} is not configured.")
+    if req.clear_api_key and req.api_key is not None:
+        raise HTTPException(status_code=400, detail="Set api_key or clear_api_key, not both.")
+
+    existing = existing or ProviderConfig()
+    extra = dict(existing.extra)
+    if req.models:
+        extra["models"] = req.models
+    else:
+        extra.pop("models", None)
+    provider = ProviderConfig(
+        base_url=req.base_url,
+        model=req.model,
+        timeout=req.timeout,
+        extra=extra,
+    )
+    new_key = req.api_key.get_secret_value().strip() if req.api_key else None
+
+    def update(managed, provider_keys):
+        providers = _ensure_managed_providers(managed, provider_keys, settings)
+        providers[name] = _provider_payload(provider)
+        if req.clear_api_key:
+            provider_keys.pop(name, None)
+        elif new_key:
+            provider_keys[name] = new_key
+
+    _persist_management(settings, update)
+    return _managed_providers_response(load_settings())
+
+
+@app.delete("/settings/providers/{name}", response_model=ManagedProvidersResponse)
+def delete_managed_provider(name: ProviderId):
+    """Remove a provider configuration and its managed API key."""
+    settings = _settings()
+    if name == settings.default_provider:
+        raise HTTPException(
+            status_code=409,
+            detail="Choose another default before deleting this provider.",
+        )
+    if name not in settings.providers:
+        raise HTTPException(status_code=404, detail=f"Provider {name!r} is not configured.")
+
+    def update(managed, provider_keys):
+        providers = _ensure_managed_providers(managed, provider_keys, settings)
+        providers.pop(name, None)
+        provider_keys.pop(name, None)
+
+    _persist_management(settings, update)
+    return _managed_providers_response(load_settings())
+
+
+@app.put("/settings/defaults", response_model=ManagedProvidersResponse)
+def update_managed_defaults(req: DefaultsSettingsRequest):
+    """Persist the default provider and optional model."""
+    settings = _settings()
+    configured_names = set(settings.providers) | {settings.default_provider}
+    if req.provider not in configured_names:
+        raise HTTPException(
+            status_code=400,
+            detail="The default provider must be configured first.",
+        )
+
+    def update(managed, _provider_keys):
+        managed["default_provider"] = req.provider
+        if req.model:
+            managed["default_model"] = req.model
+        else:
+            managed["default_model"] = None
+
+    _persist_management(settings, update)
+    return _managed_providers_response(load_settings())
+
+
+@app.post("/settings/providers/{name}/test", response_model=ConnectionTestResponse)
+def test_managed_provider(name: ProviderId):
+    """Test provider credentials without generating billable artwork."""
+    name = _validate_provider_name(name)
+    settings = _settings()
+    config = settings.providers.get(name)
+    if config is None and name != settings.default_provider:
+        raise HTTPException(status_code=404, detail=f"Provider {name!r} is not configured.")
+    detail = _test_provider_connection(name, config or ProviderConfig())
+    return ConnectionTestResponse(ok=True, detail=detail)
+
+
+@app.get("/settings/tvs", response_model=ManagedTVsResponse)
+def get_managed_tvs():
+    """Return persisted TV profiles without exposing token paths."""
+    return _managed_tvs_response()
+
+
+@app.post("/settings/tvs", response_model=ManagedTVsResponse, status_code=201)
+def create_managed_tv(req: TVCreateRequest):
+    """Create a persisted TV profile."""
+    settings = _settings()
+    if req.profile_id in settings.tvs:
+        raise HTTPException(
+            status_code=409,
+            detail=f"TV profile {req.profile_id!r} already exists.",
+        )
+    token_file = settings.data_dir / "secrets" / f"{req.ip.replace('.', '_')}.token"
+    profile = TVProfile(
+        ip=req.ip,
+        port=req.port,
+        name=req.client_name,
+        ssl=req.ssl,
+        token_file=str(token_file),
+    )
+
+    def update(managed, _provider_keys):
+        tvs = _ensure_managed_tvs(managed, settings)
+        tvs[req.profile_id] = _tv_payload(profile)
+
+    _persist_management(settings, update)
+    return _managed_tvs_response(load_settings())
+
+
+@app.put("/settings/tvs/{profile_id}", response_model=ManagedTVsResponse)
+def update_managed_tv(profile_id: ProfileId, req: TVSettingsRequest):
+    """Replace editable fields for a persisted TV profile."""
+    settings = _settings()
+    existing = settings.tvs.get(profile_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail=f"TV profile {profile_id!r} was not found.")
+    if req.ip == existing.ip and existing.token_file:
+        token_file = existing.token_file
+    else:
+        token_file = str(settings.data_dir / "secrets" / f"{req.ip.replace('.', '_')}.token")
+    profile = TVProfile(
+        ip=req.ip,
+        port=req.port,
+        name=req.client_name,
+        ssl=req.ssl,
+        token_file=token_file,
+    )
+
+    def update(managed, _provider_keys):
+        tvs = _ensure_managed_tvs(managed, settings)
+        tvs[profile_id] = _tv_payload(profile)
+
+    _persist_management(settings, update)
+    return _managed_tvs_response(load_settings())
+
+
+@app.delete("/settings/tvs/{profile_id}", response_model=ManagedTVsResponse)
+def delete_managed_tv(profile_id: ProfileId):
+    """Remove a persisted TV profile without deleting its recoverable pairing token."""
+    settings = _settings()
+    if profile_id not in settings.tvs:
+        raise HTTPException(status_code=404, detail=f"TV profile {profile_id!r} was not found.")
+
+    def update(managed, _provider_keys):
+        tvs = _ensure_managed_tvs(managed, settings)
+        tvs.pop(profile_id, None)
+
+    _persist_management(settings, update)
+    return _managed_tvs_response(load_settings())
+
+
+@app.get("/settings/tvs/{profile_id}/test", response_model=ConnectionTestResponse)
+def test_managed_tv(profile_id: ProfileId):
+    """Check TV reachability and Art Mode support."""
+    from frameart.tv.controller import get_status
+
+    settings = _settings()
+    profile = settings.tvs.get(profile_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail=f"TV profile {profile_id!r} was not found.")
+    status = get_status(profile)
+    if not status.reachable:
+        return ConnectionTestResponse(ok=False, detail=status.error or "TV is not reachable.")
+    if not status.art_mode_supported:
+        return ConnectionTestResponse(
+            ok=False,
+            detail="TV is reachable but Art Mode is unavailable.",
+        )
+    return ConnectionTestResponse(ok=True, detail="TV is reachable and supports Art Mode.")
+
+
+@app.post("/settings/tvs/{profile_id}/pair", response_model=ConnectionTestResponse)
+def pair_managed_tv(profile_id: ProfileId):
+    """Initiate pairing and save the TV token under the FrameArt data directory."""
+    from frameart.tv.controller import _run_with_timeout, pair
+
+    settings = _settings()
+    profile = settings.tvs.get(profile_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail=f"TV profile {profile_id!r} was not found.")
+    result, error = _run_with_timeout(lambda: pair(profile), timeout_sec=30)
+    if error or not result:
+        raise HTTPException(
+            status_code=502,
+            detail=f"TV pairing failed: {error or 'unknown error'}",
+        )
+    return ConnectionTestResponse(ok=True, detail="Pairing succeeded and the token was saved.")
 
 
 @app.post("/generate", response_model=JobResponse)

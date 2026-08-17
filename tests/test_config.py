@@ -9,6 +9,7 @@ import yaml
 from pydantic import ValidationError
 
 from frameart.config import STYLE_PRESETS, Settings, TVProfile, load_settings
+from frameart.settings_store import update_management_state
 
 
 class TestSettings:
@@ -89,3 +90,29 @@ class TestLoadSettings:
 
         assert settings.default_provider == "openai"
         assert settings.log_level == "WARNING"
+
+    def test_managed_settings_override_yaml_but_not_environment(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "base.yaml"
+        config_file.write_text(
+            "default_provider: openai\n"
+            "providers:\n"
+            "  openai:\n"
+            "    model: dall-e-3\n"
+        )
+        monkeypatch.setenv("FRAMEART_CONFIG", str(config_file))
+        monkeypatch.setenv("FRAMEART_DATA_DIR", str(tmp_path))
+
+        def update(settings, provider_keys):
+            settings["default_provider"] = "google"
+            settings["providers"] = {"google": {"model": "nano-banana"}}
+            provider_keys["google"] = "managed-secret"
+
+        update_management_state(tmp_path, update)
+
+        settings = load_settings()
+        assert settings.default_provider == "google"
+        assert set(settings.providers) == {"google"}
+        assert settings.providers["google"].api_key == "managed-secret"
+
+        monkeypatch.setenv("FRAMEART_DEFAULT_PROVIDER", "ollama")
+        assert load_settings().default_provider == "ollama"

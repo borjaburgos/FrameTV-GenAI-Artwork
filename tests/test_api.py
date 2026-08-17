@@ -45,6 +45,23 @@ def _jpeg_bytes() -> bytes:
     return output.getvalue()
 
 
+@pytest.fixture
+def managed_config_env(tmp_path, monkeypatch):
+    """Isolate web-managed configuration beneath a temporary data directory."""
+    config_file = tmp_path / "base.yaml"
+    config_file.write_text(
+        "auth_enabled: false\n"
+        "default_provider: openai\n"
+        "providers:\n"
+        "  openai:\n"
+        "    model: dall-e-3\n"
+    )
+    monkeypatch.setenv("FRAMEART_CONFIG", str(config_file))
+    monkeypatch.setenv("FRAMEART_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("FRAMEART_AUTH_ENABLED", "false")
+    return tmp_path
+
+
 # ---------------------------------------------------------------------------
 # /health
 # ---------------------------------------------------------------------------
@@ -87,6 +104,17 @@ class TestAuthentication:
                 json={"job_ids": ["job-1"]},
                 headers=headers,
             )
+            assert denied.status_code == 403
+
+    def test_automation_token_cannot_read_managed_settings(self, monkeypatch):
+        token = "automation-token-with-twenty-characters"
+        monkeypatch.setenv("FRAMEART_AUTH_ENABLED", "true")
+        monkeypatch.setenv("FRAMEART_ADMIN_TOKEN", "admin-token-with-twenty-characters")
+        monkeypatch.setenv("FRAMEART_AUTOMATION_TOKEN", token)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        with TestClient(app) as secured_client:
+            denied = secured_client.get("/settings/providers", headers=headers)
             assert denied.status_code == 403
 
 
@@ -227,6 +255,74 @@ class TestProviders:
             "nano-banana-2",
             "gemini-2.5-flash-image-preview",
         ]
+
+
+class TestManagedProviders:
+    def test_update_key_is_persisted_but_never_returned(self, managed_config_env):
+        resp = client.put(
+            "/settings/providers/openai",
+            json={
+                "model": "gpt-image-1",
+                "timeout": 90,
+                "models": ["gpt-image-1", "dall-e-3"],
+                "api_key": "top-secret-api-key",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert "top-secret-api-key" not in resp.text
+        provider = resp.json()["providers"][0]
+        assert provider["has_api_key"] is True
+        assert provider["api_key_source"] == "managed"
+        assert provider["model"] == "gpt-image-1"
+
+        from frameart.config import load_settings
+
+        settings = load_settings()
+        assert settings.providers["openai"].api_key == "top-secret-api-key"
+
+    def test_create_change_default_and_delete_provider(self, managed_config_env):
+        created = client.post(
+            "/settings/providers",
+            json={
+                "name": "ollama",
+                "base_url": "http://host.docker.internal:11434",
+                "model": "sdxl",
+                "timeout": 300,
+            },
+        )
+        assert created.status_code == 201
+        assert {p["name"] for p in created.json()["providers"]} == {"openai", "ollama"}
+
+        defaults = client.put(
+            "/settings/defaults",
+            json={"provider": "ollama", "model": "sdxl"},
+        )
+        assert defaults.status_code == 200
+        assert defaults.json()["default_provider"] == "ollama"
+
+        deleted = client.delete("/settings/providers/openai")
+        assert deleted.status_code == 200
+        assert [p["name"] for p in deleted.json()["providers"]] == ["ollama"]
+
+    def test_cannot_delete_default_provider(self, managed_config_env):
+        resp = client.delete("/settings/providers/openai")
+        assert resp.status_code == 409
+
+    @patch("frameart.api.httpx.Client")
+    def test_provider_connection(self, mock_client_cls, managed_config_env):
+        client.put(
+            "/settings/providers/openai",
+            json={"model": "gpt-image-1", "api_key": "test-key"},
+        )
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        mock_client_cls.return_value.__enter__.return_value.get.return_value = response
+
+        resp = client.post("/settings/providers/openai/test")
+
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "detail": "Connected to openai."}
 
     @patch("frameart.api._settings")
     @patch("frameart.api._fetch_google_image_models")
@@ -915,6 +1011,85 @@ class TestTVDiscover:
 
         assert resp.status_code == 503
         assert resp.json() == {"detail": "Use the LAN deployment"}
+
+
+class TestManagedTVs:
+    def test_create_update_and_delete_tv(self, managed_config_env):
+        created = client.post(
+            "/settings/tvs",
+            json={
+                "profile_id": "living_room",
+                "ip": "192.168.50.25",
+                "port": 8002,
+                "client_name": "FrameArt Living Room",
+                "ssl": True,
+            },
+        )
+        assert created.status_code == 201
+        assert created.json()["tvs"] == [
+            {
+                "profile_id": "living_room",
+                "ip": "192.168.50.25",
+                "port": 8002,
+                "client_name": "FrameArt Living Room",
+                "ssl": True,
+                "token_configured": False,
+            }
+        ]
+
+        updated = client.put(
+            "/settings/tvs/living_room",
+            json={
+                "ip": "10.0.0.25",
+                "port": 8001,
+                "client_name": "Living Room",
+                "ssl": False,
+            },
+        )
+        assert updated.status_code == 200
+        assert updated.json()["tvs"][0]["ip"] == "10.0.0.25"
+        assert updated.json()["tvs"][0]["ssl"] is False
+
+        deleted = client.delete("/settings/tvs/living_room")
+        assert deleted.status_code == 200
+        assert deleted.json() == {"tvs": []}
+
+    def test_rejects_public_tv_ip(self, managed_config_env):
+        resp = client.post(
+            "/settings/tvs",
+            json={"profile_id": "invalid", "ip": "8.8.8.8"},
+        )
+        assert resp.status_code == 422
+
+    @patch("frameart.tv.controller.get_status")
+    def test_tv_connection(self, mock_status, managed_config_env):
+        client.post(
+            "/settings/tvs",
+            json={"profile_id": "living_room", "ip": "192.168.50.25"},
+        )
+        mock_status.return_value = MagicMock(
+            reachable=True,
+            art_mode_supported=True,
+            error=None,
+        )
+
+        resp = client.get("/settings/tvs/living_room/test")
+
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+
+    @patch("frameart.tv.controller._run_with_timeout")
+    def test_tv_pairing(self, mock_run, managed_config_env):
+        client.post(
+            "/settings/tvs",
+            json={"profile_id": "living_room", "ip": "192.168.50.25"},
+        )
+        mock_run.return_value = (True, None)
+
+        resp = client.post("/settings/tvs/living_room/pair")
+
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -1728,3 +1903,13 @@ class TestWebUI:
         assert 'id="add-tv-modal"' in resp.text
         assert "parseJSONResponse(resp, 'TV discovery request failed.')" in resp.text
         assert "frameart-api-lan" in resp.text
+
+    def test_settings_ui_has_provider_and_persistent_tv_management(self):
+        resp = client.get("/")
+
+        assert 'id="btn-settings-add-provider"' in resp.text
+        assert 'id="provider-settings-modal"' in resp.text
+        assert 'id="btn-settings-add-tv"' in resp.text
+        assert 'id="tv-settings-modal"' in resp.text
+        assert "'/settings/providers'" in resp.text
+        assert "'/settings/tvs'" in resp.text
