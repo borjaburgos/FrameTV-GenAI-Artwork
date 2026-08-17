@@ -17,6 +17,7 @@ services:
     # on the same subnet. Uncomment if needed:
     # network_mode: host
     restart: "no"
+    command: ["--help"]
     # Override the entrypoint command as needed:
     # command: ["generate-and-apply", "--prompt", "a sunset over the ocean", "--tv-ip", "192.168.1.100"]
 

@@ -81,6 +81,11 @@ from frameart.automation import (
 from frameart.config import STYLE_PRESETS, ProviderConfig, Settings, TVProfile, load_settings
 from frameart.jobs import JobQueueFullError
 from frameart.library import LibraryStore
+from frameart.live_album import (
+    LiveAlbumService,
+    LiveAlbumStore,
+    validate_source_url,
+)
 from frameart.live_score import LiveScoreService, LiveScoreStore, ScoreEvent
 from frameart.providers.registry import available_providers
 from frameart.settings_store import (
@@ -144,6 +149,7 @@ JobId = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")]
 
 _automation_scheduler = AutomationScheduler(load_settings)
 _live_score_service = LiveScoreService(load_settings)
+_live_album_service = LiveAlbumService(load_settings)
 
 
 @asynccontextmanager
@@ -151,9 +157,11 @@ async def _app_lifespan(_app: FastAPI):
     """Run the durable automation loop for every ASGI deployment."""
     _automation_scheduler.start()
     _live_score_service.start()
+    _live_album_service.start()
     try:
         yield
     finally:
+        _live_album_service.stop()
         _live_score_service.stop()
         _automation_scheduler.stop()
 
@@ -202,7 +210,11 @@ def _required_scope(request: Request) -> str:
     if (
         request.method == "POST"
         and request.url.path.startswith("/modes/")
-        and (request.url.path.endswith("/refresh") or request.url.path.endswith("/feed"))
+        and (
+            request.url.path.endswith("/refresh")
+            or request.url.path.endswith("/feed")
+            or request.url.path.endswith("/next")
+        )
     ):
         return "control"
     if request.url.path == "/automation/status" and request.method == "GET":
@@ -755,6 +767,9 @@ class WebhookCreateRequest(BaseModel):
             "live_score.displayed",
             "live_score.partial",
             "live_score.error",
+            "live_album.displayed",
+            "live_album.partial",
+            "live_album.error",
         }
         normalized = list(dict.fromkeys(event.strip() for event in value if event.strip()))
         unsupported = sorted(set(normalized) - supported)
@@ -812,6 +827,35 @@ class LiveScoreFeedRequest(BaseModel):
         max_length=20,
     )
     provider_updated_at: str | None = Field(None, max_length=100)
+
+
+class LiveAlbumCreateRequest(BaseModel):
+    """Create a bounded public-photo slideshow."""
+
+    name: str = Field(..., min_length=1, max_length=100)
+    provider: str = Field(..., pattern=r"^(manifest|public_page|immich)$")
+    source_url: str = Field(..., min_length=8, max_length=4096)
+    group_id: AutomationId
+    interval_seconds: int = Field(300, ge=30, le=86400)
+    shuffle: bool = False
+    allow_private_network: bool = False
+    enabled: bool = True
+
+    @field_validator("name")
+    @classmethod
+    def strip_live_album_name(cls, value: str) -> str:
+        return _strip_nonempty(value)
+
+    @field_validator("source_url")
+    @classmethod
+    def validate_live_album_url(cls, value: str) -> str:
+        return validate_source_url(value)
+
+
+class LiveAlbumEnabledRequest(BaseModel):
+    """Pause or resume a live-album slideshow."""
+
+    enabled: bool
 
 
 CollectionId = Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")]
@@ -884,6 +928,11 @@ def _automation_store(settings=None) -> AutomationStore:
 def _live_score_store(settings=None) -> LiveScoreStore:
     settings = settings or _settings()
     return LiveScoreStore(settings.data_dir)
+
+
+def _live_album_store(settings=None) -> LiveAlbumStore:
+    settings = settings or _settings()
+    return LiveAlbumStore(settings.data_dir)
 
 
 _SENSITIVE_SETTING_TERMS = ("api_key", "password", "secret", "token")
@@ -2865,6 +2914,75 @@ def delete_live_score_tracker(tracker_id: AutomationId):
     return {"deleted": tracker_id}
 
 
+# ---------------------------------------------------------------------------
+# Routes — Live Album mode
+# ---------------------------------------------------------------------------
+
+
+@app.get("/modes/live-album")
+def list_live_albums():
+    return _live_album_store().list_albums()
+
+
+@app.post("/modes/live-album", status_code=201)
+def create_live_album(req: LiveAlbumCreateRequest):
+    settings = _settings()
+    if _automation_store(settings).get_group(req.group_id) is None:
+        raise HTTPException(status_code=422, detail="TV group was not found.")
+    try:
+        return _live_album_store(settings).create_album(
+            name=req.name,
+            provider=req.provider,
+            source_url=req.source_url,
+            group_id=req.group_id,
+            interval_seconds=req.interval_seconds,
+            shuffle=req.shuffle,
+            allow_private_network=req.allow_private_network,
+            enabled=req.enabled,
+        )
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="A live album with that name exists.",
+        ) from exc
+
+
+@app.put("/modes/live-album/{album_id}/enabled")
+def set_live_album_enabled(album_id: AutomationId, req: LiveAlbumEnabledRequest):
+    store = _live_album_store()
+    if not store.set_enabled(album_id, req.enabled):
+        raise HTTPException(status_code=404, detail="Live album was not found.")
+    return store.get_album(album_id)
+
+
+@app.post("/modes/live-album/{album_id}/next")
+def advance_live_album(album_id: AutomationId):
+    try:
+        return _live_album_service.advance_album(album_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Live album was not found.") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/modes/live-album/{album_id}/image")
+def get_live_album_image(album_id: AutomationId):
+    settings = _settings()
+    if _live_album_store(settings).get_album(album_id) is None:
+        raise HTTPException(status_code=404, detail="Live album was not found.")
+    image_path = settings.data_dir / "modes" / "live-album" / album_id / "current.png"
+    if not image_path.is_file():
+        raise HTTPException(status_code=404, detail="Album has not displayed a photo yet.")
+    return FileResponse(image_path, media_type="image/png")
+
+
+@app.delete("/modes/live-album/{album_id}")
+def delete_live_album(album_id: AutomationId):
+    if not _live_album_service.delete_album(album_id):
+        raise HTTPException(status_code=404, detail="Live album was not found.")
+    return {"deleted": album_id}
+
+
 @app.post("/jobs/delete", response_model=DeleteJobsResponse)
 def delete_jobs(req: DeleteJobsRequest):
     """Delete generated job artifacts from the host filesystem."""
@@ -3434,6 +3552,11 @@ def run_server(host: str = "127.0.0.1", port: int = 8000) -> None:
     """Start the uvicorn server."""
     import uvicorn
 
+    if (
+        os.getenv("FRAMEART_SECURE_CONTAINER", "").lower() in {"1", "true", "yes", "on"}
+        and "FRAMEART_AUTH_ENABLED" not in os.environ
+    ):
+        os.environ["FRAMEART_AUTH_ENABLED"] = "true"
     settings = load_settings()
     if not _is_loopback_host(host) and not settings.auth_enabled:
         raise RuntimeError(

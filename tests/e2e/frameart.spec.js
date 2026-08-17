@@ -258,3 +258,45 @@ test('creates, pauses, and deletes a live-score mode', async ({ page, request })
     await request.delete('/settings/tvs/e2e_score_tv');
   }
 });
+
+test('creates, pauses, and deletes a live-album mode', async ({ page, request }) => {
+  await request.post('/settings/tvs', {
+    data: {
+      profile_id: 'e2e_album_tv',
+      ip: '192.168.50.28',
+      port: 8002,
+      client_name: 'FrameArt E2E',
+      ssl: true,
+    },
+  });
+  const groupResponse = await request.post('/automation/groups', {
+    data: { name: 'E2E Album Group', tv_profile_ids: ['e2e_album_tv'] },
+  });
+  const group = await groupResponse.json();
+
+  try {
+    await page.goto('/');
+    await page.locator('.tabs').getByRole('button', { name: 'Modes' }).click();
+    await page.getByLabel('Album name').fill('E2E Live Album');
+    await page.getByLabel('Album source').selectOption('manifest');
+    await page.getByLabel('Public album or manifest URL')
+      .fill('https://photos.example/e2e-album.json');
+    await page.locator('#live-album-group').selectOption(group.id);
+    await page.getByLabel('Shuffle daily').check();
+    await page.getByRole('button', { name: 'Create Live Album' }).click();
+
+    const album = page.locator('#live-album-list .settings-item').filter({
+      hasText: 'E2E Live Album',
+    });
+    await expect(album).toContainText('manifest');
+    await expect(album).toContainText('photos.example');
+    await album.getByRole('button', { name: 'Pause' }).click();
+    await expect(album.getByRole('button', { name: 'Resume' })).toBeVisible();
+    page.once('dialog', (dialog) => dialog.accept());
+    await album.getByRole('button', { name: 'Delete' }).click();
+    await expect(album).toHaveCount(0);
+  } finally {
+    await request.delete('/automation/groups/' + group.id);
+    await request.delete('/settings/tvs/e2e_album_tv');
+  }
+});

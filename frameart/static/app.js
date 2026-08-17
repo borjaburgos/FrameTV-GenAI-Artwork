@@ -19,6 +19,7 @@
   let automationWebhooks = [];
   let automationStatus = null;
   let liveScoreTrackers = [];
+  let liveAlbums = [];
   let editingProviderName = null;
   let editingTVProfileId = null;
   const generationJobs = new Map();
@@ -1426,16 +1427,19 @@
   async function loadLiveScores(triggerButton) {
     if (triggerButton) setButtonBusy(triggerButton, 'Refreshing...');
     try {
-      const [trackerResponse, groupResponse] = await Promise.all([
+      const [trackerResponse, albumResponse, groupResponse] = await Promise.all([
         apiFetch('/modes/live-score'),
+        apiFetch('/modes/live-album'),
         apiFetch('/automation/groups'),
       ]);
       liveScoreTrackers = await parseJSONResponse(
         trackerResponse,
         'Could not load live-score trackers.',
       );
+      liveAlbums = await parseJSONResponse(albumResponse, 'Could not load live albums.');
       automationGroups = await parseJSONResponse(groupResponse, 'Could not load TV groups.');
       renderLiveScores();
+      renderLiveAlbums();
     } finally {
       if (triggerButton) clearButtonBusy(triggerButton);
     }
@@ -1534,6 +1538,96 @@
         if (!window.confirm('Delete this live-score tracker and its current TV image?')) return;
         const response = await apiFetch('/modes/live-score/' + remove.dataset.liveScoreDelete, {method: 'DELETE'});
         await parseJSONResponse(response, 'Could not delete tracker.');
+      }
+      await loadLiveScores();
+    } catch (error) { showToast(error.message, 'error'); }
+    finally { clearButtonBusy(button); }
+  });
+
+  function renderLiveAlbums() {
+    const groups = automationGroups || [];
+    document.getElementById('live-album-group').innerHTML = groups.map((group) =>
+      '<option value="' + esc(group.id) + '">' + esc(group.name) + '</option>'
+    ).join('');
+    const list = document.getElementById('live-album-list');
+    if (!liveAlbums.length) {
+      list.innerHTML = '<div class="settings-item"><span>No live albums yet.</span></div>';
+      return;
+    }
+    list.innerHTML = liveAlbums.map((album) => {
+      const group = groups.find((item) => item.id === album.group_id);
+      const preview = album.last_item_id
+        ? '<img class="live-score-preview" src="/modes/live-album/' + esc(album.id) +
+          '/image?' + Date.now() + '" alt="Current album photo preview">'
+        : '';
+      return '<div class="settings-item"><div class="settings-item-main"><strong>' +
+        esc(album.name) + '</strong><span>' + esc(album.last_item_title || 'Waiting for first photo') +
+        '</span><span>' + esc(album.provider) + ' · ' + esc(album.source_host || 'remote source') +
+        ' · ' + esc(group?.name || album.group_id) + ' · every ' +
+        esc(String(album.interval_seconds)) + 's · ' + esc(album.last_status || 'new') +
+        (album.source_count ? ' · ' + esc(String(album.source_count)) + ' photos' : '') +
+        (album.last_error ? ' · ' + esc(album.last_error) : '') + '</span>' + preview +
+        '</div><div class="settings-item-actions">' +
+        '<button class="btn btn-secondary btn-small" data-live-album-next="' +
+        esc(album.id) + '">Next now</button>' +
+        '<button class="btn btn-secondary btn-small" data-live-album-toggle="' +
+        esc(album.id) + '" data-enabled="' + String(album.enabled) + '">' +
+        (album.enabled ? 'Pause' : 'Resume') + '</button>' +
+        '<button class="btn btn-danger btn-small" data-live-album-delete="' +
+        esc(album.id) + '">Delete</button></div></div>';
+    }).join('');
+  }
+
+  document.getElementById('btn-live-album-create').addEventListener('click', async (event) => {
+    const body = {
+      name: document.getElementById('live-album-name').value.trim(),
+      provider: document.getElementById('live-album-provider').value,
+      source_url: document.getElementById('live-album-url').value.trim(),
+      group_id: document.getElementById('live-album-group').value,
+      interval_seconds: Number(document.getElementById('live-album-interval').value),
+      shuffle: document.getElementById('live-album-shuffle').checked,
+      allow_private_network: document.getElementById('live-album-private').checked,
+      enabled: true,
+    };
+    if (!body.name || !body.source_url || !body.group_id) {
+      showToast('Enter a name and source URL, and choose a TV group.', 'warn'); return;
+    }
+    setButtonBusy(event.currentTarget, 'Creating...');
+    try {
+      const response = await apiFetch('/modes/live-album', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+      });
+      await parseJSONResponse(response, 'Could not create live album.');
+      document.getElementById('live-album-name').value = '';
+      document.getElementById('live-album-url').value = '';
+      await loadLiveScores();
+      showToast('Live album created. Use Next now to test its source.', 'done');
+    } catch (error) { showToast(error.message, 'error'); }
+    finally { clearButtonBusy(event.currentTarget); }
+  });
+
+  document.getElementById('live-album-list').addEventListener('click', async (event) => {
+    const next = event.target.closest('[data-live-album-next]');
+    const toggle = event.target.closest('[data-live-album-toggle]');
+    const remove = event.target.closest('[data-live-album-delete]');
+    const button = next || toggle || remove;
+    if (!button) return;
+    setButtonBusy(button, next ? 'Loading...' : 'Saving...');
+    try {
+      if (next) {
+        const response = await apiFetch('/modes/live-album/' + next.dataset.liveAlbumNext + '/next', {method: 'POST'});
+        const result = await parseJSONResponse(response, 'Could not advance live album.');
+        showToast('Live album ' + result.status + '.', result.status === 'error' ? 'error' : 'done');
+      } else if (toggle) {
+        const response = await apiFetch('/modes/live-album/' + toggle.dataset.liveAlbumToggle + '/enabled', {
+          method: 'PUT', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({enabled: toggle.dataset.enabled !== 'true'}),
+        });
+        await parseJSONResponse(response, 'Could not update live album.');
+      } else if (remove) {
+        if (!window.confirm('Delete this live album and its current TV image?')) return;
+        const response = await apiFetch('/modes/live-album/' + remove.dataset.liveAlbumDelete, {method: 'DELETE'});
+        await parseJSONResponse(response, 'Could not delete live album.');
       }
       await loadLiveScores();
     } catch (error) { showToast(error.message, 'error'); }
@@ -1719,7 +1813,8 @@
       const created = await writeAutomation('/automation/webhooks', 'POST', {
         name, url, events: [
           'schedule.completed', 'schedule.partial', 'schedule.failed',
-          'live_score.displayed', 'live_score.partial', 'live_score.error', 'integration.test',
+          'live_score.displayed', 'live_score.partial', 'live_score.error',
+          'live_album.displayed', 'live_album.partial', 'live_album.error', 'integration.test',
         ],
       }, 'Could not add webhook.');
       window.alert('Save this webhook signing secret now; it will not be shown again:\n\n' + created.secret);

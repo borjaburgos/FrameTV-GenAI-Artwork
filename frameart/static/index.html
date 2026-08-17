@@ -407,7 +407,46 @@
     </div>
     <div class="settings-card settings-card-wide">
       <h3>Live Album</h3>
-      <p>Public album slideshow management will appear here. Album adapters use one-at-a-time caching so the host and TV do not accumulate copies.</p>
+      <p>Rotate a public manifest, shared web album, or Immich public share. Only the current 4K still is cached locally and superseded TV images are removed.</p>
+      <div class="row">
+        <div>
+          <label for="live-album-name">Album name</label>
+          <input id="live-album-name" maxlength="100" placeholder="Family highlights">
+        </div>
+        <div>
+          <label for="live-album-provider">Album source</label>
+          <select id="live-album-provider">
+            <option value="manifest">JSON manifest</option>
+            <option value="public_page">Public web album (best effort)</option>
+            <option value="immich">Immich public share</option>
+          </select>
+        </div>
+        <div>
+          <label for="live-album-url">Public album or manifest URL</label>
+          <input id="live-album-url" type="url" maxlength="4096" placeholder="https://photos.example/album.json">
+        </div>
+        <div>
+          <label for="live-album-group">TV group</label>
+          <select id="live-album-group"></select>
+        </div>
+        <div>
+          <label for="live-album-interval">Change photo</label>
+          <select id="live-album-interval">
+            <option value="30">Every 30 seconds</option>
+            <option value="60">Every minute</option>
+            <option value="300" selected>Every 5 minutes</option>
+            <option value="900">Every 15 minutes</option>
+            <option value="3600">Every hour</option>
+          </select>
+        </div>
+      </div>
+      <div class="checkbox-row">
+        <label><input id="live-album-shuffle" type="checkbox"> Shuffle daily</label>
+        <label><input id="live-album-private" type="checkbox"> Allow trusted private/LAN source</label>
+      </div>
+      <p class="hint">Apple and Google public pages are parsed on a best-effort basis because they do not expose a stable anonymous album API. A JSON manifest is the portable option. Private-network access is off by default to prevent server-side request abuse.</p>
+      <button class="btn btn-small" id="btn-live-album-create">Create Live Album</button>
+      <div class="settings-list" id="live-album-list"></div>
     </div>
   </div>
 </div>

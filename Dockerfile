@@ -29,7 +29,8 @@ VOLUME /data/frameart
 # Switch to non-root user
 USER frameart
 
-ENV FRAMEART_DATA_DIR=/data/frameart
+ENV FRAMEART_DATA_DIR=/data/frameart \
+    FRAMEART_SECURE_CONTAINER=true
 
 EXPOSE 8000
 
@@ -37,4 +38,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')"]
 
 ENTRYPOINT ["frameart"]
-CMD ["--help"]
+CMD ["serve", "--host", "0.0.0.0", "--port", "8000"]
