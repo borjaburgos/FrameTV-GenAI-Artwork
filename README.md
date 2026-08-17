@@ -56,6 +56,22 @@ Set your API key:
 export OPENAI_API_KEY="sk-..."
 ```
 
+### Manage providers and TVs in the web UI
+
+Open **Settings** to add, edit, test, and remove image providers; update API keys;
+choose the default provider/model; and manage persistent TV profiles. Provider keys are
+never returned to the browser after saving: the UI only shows whether a key is configured.
+
+Web-managed settings are stored below FrameArt's `data_dir`:
+
+- `settings/managed.yaml` contains non-secret provider, default, and TV configuration.
+- `secrets/provider-keys.yaml` contains provider API keys with owner-only file permissions.
+
+Environment variables remain authoritative over web-managed values. When authentication is
+enabled, all `/settings/*` API operations require an admin token. TVs found through **Scan
+Network** or entered through **Add by IP** can be saved as persistent profiles from the TVs
+page.
+
 ## Pairing with Your Frame TV
 
 Before uploading art, you must pair FrameArt with your TV. This is a one-time setup:
@@ -563,8 +579,8 @@ See [docs/LXC.md](docs/LXC.md) for running FrameArt in a Proxmox LXC container. 
 - If running in Docker on Linux, use the `frameart-api-lan` service shown above. The regular
   bridge-networked API cannot reliably receive LAN SSDP responses.
 - If multicast is blocked by the host or network, open **TVs → Add by IP** and enter the TV's
-  RFC1918 address. Manually added TVs last for the current browser session; persistent TV
-  configuration remains available through `config.yaml`.
+  RFC1918 address. Use **Save** on the discovered/manual TV card to turn it into a persistent
+  profile, or keep it as a browser-session-only connection.
 
 ### Upload fails with error -1 on 2018/2019 Frame TVs
 

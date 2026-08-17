@@ -191,6 +191,9 @@
   }
   .settings-card h3 { font-size: 1rem; margin-bottom: .4rem; }
   .settings-card p { color: var(--muted); font-size: .86rem; line-height: 1.4; }
+  .settings-card-wide { grid-column: 1 / -1; }
+  .settings-card-header { display: flex; justify-content: space-between; align-items: flex-start;
+                          gap: .8rem; }
   .settings-list {
     margin-top: .7rem;
     display: flex;
@@ -207,7 +210,14 @@
     font-size: .82rem;
     color: var(--muted);
   }
+  .settings-item-main { min-width: 0; }
+  .settings-item-main span { display: block; margin-top: .2rem; overflow-wrap: anywhere; }
+  .settings-item-actions { display: flex; align-items: center; justify-content: flex-end;
+                           gap: .35rem; flex-wrap: wrap; }
   .settings-item strong { color: var(--text); font-weight: 600; }
+  .inline-check { display: flex; align-items: center; gap: .5rem; margin-bottom: .8rem; }
+  .inline-check input { width: auto; margin: 0; }
+  .inline-check label { margin: 0; }
 
   /* --- Forms --- */
   label { display: block; color: var(--muted); font-size: .8rem; margin-bottom: .25rem; }
@@ -593,6 +603,9 @@
     .tv-art-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .tv-card { flex-direction: column; align-items: flex-start; gap: .55rem; }
     .tv-card .badge { align-self: flex-start; }
+    .settings-card-header { flex-direction: column; }
+    .settings-item { flex-direction: column; align-items: stretch; }
+    .settings-item-actions { justify-content: flex-start; }
     .shortcut-grid { grid-template-columns: 1fr; }
     .shortcut-grid .keys { justify-content: flex-start; }
     .modal-overlay { align-items: flex-end; }
@@ -895,29 +908,120 @@
   <div class="page-eyebrow">Settings</div>
   <div class="section-heading">
     <h2>Settings</h2>
+    <button class="btn btn-secondary" id="btn-settings-refresh">Refresh</button>
   </div>
-  <p class="page-intro">Manage providers and defaults. Generation and edit settings live under Create.</p>
+  <p class="page-intro">Manage providers, API keys, defaults, and persistent TV profiles.</p>
   <div class="settings-grid">
-    <div class="settings-card">
-      <h3>Providers</h3>
-      <p>Configured providers and image-capable models currently available.</p>
+    <div class="settings-card settings-card-wide">
+      <div class="settings-card-header">
+        <div>
+          <h3>Providers</h3>
+          <p>API keys are masked and stored separately from non-secret settings.</p>
+        </div>
+        <button class="btn btn-secondary btn-small" id="btn-settings-add-provider">Add Provider</button>
+      </div>
       <div class="settings-list" id="settings-provider-list">
         <div class="settings-item"><strong>Loading...</strong><span></span></div>
       </div>
     </div>
     <div class="settings-card">
-      <h3>TV Availability</h3>
-      <p>Configured and discovered TVs in this session.</p>
+      <h3>Generation Defaults</h3>
+      <p>Choose the provider and optional model preselected in Create.</p>
+      <div style="margin-top:.7rem;">
+        <label for="settings-default-provider">Default provider</label>
+        <select id="settings-default-provider"></select>
+        <label for="settings-default-model">Default model</label>
+        <input id="settings-default-model" maxlength="200" placeholder="Provider default">
+        <button class="btn btn-small" id="btn-settings-save-defaults">Save Defaults</button>
+      </div>
+    </div>
+    <div class="settings-card settings-card-wide">
+      <div class="settings-card-header">
+        <div>
+          <h3>Persistent TVs</h3>
+          <p>Profiles saved here survive browser and container restarts.</p>
+        </div>
+        <button class="btn btn-secondary btn-small" id="btn-settings-add-tv">Add TV</button>
+      </div>
       <div class="settings-list" id="settings-tv-list">
-        <div class="settings-item"><strong>Configured TVs</strong><span id="settings-tv-count">0</span></div>
+        <div class="settings-item"><strong>Loading...</strong><span></span></div>
       </div>
     </div>
     <div class="settings-card">
-      <h3>Hints</h3>
-      <p>Use <kbd>Ctrl</kbd>+<kbd>Enter</kbd> to generate quickly in Create > AI. Use <kbd>/</kbd> to focus search fields.</p>
+      <h3>Storage</h3>
+      <p>Web-managed settings are an overlay under the FrameArt data directory. Environment variables remain authoritative and cannot be cleared from this UI.</p>
     </div>
   </div>
 </div>
+</div>
+
+<!-- Provider settings editor -->
+<div class="modal-overlay" id="provider-settings-modal" role="dialog" aria-modal="true" aria-labelledby="provider-settings-title">
+  <div class="modal-dialog">
+    <h3 id="provider-settings-title">Add Provider</h3>
+    <label for="provider-settings-name">Provider type</label>
+    <select id="provider-settings-name"></select>
+    <label for="provider-settings-base-url">Base URL</label>
+    <input id="provider-settings-base-url" maxlength="2048" placeholder="Use provider default">
+    <div class="row">
+      <div>
+        <label for="provider-settings-model">Primary model</label>
+        <input id="provider-settings-model" maxlength="200" placeholder="Provider default">
+      </div>
+      <div>
+        <label for="provider-settings-timeout">Timeout (seconds)</label>
+        <input id="provider-settings-timeout" type="number" min="1" max="600" value="120">
+      </div>
+    </div>
+    <label for="provider-settings-models">Additional selectable models</label>
+    <textarea id="provider-settings-models" placeholder="One model per line"></textarea>
+    <label for="provider-settings-api-key">API key</label>
+    <input id="provider-settings-api-key" type="password" maxlength="8192" autocomplete="new-password" placeholder="Leave blank to keep the current key">
+    <p id="provider-settings-key-state" style="margin-top:-.45rem; margin-bottom:.8rem; font-size:.8rem; color:var(--muted);"></p>
+    <div class="inline-check">
+      <input id="provider-settings-clear-key" type="checkbox">
+      <label for="provider-settings-clear-key">Clear the managed key</label>
+    </div>
+    <div class="status-bar error" id="provider-settings-error" role="alert">
+      <div class="value" id="provider-settings-error-text"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary btn-small" id="btn-provider-settings-cancel">Cancel</button>
+      <button class="btn btn-small" id="btn-provider-settings-save">Save Provider</button>
+    </div>
+  </div>
+</div>
+
+<!-- Persistent TV settings editor -->
+<div class="modal-overlay" id="tv-settings-modal" role="dialog" aria-modal="true" aria-labelledby="tv-settings-title">
+  <div class="modal-dialog">
+    <h3 id="tv-settings-title">Add TV</h3>
+    <label for="tv-settings-profile-id">Profile ID</label>
+    <input id="tv-settings-profile-id" maxlength="64" placeholder="living_room">
+    <label for="tv-settings-ip">Private IPv4 address</label>
+    <input id="tv-settings-ip" inputmode="decimal" maxlength="15" placeholder="192.168.1.100">
+    <div class="row">
+      <div>
+        <label for="tv-settings-port">Port</label>
+        <input id="tv-settings-port" type="number" min="1" max="65535" value="8002">
+      </div>
+      <div>
+        <label for="tv-settings-client-name">Pairing name</label>
+        <input id="tv-settings-client-name" maxlength="100" value="FrameArt">
+      </div>
+    </div>
+    <div class="inline-check">
+      <input id="tv-settings-ssl" type="checkbox" checked>
+      <label for="tv-settings-ssl">Use secure WebSocket (port 8002)</label>
+    </div>
+    <div class="status-bar error" id="tv-settings-error" role="alert">
+      <div class="value" id="tv-settings-error-text"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary btn-small" id="btn-tv-settings-cancel">Cancel</button>
+      <button class="btn btn-small" id="btn-tv-settings-save">Save TV</button>
+    </div>
+  </div>
 </div>
 
 <!-- Add a session-only TV by private IP -->
@@ -1105,6 +1209,10 @@
   let loadedTVArtById = {};
   let selectedGalleryJobIds = new Set();
   let configuredProviders = [];
+  let managedProviderSettings = null;
+  let managedTVSettings = [];
+  let editingProviderName = null;
+  let editingTVProfileId = null;
   const generationJobs = new Map();
   let generationPollTimer = null;
   let authPromptPromise = null;
@@ -1295,18 +1403,46 @@
   function renderSettingsProviders() {
     const container = document.getElementById('settings-provider-list');
     if (!container) return;
-    if (!configuredProviders.length) {
+    const providers = managedProviderSettings?.providers || [];
+    if (!managedProviderSettings) {
+      container.innerHTML = '<div class="settings-item"><strong>Loading...</strong><span></span></div>';
+      return;
+    }
+    if (!providers.length) {
       container.innerHTML = '<div class="settings-item"><strong>No providers configured</strong><span></span></div>';
       return;
     }
-    container.innerHTML = configuredProviders.map((provider) => {
-      const modelCount = Array.isArray(provider.models) ? provider.models.length : 0;
-      const suffix = provider.is_default ? 'default' : (provider.default_model || 'custom');
+    container.innerHTML = providers.map((provider, index) => {
+      const model = provider.model || 'Provider default';
+      const keyState = provider.has_api_key
+        ? ('Key: ' + (provider.api_key_source || 'configured'))
+        : 'No API key';
+      const defaultBadge = provider.is_default
+        ? '<span class="badge badge-frame">Default</span>'
+        : '';
+      const deleteDisabled = provider.is_default ? ' disabled title="Choose another default first"' : '';
       return '<div class="settings-item">' +
-        '<strong>' + esc(provider.name) + '</strong>' +
-        '<span>' + modelCount + ' model(s) · ' + esc(suffix) + '</span>' +
-        '</div>';
+        '<div class="settings-item-main"><strong>' + esc(provider.name) + '</strong>' +
+        '<span>' + esc(model) + ' · ' + esc(keyState) + '</span></div>' +
+        '<div class="settings-item-actions">' + defaultBadge +
+        '<button class="btn btn-ghost btn-small" data-provider-action="test" data-provider-index="' + index + '">Test</button>' +
+        '<button class="btn btn-secondary btn-small" data-provider-action="edit" data-provider-index="' + index + '">Edit</button>' +
+        '<button class="btn btn-danger btn-small" data-provider-action="delete" data-provider-index="' + index + '"' + deleteDisabled + '>Delete</button>' +
+        '</div></div>';
     }).join('');
+
+    const defaultSelect = document.getElementById('settings-default-provider');
+    defaultSelect.innerHTML = providers.map((provider) =>
+      '<option value="' + esc(provider.name) + '">' + esc(provider.name) + '</option>'
+    ).join('');
+    defaultSelect.value = managedProviderSettings.default_provider;
+    document.getElementById('settings-default-model').value =
+      managedProviderSettings.default_model || '';
+
+    const available = managedProviderSettings.available_types || [];
+    const configured = new Set(providers.map((provider) => provider.name));
+    document.getElementById('btn-settings-add-provider').disabled =
+      !available.some((name) => !configured.has(name));
   }
 
   function setButtonBusy(btn, busyText) {
@@ -1330,8 +1466,11 @@
 
   function addTVs(tvs, source) {
     for (const tv of tvs) {
-      if (!knownTVs.some(k => k.ip === tv.ip)) {
+      const existing = knownTVs.find((known) => known.ip === tv.ip);
+      if (!existing) {
         knownTVs.push({ ...tv, source });
+      } else if (source === 'config') {
+        Object.assign(existing, tv, { source });
       }
     }
     refreshTVSelects();
@@ -1431,6 +1570,9 @@
       const removeButton = t.source === 'config' ? '' :
         '<button class="btn btn-ghost btn-small" data-remove-tv-index="' +
         index + '">Remove</button>';
+      const saveButton = t.source === 'config' ? '' :
+        '<button class="btn btn-secondary btn-small" data-save-tv-index="' +
+        index + '">Save</button>';
       return `
         <div class="tv-card">
           <div class="tv-info">
@@ -1439,6 +1581,7 @@
           </div>
           <div class="tv-actions">
             <span class="badge ${badgeClass}">${badgeText}</span>
+            ${saveButton}
             ${removeButton}
           </div>
         </div>`;
@@ -1448,11 +1591,33 @@
   }
 
   function renderSettingsTVSummary() {
-    const countEl = document.getElementById('settings-tv-count');
-    if (countEl) countEl.textContent = String(knownTVs.length);
+    const container = document.getElementById('settings-tv-list');
+    if (!container) return;
+    if (!managedTVSettings.length) {
+      container.innerHTML = '<div class="settings-item"><div class="settings-item-main"><strong>No persistent TVs</strong><span>Use Add TV or save a discovered TV.</span></div></div>';
+      return;
+    }
+    container.innerHTML = managedTVSettings.map((tv, index) => {
+      const tokenState = tv.token_configured ? 'Paired' : 'Not paired';
+      return '<div class="settings-item">' +
+        '<div class="settings-item-main"><strong>' + esc(tv.profile_id) + '</strong>' +
+        '<span>' + esc(tv.ip) + ':' + tv.port + ' · ' + esc(tokenState) + '</span></div>' +
+        '<div class="settings-item-actions">' +
+        '<button class="btn btn-ghost btn-small" data-settings-tv-action="test" data-settings-tv-index="' + index + '">Test</button>' +
+        '<button class="btn btn-ghost btn-small" data-settings-tv-action="pair" data-settings-tv-index="' + index + '">Pair</button>' +
+        '<button class="btn btn-secondary btn-small" data-settings-tv-action="edit" data-settings-tv-index="' + index + '">Edit</button>' +
+        '<button class="btn btn-danger btn-small" data-settings-tv-action="delete" data-settings-tv-index="' + index + '">Delete</button>' +
+        '</div></div>';
+    }).join('');
   }
 
   document.getElementById('tv-list').addEventListener('click', (event) => {
+    const saveButton = event.target.closest('[data-save-tv-index]');
+    if (saveButton) {
+      const tv = knownTVs[Number(saveButton.dataset.saveTvIndex)];
+      if (tv) openTVSettingsEditor(null, tv);
+      return;
+    }
     const button = event.target.closest('[data-remove-tv-index]');
     if (!button) return;
     removeSessionTV(Number(button.dataset.removeTvIndex));
@@ -1557,15 +1722,12 @@
     showToast('Failed to load configured providers; using fallback defaults.', 'warn');
   });
 
-  // Load pre-configured TVs on startup
-  apiFetch('/tv/configured').then(r => r.json()).then(configured => {
-    addTVs(configured.map(c => ({
-      ip: c.ip, name: c.name, model: null, frame_tv: true,
-    })), 'config');
-  }).catch(() => {
+  // Load pre-configured TVs and editable management settings on startup.
+  reloadConfiguredTVs().catch(() => {
     document.getElementById('tv-empty').textContent =
       'No configured TVs. Click "Scan Network" to find Samsung TVs.';
   });
+  loadManagementSettings();
 
   document.getElementById('tv-select').addEventListener('change', (e) => {
     localStorage.setItem(storageKeys.tvGenerate, e.target.value || '');
@@ -2156,6 +2318,8 @@
     'upload-modal',
     'batch-upload-modal',
     'remix-modal',
+    'provider-settings-modal',
+    'tv-settings-modal',
     'add-tv-modal',
     'shortcuts-modal',
   ];
@@ -2200,6 +2364,346 @@
   };
   document.getElementById('modal').addEventListener('click', function() {
     closeModal('modal');
+  });
+
+  // =========================================================================
+  // Persistent settings management
+  // =========================================================================
+  function setSettingsModalError(prefix, message) {
+    const status = document.getElementById(prefix + '-error');
+    const text = document.getElementById(prefix + '-error-text');
+    text.textContent = message || '';
+    status.classList.toggle('visible', Boolean(message));
+  }
+
+  async function reloadRuntimeProviders() {
+    const response = await apiFetch('/providers');
+    refreshProviderSelects(await parseJSONResponse(response, 'Could not reload providers.'));
+  }
+
+  async function reloadConfiguredTVs() {
+    const response = await apiFetch('/tv/configured');
+    const configured = await parseJSONResponse(response, 'Could not reload configured TVs.');
+    knownTVs = knownTVs.filter((tv) => tv.source !== 'config');
+    addTVs(configured.map((tv) => ({
+      ip: tv.ip,
+      name: tv.name,
+      profile_id: tv.name,
+      model: null,
+      frame_tv: true,
+    })), 'config');
+  }
+
+  async function loadManagementSettings(triggerButton) {
+    if (triggerButton) setButtonBusy(triggerButton, 'Refreshing...');
+    try {
+      const [providerResponse, tvResponse] = await Promise.all([
+        apiFetch('/settings/providers'),
+        apiFetch('/settings/tvs'),
+      ]);
+      managedProviderSettings = await parseJSONResponse(
+        providerResponse,
+        'Could not load provider settings.',
+      );
+      const tvPayload = await parseJSONResponse(tvResponse, 'Could not load TV settings.');
+      managedTVSettings = tvPayload.tvs || [];
+      renderSettingsProviders();
+      renderSettingsTVSummary();
+    } catch (error) {
+      const message = error?.message || 'Settings could not be loaded.';
+      document.getElementById('settings-provider-list').innerHTML =
+        '<div class="settings-item"><strong>Unavailable</strong><span>' + esc(message) + '</span></div>';
+      document.getElementById('settings-tv-list').innerHTML =
+        '<div class="settings-item"><strong>Unavailable</strong><span>' + esc(message) + '</span></div>';
+      showToast('Settings management: ' + message, 'error');
+    } finally {
+      if (triggerButton) clearButtonBusy(triggerButton);
+    }
+  }
+
+  function openProviderSettingsEditor(provider) {
+    editingProviderName = provider?.name || null;
+    const nameSelect = document.getElementById('provider-settings-name');
+    const configured = new Set(
+      (managedProviderSettings?.providers || []).map((item) => item.name),
+    );
+    const choices = editingProviderName
+      ? [editingProviderName]
+      : (managedProviderSettings?.available_types || []).filter((name) => !configured.has(name));
+    if (!choices.length) {
+      showToast('All available provider types are already configured.', 'warn');
+      return;
+    }
+    nameSelect.innerHTML = choices.map((name) =>
+      '<option value="' + esc(name) + '">' + esc(name) + '</option>'
+    ).join('');
+    nameSelect.disabled = Boolean(editingProviderName);
+    document.getElementById('provider-settings-title').textContent =
+      editingProviderName ? ('Edit ' + editingProviderName) : 'Add Provider';
+    document.getElementById('provider-settings-base-url').value = provider?.base_url || '';
+    document.getElementById('provider-settings-model').value = provider?.model || '';
+    document.getElementById('provider-settings-timeout').value = provider?.timeout || 120;
+    document.getElementById('provider-settings-models').value =
+      (provider?.models || []).join('\n');
+    document.getElementById('provider-settings-api-key').value = '';
+    const clearKey = document.getElementById('provider-settings-clear-key');
+    clearKey.checked = false;
+    clearKey.disabled = provider?.api_key_source === 'environment' || !provider?.has_api_key;
+    const keyState = provider?.has_api_key
+      ? ('A key is configured via ' + provider.api_key_source + '. Leave blank to keep it.')
+      : 'No API key is currently configured.';
+    document.getElementById('provider-settings-key-state').textContent = keyState;
+    setSettingsModalError('provider-settings', '');
+    openModal('provider-settings-modal', '#provider-settings-name');
+  }
+
+  async function saveProviderSettings() {
+    const button = document.getElementById('btn-provider-settings-save');
+    const name = document.getElementById('provider-settings-name').value;
+    const apiKey = document.getElementById('provider-settings-api-key').value.trim();
+    const models = document.getElementById('provider-settings-models').value
+      .split(/[\n,]+/)
+      .map((model) => model.trim())
+      .filter(Boolean);
+    const payload = {
+      base_url: document.getElementById('provider-settings-base-url').value.trim() || null,
+      model: document.getElementById('provider-settings-model').value.trim() || null,
+      timeout: Number(document.getElementById('provider-settings-timeout').value),
+      models,
+      clear_api_key: document.getElementById('provider-settings-clear-key').checked,
+    };
+    if (apiKey) payload.api_key = apiKey;
+    if (!editingProviderName) payload.name = name;
+
+    setSettingsModalError('provider-settings', '');
+    setButtonBusy(button, 'Saving...');
+    try {
+      const endpoint = editingProviderName
+        ? ('/settings/providers/' + encodeURIComponent(editingProviderName))
+        : '/settings/providers';
+      const response = await apiFetch(endpoint, {
+        method: editingProviderName ? 'PUT' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      managedProviderSettings = await parseJSONResponse(response, 'Could not save provider.');
+      renderSettingsProviders();
+      closeModal('provider-settings-modal');
+      await reloadRuntimeProviders();
+      showToast('Provider settings saved.', 'done');
+    } catch (error) {
+      setSettingsModalError('provider-settings', error?.message || 'Could not save provider.');
+    } finally {
+      clearButtonBusy(button);
+    }
+  }
+
+  document.getElementById('settings-provider-list').addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-provider-action]');
+    if (!button) return;
+    const provider = managedProviderSettings?.providers?.[Number(button.dataset.providerIndex)];
+    if (!provider) return;
+    const action = button.dataset.providerAction;
+    if (action === 'edit') {
+      openProviderSettingsEditor(provider);
+      return;
+    }
+    if (action === 'delete') {
+      if (!window.confirm('Delete provider ' + provider.name + ' and its managed key?')) return;
+      setButtonBusy(button, 'Deleting...');
+      try {
+        const response = await apiFetch(
+          '/settings/providers/' + encodeURIComponent(provider.name),
+          { method: 'DELETE' },
+        );
+        managedProviderSettings = await parseJSONResponse(response, 'Could not delete provider.');
+        renderSettingsProviders();
+        await reloadRuntimeProviders();
+        showToast('Provider deleted.', 'done');
+      } catch (error) {
+        showToast(error?.message || 'Could not delete provider.', 'error');
+      } finally {
+        clearButtonBusy(button);
+      }
+      return;
+    }
+    if (action === 'test') {
+      setButtonBusy(button, 'Testing...');
+      try {
+        const response = await apiFetch(
+          '/settings/providers/' + encodeURIComponent(provider.name) + '/test',
+          { method: 'POST' },
+        );
+        const result = await parseJSONResponse(response, 'Provider test failed.');
+        showToast(result.detail, result.ok ? 'done' : 'error');
+      } catch (error) {
+        showToast(error?.message || 'Provider test failed.', 'error');
+      } finally {
+        clearButtonBusy(button);
+      }
+    }
+  });
+
+  document.getElementById('btn-settings-add-provider').addEventListener('click', () => {
+    openProviderSettingsEditor(null);
+  });
+  document.getElementById('btn-provider-settings-cancel').addEventListener('click', () => {
+    closeModal('provider-settings-modal');
+  });
+  document.getElementById('btn-provider-settings-save').addEventListener(
+    'click',
+    saveProviderSettings,
+  );
+
+  document.getElementById('btn-settings-save-defaults').addEventListener('click', async () => {
+    const button = document.getElementById('btn-settings-save-defaults');
+    setButtonBusy(button, 'Saving...');
+    try {
+      const response = await apiFetch('/settings/defaults', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: document.getElementById('settings-default-provider').value,
+          model: document.getElementById('settings-default-model').value.trim() || null,
+        }),
+      });
+      managedProviderSettings = await parseJSONResponse(response, 'Could not save defaults.');
+      renderSettingsProviders();
+      await reloadRuntimeProviders();
+      showToast('Generation defaults saved.', 'done');
+    } catch (error) {
+      showToast(error?.message || 'Could not save defaults.', 'error');
+    } finally {
+      clearButtonBusy(button);
+    }
+  });
+
+  function suggestedProfileId(name) {
+    const candidate = (name || 'frame_tv').toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 64);
+    return candidate || 'frame_tv';
+  }
+
+  function openTVSettingsEditor(tv, discoveredTV) {
+    editingTVProfileId = tv?.profile_id || null;
+    const profileId = document.getElementById('tv-settings-profile-id');
+    profileId.disabled = Boolean(editingTVProfileId);
+    profileId.value = editingTVProfileId || suggestedProfileId(discoveredTV?.name);
+    document.getElementById('tv-settings-title').textContent =
+      editingTVProfileId ? ('Edit ' + editingTVProfileId) : 'Add TV';
+    document.getElementById('tv-settings-ip').value = tv?.ip || discoveredTV?.ip || '';
+    document.getElementById('tv-settings-port').value = tv?.port || 8002;
+    document.getElementById('tv-settings-client-name').value = tv?.client_name || 'FrameArt';
+    document.getElementById('tv-settings-ssl').checked = tv ? tv.ssl : true;
+    setSettingsModalError('tv-settings', '');
+    openModal('tv-settings-modal', '#tv-settings-profile-id');
+  }
+
+  async function saveTVSettings() {
+    const button = document.getElementById('btn-tv-settings-save');
+    const profileId = document.getElementById('tv-settings-profile-id').value.trim();
+    const ip = normalizePrivateIPv4(document.getElementById('tv-settings-ip').value);
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(profileId)) {
+      setSettingsModalError('tv-settings', 'Profile ID may contain letters, numbers, _ and -.');
+      return;
+    }
+    if (!ip) {
+      setSettingsModalError('tv-settings', 'Enter an RFC1918 private IPv4 address.');
+      return;
+    }
+    const payload = {
+      ip,
+      port: Number(document.getElementById('tv-settings-port').value),
+      client_name: document.getElementById('tv-settings-client-name').value.trim(),
+      ssl: document.getElementById('tv-settings-ssl').checked,
+    };
+    if (!editingTVProfileId) payload.profile_id = profileId;
+
+    setSettingsModalError('tv-settings', '');
+    setButtonBusy(button, 'Saving...');
+    try {
+      const endpoint = editingTVProfileId
+        ? ('/settings/tvs/' + encodeURIComponent(editingTVProfileId))
+        : '/settings/tvs';
+      const response = await apiFetch(endpoint, {
+        method: editingTVProfileId ? 'PUT' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const result = await parseJSONResponse(response, 'Could not save TV.');
+      managedTVSettings = result.tvs || [];
+      renderSettingsTVSummary();
+      closeModal('tv-settings-modal');
+      await reloadConfiguredTVs();
+      showToast('TV profile saved.', 'done');
+    } catch (error) {
+      setSettingsModalError('tv-settings', error?.message || 'Could not save TV.');
+    } finally {
+      clearButtonBusy(button);
+    }
+  }
+
+  document.getElementById('settings-tv-list').addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-settings-tv-action]');
+    if (!button) return;
+    const tv = managedTVSettings[Number(button.dataset.settingsTvIndex)];
+    if (!tv) return;
+    const action = button.dataset.settingsTvAction;
+    if (action === 'edit') {
+      openTVSettingsEditor(tv, null);
+      return;
+    }
+    if (action === 'delete') {
+      if (!window.confirm('Delete TV profile ' + tv.profile_id + '? Pairing tokens are retained.')) return;
+      setButtonBusy(button, 'Deleting...');
+      try {
+        const response = await apiFetch(
+          '/settings/tvs/' + encodeURIComponent(tv.profile_id),
+          { method: 'DELETE' },
+        );
+        const result = await parseJSONResponse(response, 'Could not delete TV.');
+        managedTVSettings = result.tvs || [];
+        renderSettingsTVSummary();
+        await reloadConfiguredTVs();
+        showToast('TV profile deleted.', 'done');
+      } catch (error) {
+        showToast(error?.message || 'Could not delete TV.', 'error');
+      } finally {
+        clearButtonBusy(button);
+      }
+      return;
+    }
+    if (action === 'pair' && !window.confirm(
+      'Start pairing with ' + tv.profile_id + '? Accept the prompt shown on the TV.',
+    )) return;
+
+    setButtonBusy(button, action === 'pair' ? 'Pairing...' : 'Testing...');
+    try {
+      const response = await apiFetch(
+        '/settings/tvs/' + encodeURIComponent(tv.profile_id) + '/' + action,
+        { method: action === 'pair' ? 'POST' : 'GET' },
+      );
+      const result = await parseJSONResponse(response, 'TV ' + action + ' failed.');
+      showToast(result.detail, result.ok ? 'done' : 'error');
+      if (action === 'pair' && result.ok) await loadManagementSettings();
+    } catch (error) {
+      showToast(error?.message || ('TV ' + action + ' failed.'), 'error');
+    } finally {
+      clearButtonBusy(button);
+    }
+  });
+
+  document.getElementById('btn-settings-add-tv').addEventListener('click', () => {
+    openTVSettingsEditor(null, null);
+  });
+  document.getElementById('btn-tv-settings-cancel').addEventListener('click', () => {
+    closeModal('tv-settings-modal');
+  });
+  document.getElementById('btn-tv-settings-save').addEventListener('click', saveTVSettings);
+  document.getElementById('btn-settings-refresh').addEventListener('click', (event) => {
+    loadManagementSettings(event.currentTarget);
   });
 
   // =========================================================================

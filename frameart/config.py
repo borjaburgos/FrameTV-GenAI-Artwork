@@ -22,6 +22,8 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
+from frameart.settings_store import load_managed_overlay, read_managed_settings
+
 
 def _default_data_dir() -> Path:
     """Pick a sensible default data directory.
@@ -167,6 +169,7 @@ class Settings(BaseSettings):
         return (
             init_settings,
             env_settings,
+            _ManagedSettingsSource(settings_cls),
             _YamlSettingsSource(settings_cls),
             file_secret_settings,
         )
@@ -207,7 +210,44 @@ class _YamlSettingsSource(PydanticBaseSettingsSource):
         config_path = _find_config_file()
         if not config_path:
             return {}
-        return _load_yaml_config(config_path)
+        config = _load_yaml_config(config_path)
+        managed = read_managed_settings(_managed_data_dir())
+        # Provider/TV management snapshots are complete collections. Suppress
+        # their lower-priority YAML versions so deletions are not deep-merged
+        # back into the effective settings by pydantic-settings.
+        for collection in ("providers", "tvs"):
+            if collection in managed:
+                config.pop(collection, None)
+        return config
+
+
+def _managed_data_dir() -> Path:
+    """Resolve the data directory without recursively constructing ``Settings``."""
+    env_data_dir = os.environ.get("FRAMEART_DATA_DIR")
+    if env_data_dir:
+        return Path(env_data_dir).expanduser()
+
+    config_path = _find_config_file()
+    if config_path:
+        configured = _load_yaml_config(config_path).get("data_dir")
+        if isinstance(configured, str) and configured.strip():
+            return Path(configured).expanduser()
+    return DEFAULT_DATA_DIR
+
+
+class _ManagedSettingsSource(PydanticBaseSettingsSource):
+    """Load the web-managed overlay above YAML and below environment values."""
+
+    def get_field_value(
+        self,
+        field: FieldInfo,
+        field_name: str,
+    ) -> tuple[Any, str, bool]:
+        data = self()
+        return data.get(field_name), field_name, False
+
+    def __call__(self) -> dict[str, Any]:
+        return load_managed_overlay(_managed_data_dir())
 
 
 def load_settings(**overrides: Any) -> Settings:
