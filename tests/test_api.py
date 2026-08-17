@@ -2023,6 +2023,127 @@ class TestLibraryManagement:
         assert history[0]["tv_target"] == "living-room"
 
 
+class TestAutomationManagement:
+    @staticmethod
+    def create_artifact(data_dir: Path, job_id: str):
+        job_dir = data_dir / "artifacts" / "2026" / "01" / "01" / job_id
+        job_dir.mkdir(parents=True)
+        (job_dir / "final.png").write_bytes(_jpeg_bytes())
+        (job_dir / "meta.json").write_text(
+            json.dumps({"job_id": job_id, "prompt_original": "Scheduled landscape"})
+        )
+
+    def test_group_playlist_and_schedule_crud(self, managed_config_env):
+        self.create_artifact(managed_config_env, "scheduled-one")
+        tv = client.post(
+            "/settings/tvs",
+            json={
+                "profile_id": "living_room",
+                "ip": "192.168.1.50",
+                "port": 8002,
+                "client_name": "FrameArt",
+                "ssl": True,
+            },
+        )
+        assert tv.status_code == 201
+
+        group = client.post(
+            "/automation/groups",
+            json={"name": "Downstairs", "tv_profile_ids": ["living_room"]},
+        )
+        assert group.status_code == 201
+        group_id = group.json()["id"]
+        playlist = client.post(
+            "/automation/playlists",
+            json={"name": "Landscapes", "job_ids": ["scheduled-one"]},
+        )
+        assert playlist.status_code == 201
+        playlist_id = playlist.json()["id"]
+        schedule = client.post(
+            "/automation/schedules",
+            json={
+                "name": "Evening",
+                "playlist_id": playlist_id,
+                "group_id": group_id,
+                "interval_seconds": 300,
+            },
+        )
+        assert schedule.status_code == 201
+        schedule_id = schedule.json()["id"]
+        assert client.get("/automation/groups").json()[0]["name"] == "Downstairs"
+        assert client.get("/automation/playlists").json()[0]["job_ids"] == [
+            "scheduled-one"
+        ]
+
+        paused = client.put(
+            f"/automation/schedules/{schedule_id}/enabled",
+            json={"enabled": False},
+        )
+        assert paused.status_code == 200
+        assert paused.json()["enabled"] is False
+        assert client.delete(f"/automation/schedules/{schedule_id}").status_code == 200
+        assert client.delete(f"/automation/playlists/{playlist_id}").status_code == 200
+        assert client.delete(f"/automation/groups/{group_id}").status_code == 200
+
+    @patch("frameart.api.display_artifact")
+    def test_immediate_group_fanout(self, mock_display, managed_config_env):
+        self.create_artifact(managed_config_env, "fanout-one")
+        client.post(
+            "/settings/tvs",
+            json={
+                "profile_id": "living_room",
+                "ip": "192.168.1.51",
+                "port": 8002,
+                "client_name": "FrameArt",
+                "ssl": True,
+            },
+        )
+        group = client.post(
+            "/automation/groups",
+            json={"name": "One TV", "tv_profile_ids": ["living_room"]},
+        ).json()
+        mock_display.return_value = {
+            "tv_profile_id": "living_room",
+            "content_id": "content-one",
+        }
+
+        response = client.post(
+            f"/automation/groups/{group['id']}/display",
+            json={"job_id": "fanout-one", "matte": "none"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "completed"
+        mock_display.assert_called_once()
+
+    def test_webhook_secret_is_only_returned_on_create(self, managed_config_env):
+        created = client.post(
+            "/automation/webhooks",
+            json={
+                "name": "HA",
+                "url": "http://homeassistant.local/api/webhook/frameart",
+                "events": ["schedule.completed"],
+            },
+        )
+        assert created.status_code == 201
+        assert len(created.json()["secret"]) == 64
+        listed = client.get("/automation/webhooks")
+        assert listed.status_code == 200
+        assert "secret" not in listed.json()[0]
+
+    def test_rejects_unknown_group_tv_and_missing_playlist_art(self, managed_config_env):
+        unknown_tv = client.post(
+            "/automation/groups",
+            json={"name": "Bad", "tv_profile_ids": ["missing"]},
+        )
+        assert unknown_tv.status_code == 422
+        missing_art = client.post(
+            "/automation/playlists",
+            json={"name": "Bad", "job_ids": ["missing-job"]},
+        )
+        assert missing_art.status_code == 422
+
+
 # ---------------------------------------------------------------------------
 # GET / — Web UI
 # ---------------------------------------------------------------------------
@@ -2058,3 +2179,15 @@ class TestWebUI:
         assert 'id="tv-settings-modal"' in resp.text
         assert "'/settings/providers'" in script.text
         assert "'/settings/tvs'" in script.text
+
+    def test_automation_ui_has_groups_playlists_schedules_and_integrations(self):
+        page = client.get("/")
+        script = client.get("/static/app.js")
+
+        assert 'data-page="automations"' in page.text
+        assert 'id="automation-group-list"' in page.text
+        assert 'id="automation-playlist-list"' in page.text
+        assert 'id="automation-schedule-list"' in page.text
+        assert 'id="automation-webhook-list"' in page.text
+        assert "'/automation/groups'" in script.text
+        assert "'/automation/schedules'" in script.text

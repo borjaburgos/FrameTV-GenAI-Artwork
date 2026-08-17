@@ -155,3 +155,65 @@ test('searches, tags, and collects library artwork', async ({ page }) => {
     await rm(jobDir, { recursive: true, force: true });
   }
 });
+
+test('creates TV groups, playlists, and durable schedules', async ({ page, request }) => {
+  const jobId = 'e2e-automation-art';
+  const jobDir = path.join(process.cwd(), '.e2e-data', 'artifacts', '2026', '01', '02', jobId);
+  await mkdir(jobDir, { recursive: true });
+  await writeFile(
+    path.join(jobDir, 'final.png'),
+    Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII=',
+      'base64',
+    ),
+  );
+  await writeFile(
+    path.join(jobDir, 'meta.json'),
+    JSON.stringify({ job_id: jobId, prompt_original: 'Automation landscape' }),
+  );
+  await request.post('/settings/tvs', {
+    data: {
+      profile_id: 'e2e_automation_tv',
+      ip: '192.168.50.26',
+      port: 8002,
+      client_name: 'FrameArt E2E',
+      ssl: true,
+    },
+  });
+
+  try {
+    await page.goto('/');
+    await page.locator('.tabs').getByRole('button', { name: 'Automations' }).click();
+    await expect(page.locator('#panel-automations')).toBeVisible();
+    await expect(page.locator('#automation-integration-status')).toContainText('Running');
+
+    await page.getByLabel('Group name').fill('E2E Group');
+    await page.locator('#automation-group-tvs input[value="e2e_automation_tv"]').check();
+    await page.getByRole('button', { name: 'Create Group' }).click();
+    await expect(page.locator('#automation-group-list')).toContainText('E2E Group');
+
+    await page.getByLabel('Playlist name').fill('E2E Playlist');
+    await page.getByLabel('Artwork').selectOption(jobId);
+    await page.getByRole('button', { name: 'Create Playlist' }).click();
+    await expect(page.locator('#automation-playlist-list')).toContainText('E2E Playlist');
+
+    await page.getByLabel('Schedule name').fill('E2E Schedule');
+    await page.getByRole('button', { name: 'Create Schedule' }).click();
+    const schedule = page.locator('#automation-schedule-list .settings-item').filter({
+      hasText: 'E2E Schedule',
+    });
+    await expect(schedule).toContainText('E2E Playlist');
+    await schedule.getByRole('button', { name: 'Pause' }).click();
+    await expect(schedule.getByRole('button', { name: 'Resume' })).toBeVisible();
+    await schedule.getByRole('button', { name: 'Delete' }).click();
+    await expect(schedule).toHaveCount(0);
+
+    await page.locator('#automation-playlist-list .settings-item')
+      .filter({ hasText: 'E2E Playlist' }).getByRole('button', { name: 'Delete' }).click();
+    await page.locator('#automation-group-list .settings-item')
+      .filter({ hasText: 'E2E Group' }).getByRole('button', { name: 'Delete' }).click();
+  } finally {
+    await request.delete('/settings/tvs/e2e_automation_tv');
+    await rm(jobDir, { recursive: true, force: true });
+  }
+});

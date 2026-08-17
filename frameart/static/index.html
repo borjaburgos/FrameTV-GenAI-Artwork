@@ -14,6 +14,7 @@
     <button class="active" data-page="create">Create</button>
     <button data-page="library">Library</button>
     <button data-page="tvs">TVs</button>
+    <button data-page="automations">Automations</button>
     <button data-page="settings">Settings</button>
   </div>
   <div class="header-spacer"></div>
@@ -292,6 +293,87 @@
         <button class="btn btn-danger btn-small" id="btn-tv-delete-selected-inline" disabled>Delete Selected</button>
         <button class="btn btn-ghost btn-small" id="btn-tv-clear-selection-inline" disabled>Clear</button>
       </div>
+    </div>
+  </div>
+</div>
+
+<div class="panel" id="panel-automations">
+  <div class="page-eyebrow">Automations</div>
+  <div class="section-heading">
+    <h2>TV Groups &amp; Schedules</h2>
+    <button class="btn btn-secondary" id="btn-automation-refresh">Refresh</button>
+  </div>
+  <p class="page-intro">Fan artwork out to several TVs, rotate library playlists, and connect local automations.</p>
+  <div class="settings-grid">
+    <div class="settings-card">
+      <h3>TV Groups</h3>
+      <p>Create a reusable target from persistent TV profiles.</p>
+      <label for="automation-group-name">Group name</label>
+      <input id="automation-group-name" maxlength="100" placeholder="Downstairs TVs">
+      <div id="automation-group-tvs" class="automation-checklist"></div>
+      <button class="btn btn-small" id="btn-automation-group-create">Create Group</button>
+      <div class="settings-list" id="automation-group-list"></div>
+    </div>
+    <div class="settings-card">
+      <h3>Playlists</h3>
+      <p>Rotate an ordered set of artwork already in your library.</p>
+      <label for="automation-playlist-name">Playlist name</label>
+      <input id="automation-playlist-name" maxlength="100" placeholder="Evening landscapes">
+      <label for="automation-playlist-jobs">Artwork</label>
+      <select id="automation-playlist-jobs" multiple size="6"></select>
+      <button class="btn btn-small" id="btn-automation-playlist-create">Create Playlist</button>
+      <div class="settings-list" id="automation-playlist-list"></div>
+    </div>
+    <div class="settings-card settings-card-wide">
+      <h3>Schedules</h3>
+      <p>Advance a playlist every 30 seconds to 30 days. Schedules survive restarts.</p>
+      <div class="row">
+        <div>
+          <label for="automation-schedule-name">Schedule name</label>
+          <input id="automation-schedule-name" maxlength="100" placeholder="Evening rotation">
+        </div>
+        <div>
+          <label for="automation-schedule-playlist">Playlist</label>
+          <select id="automation-schedule-playlist"></select>
+        </div>
+        <div>
+          <label for="automation-schedule-group">TV group</label>
+          <select id="automation-schedule-group"></select>
+        </div>
+        <div>
+          <label for="automation-schedule-interval">Interval</label>
+          <select id="automation-schedule-interval">
+            <option value="30">30 seconds</option>
+            <option value="60">1 minute</option>
+            <option value="300" selected>5 minutes</option>
+            <option value="900">15 minutes</option>
+            <option value="3600">1 hour</option>
+            <option value="86400">1 day</option>
+          </select>
+        </div>
+      </div>
+      <button class="btn btn-small" id="btn-automation-schedule-create">Create Schedule</button>
+      <div class="settings-list" id="automation-schedule-list"></div>
+    </div>
+    <div class="settings-card settings-card-wide">
+      <h3>Webhooks, MQTT &amp; Home Assistant</h3>
+      <p>Schedule events use signed webhooks and optionally publish to MQTT. Home Assistant can also call schedule Run endpoints with an automation token.</p>
+      <div class="row">
+        <div>
+          <label for="automation-webhook-name">Webhook name</label>
+          <input id="automation-webhook-name" maxlength="100" placeholder="Home Assistant">
+        </div>
+        <div>
+          <label for="automation-webhook-url">HTTP(S) URL</label>
+          <input id="automation-webhook-url" maxlength="2048" placeholder="http://homeassistant.local:8123/api/webhook/...">
+        </div>
+      </div>
+      <div class="btn-group">
+        <button class="btn btn-small" id="btn-automation-webhook-create">Add Webhook</button>
+        <button class="btn btn-secondary btn-small" id="btn-automation-webhook-test">Send Test</button>
+      </div>
+      <div class="settings-list" id="automation-webhook-list"></div>
+      <div class="settings-list" id="automation-integration-status"></div>
     </div>
   </div>
 </div>
@@ -610,6 +692,7 @@
   <button class="active" data-page="create">Create</button>
   <button data-page="library">Library</button>
   <button data-page="tvs">TVs</button>
+  <button data-page="automations">Automations</button>
   <button data-page="settings">Settings</button>
 </div>
 
