@@ -9,7 +9,7 @@ import sqlite3
 import tarfile
 import tempfile
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from frameart import __version__
@@ -20,7 +20,7 @@ _DATABASE_FILES = {"frameart.sqlite3", "frameart.sqlite3-wal", "frameart.sqlite3
 
 
 def _timestamp() -> str:
-    return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
 def _validate_data_dir(data_dir: Path) -> Path:
@@ -80,7 +80,7 @@ def create_data_backup(data_dir: Path, output: Path | None = None) -> Path:
 
         manifest = {
             "format_version": BACKUP_FORMAT_VERSION,
-            "created_at": datetime.now(UTC).isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
             "frameart_version": __version__,
             "database_included": database.is_file(),
         }
