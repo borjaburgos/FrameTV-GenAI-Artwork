@@ -227,6 +227,8 @@ def pair(profile: TVProfile) -> bool:
 
 
 TV_OP_TIMEOUT = 20  # seconds — cap for any single TV WebSocket operation
+ART_READINESS_TIMEOUT = 3.0
+ART_READINESS_POLL_INTERVAL = 0.25
 
 
 def _run_with_timeout(func, timeout_sec: int = TV_OP_TIMEOUT):
@@ -492,35 +494,164 @@ def upload_image(
 # --- Art management -----------------------------------------------------------
 
 
-def switch_art(profile: TVProfile, content_id: str) -> bool:
-    """Switch the displayed artwork on the Frame TV.
+def _run_art_call(
+    profile: TVProfile,
+    func,
+    description: str,
+    *,
+    timeout_sec: float = TV_OP_TIMEOUT,
+):
+    """Run one art-service call with its own connection and deadline."""
 
-    Also attempts to put the TV into Art Mode if it isn't already.
-    """
-
-    def _do_switch() -> None:
+    def _call():
         art = None
         try:
             art = _connect_art(profile)
-
-            # Try to enter art mode first
-            try:
-                art.set_artmode(True)
-            except Exception as e:
-                logger.warning("Could not set art mode (may already be on): %s", e)
-
-            art.select_image(content_id)
+            return func(art)
         finally:
-            with contextlib.suppress(Exception):
-                art.close()
+            if art is not None:
+                with contextlib.suppress(Exception):
+                    art.close()
+
+    return _run_tv_op(profile, _call, description, timeout_sec=timeout_sec)
+
+
+def _art_mode_is_on(value: Any) -> bool:
+    """Normalize the bool/string states returned by different TV generations."""
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "on", "true", "yes"}
+    return bool(value)
+
+
+def _content_id_from_current(value: Any) -> str | None:
+    if isinstance(value, dict):
+        content_id = value.get("content_id")
+        return str(content_id) if content_id else None
+    if isinstance(value, str):
+        return value
+    return None
+
+
+def _get_current_artwork(
+    profile: TVProfile,
+    *,
+    timeout_sec: float = TV_OP_TIMEOUT,
+) -> str | None:
+    current = _run_art_call(
+        profile,
+        lambda art: art.get_current(),
+        "Get current artwork",
+        timeout_sec=timeout_sec,
+    )
+    return _content_id_from_current(current)
+
+
+def wait_for_art(
+    profile: TVProfile,
+    content_id: str,
+    *,
+    timeout_sec: float = ART_READINESS_TIMEOUT,
+) -> bool:
+    """Briefly wait for a newly uploaded content ID to appear in the TV library.
+
+    Readiness is advisory: callers should still attempt selection if the TV's
+    content-list operation is unavailable or exceeds this bounded deadline.
+    """
+    if timeout_sec <= 0:
+        return True
+
+    def _wait(art) -> bool:
+        deadline = time.monotonic() + timeout_sec
+        while True:
+            artworks = art.available()
+            if any(item.get("content_id") == content_id for item in artworks):
+                return True
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(ART_READINESS_POLL_INTERVAL, remaining))
 
     try:
-        _run_tv_op(profile, _do_switch, f"Switch art to {content_id}")
+        ready = bool(
+            _run_art_call(
+                profile,
+                _wait,
+                f"Wait for artwork {content_id}",
+                timeout_sec=timeout_sec,
+            )
+        )
+    except Exception as exc:
+        logger.warning("Could not confirm artwork readiness for %s: %s", content_id, exc)
+        return False
+
+    if not ready:
+        logger.warning("Artwork %s was not listed before the readiness deadline", content_id)
+    return ready
+
+
+def switch_art(
+    profile: TVProfile,
+    content_id: str,
+    *,
+    wait_for_ready: bool = False,
+    readiness_timeout_sec: float = ART_READINESS_TIMEOUT,
+) -> bool:
+    """Switch the displayed artwork on the Frame TV.
+
+    Art-mode detection, enabling Art Mode, and image selection each receive an
+    independent bounded deadline. If selection fails or times out, query the TV
+    once more and accept success when the requested content is already current.
+    """
+    if wait_for_ready:
+        wait_for_art(profile, content_id, timeout_sec=readiness_timeout_sec)
+
+    art_mode_on = False
+    try:
+        art_mode_on = _art_mode_is_on(
+            _run_art_call(profile, lambda art: art.get_artmode(), "Get art mode status")
+        )
+    except Exception as exc:
+        logger.warning("Could not get art mode status before switching: %s", exc)
+
+    if not art_mode_on:
+        try:
+            _run_art_call(profile, lambda art: art.set_artmode(True), "Enable art mode")
+        except Exception as exc:
+            # Some TVs report an error even when Art Mode is already active.
+            # Selection still gets its own connection and deadline below.
+            logger.warning("Could not enable art mode before switching: %s", exc)
+
+    try:
+        _run_art_call(
+            profile,
+            lambda art: art.select_image(content_id),
+            f"Switch art to {content_id}",
+        )
         logger.info("Switched display to content_id=%s", content_id)
         return True
-    except Exception as e:
-        logger.error("Failed to switch art: %s", e)
+    except Exception as exc:
+        logger.warning("Artwork selection did not complete for %s: %s", content_id, exc)
+
+    try:
+        current = _get_current_artwork(profile)
+    except Exception as exc:
+        logger.error("Failed to reconcile display state for %s: %s", content_id, exc)
         return False
+
+    if current == content_id:
+        logger.info(
+            "Selection response failed, but the TV confirms content_id=%s is displayed",
+            content_id,
+        )
+        return True
+
+    logger.error(
+        "Failed to switch art to %s; TV reports current artwork %s",
+        content_id,
+        current or "unknown",
+    )
+    return False
 
 
 def list_art(profile: TVProfile) -> list[dict[str, Any]]:

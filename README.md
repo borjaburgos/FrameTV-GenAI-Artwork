@@ -144,6 +144,15 @@ frameart tv status --tv livingroom_frame
 frameart tv list-art --tv livingroom_frame
 ```
 
+### Display artwork that is already on the TV
+
+Use the existing content ID to recover from an interrupted upload-and-display
+operation without uploading a duplicate:
+
+```bash
+frameart tv display --tv livingroom_frame --content-id MY_F0006
+```
+
 ### List generated artifacts
 
 ```bash
