@@ -175,6 +175,23 @@
     gap: 1rem;
     margin-top: 1rem;
   }
+  .library-tools {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: .55rem;
+    margin-bottom: .8rem;
+    align-items: center;
+  }
+  .library-tools input, .library-tools select, .library-tools .btn { margin: 0; }
+  .library-chips { display: flex; gap: .3rem; flex-wrap: wrap; margin-top: .4rem; }
+  .library-chip {
+    border-radius: 999px;
+    padding: .18rem .45rem;
+    background: rgba(87, 166, 255, .13);
+    border: 1px solid rgba(87, 166, 255, .25);
+    color: var(--muted);
+    font-size: .7rem;
+  }
   .settings-card {
     background: linear-gradient(180deg, rgba(28, 36, 52, .92) 0%, rgba(21, 28, 40, .95) 100%);
     border: 1px solid var(--border);

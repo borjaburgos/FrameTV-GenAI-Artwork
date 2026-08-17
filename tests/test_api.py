@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -1405,9 +1406,10 @@ class TestTVChangeMatte:
 class TestTVDisplayArt:
     @patch("frameart.api._settings")
     @patch("frameart.tv.controller.switch_art")
-    def test_success(self, mock_switch, mock_settings):
+    def test_success(self, mock_switch, mock_settings, tmp_path):
         settings = MagicMock()
         settings.tvs = {}
+        settings.data_dir = tmp_path
         mock_settings.return_value = settings
         mock_switch.return_value = True
 
@@ -1953,6 +1955,72 @@ class TestAsyncJobsList:
         assert found["request"]["type"] == "generate"
         assert found["request"]["provider"] == "openai"
         assert found["request"]["model"] == "gpt-image-1"
+
+
+class TestLibraryManagement:
+    @staticmethod
+    def create_artifact(data_dir: Path, job_id: str, prompt: str, provider: str = "openai"):
+        job_dir = data_dir / "artifacts" / "2026" / "01" / "01" / job_id
+        job_dir.mkdir(parents=True)
+        (job_dir / "final.png").write_bytes(_jpeg_bytes())
+        (job_dir / "meta.json").write_text(
+            json.dumps(
+                {
+                    "job_id": job_id,
+                    "prompt_original": prompt,
+                    "provider": provider,
+                }
+            )
+        )
+
+    def test_search_tags_and_collections(self, managed_config_env):
+        self.create_artifact(managed_config_env, "library-one", "Blue mountain lake")
+        self.create_artifact(managed_config_env, "library-two", "Red city skyline", "ollama")
+
+        tagged = client.put("/jobs/library-one/tags", json={"tags": ["Travel", "blue"]})
+        assert tagged.status_code == 200
+        collection = client.post("/library/collections", json={"name": "Favorites"})
+        assert collection.status_code == 201
+        collection_id = collection.json()["id"]
+        added = client.post(
+            f"/library/collections/{collection_id}/items",
+            json={"job_ids": ["library-one"]},
+        )
+        assert added.status_code == 200
+
+        by_text = client.get("/jobs", params={"q": "mountain"}).json()
+        assert [item["job_id"] for item in by_text] == ["library-one"]
+        assert by_text[0]["tags"] == ["blue", "travel"]
+        assert by_text[0]["collections"] == ["Favorites"]
+        assert [item["job_id"] for item in client.get("/jobs?tag=travel").json()] == [
+            "library-one"
+        ]
+        assert [
+            item["job_id"]
+            for item in client.get(f"/jobs?collection={collection_id}").json()
+        ] == ["library-one"]
+
+        removed = client.request(
+            "DELETE",
+            f"/library/collections/{collection_id}/items",
+            json={"job_ids": ["library-one"]},
+        )
+        assert removed.status_code == 200
+        assert client.delete(f"/library/collections/{collection_id}").status_code == 200
+
+    def test_display_history_endpoint(self, managed_config_env):
+        from frameart.library import LibraryStore
+
+        LibraryStore(managed_config_env).record_display(
+            job_id="library-one",
+            content_id="content-one",
+            tv_target="living-room",
+            source="library-upload",
+        )
+
+        history = client.get("/library/history").json()
+        assert history[0]["job_id"] == "library-one"
+        assert history[0]["tv_target"] == "living-room"
 
 
 # ---------------------------------------------------------------------------

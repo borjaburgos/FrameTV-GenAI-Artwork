@@ -47,6 +47,22 @@ class PipelineResult:
     error: str | None = None
 
 
+def _record_display_history(settings: Settings, result: PipelineResult, source: str) -> None:
+    if not result.tv_switched:
+        return
+    try:
+        from frameart.library import LibraryStore
+
+        LibraryStore(settings.data_dir).record_display(
+            job_id=result.job_id,
+            content_id=result.content_id,
+            tv_target=str(result.metadata.get("tv_ip") or "") or None,
+            source=source,
+        )
+    except Exception as exc:
+        logger.warning("Could not persist display history for job %s: %s", result.job_id, exc)
+
+
 def _record_switch_failure(result: PipelineResult) -> None:
     """Preserve an uploaded ID while making an unconfirmed display a hard failure."""
     content_id = result.content_id or "unknown"
@@ -327,6 +343,7 @@ def run_apply(
         result.error = str(e)
         logger.error("Pipeline apply failed: %s", e)
 
+    _record_display_history(settings, result, "apply")
     return result
 
 
@@ -407,6 +424,7 @@ def run_import_and_apply(
         result.error = str(e)
         logger.error("Pipeline import+apply failed: %s", e)
 
+    _record_display_history(settings, result, "import")
     return result
 
 
@@ -526,6 +544,7 @@ def run_edit_and_apply(
         result.error = str(e)
         logger.error("Pipeline edit+apply failed: %s", e)
 
+    _record_display_history(settings, result, "edit")
     return result
 
 
@@ -614,4 +633,5 @@ def run_generate_and_apply(
     result.metadata["timings"] = result.timings
     save_metadata(result.job_dir, result.metadata)
 
+    _record_display_history(settings, result, "generate")
     return result
