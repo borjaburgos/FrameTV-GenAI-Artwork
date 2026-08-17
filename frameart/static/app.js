@@ -11,6 +11,8 @@
   let managedProviderSettings = null;
   let managedTVSettings = [];
   let managedSettingsBackups = [];
+  let managedCollections = [];
+  let loadedGalleryJobs = {};
   let editingProviderName = null;
   let editingTVProfileId = null;
   const generationJobs = new Map();
@@ -442,7 +444,11 @@
     pageTabs.forEach((tab) => tab.classList.toggle('active', tab.dataset.page === pageName));
     panels.forEach((panel) => panel.classList.toggle('active', panel.id === ('panel-' + pageName)));
     localStorage.setItem(storageKeys.page, pageName);
-    if (pageName === 'library') loadGallery();
+    if (pageName === 'library') {
+      loadLibraryCollections().then(loadGallery).catch((error) => {
+        showToast(error?.message || 'Could not load library metadata.', 'error');
+      });
+    }
     if (pageName === 'create' && getActiveCreateModeName() === 'ai') loadGenerationJobsFromAPI();
   }
 
@@ -528,6 +534,7 @@
       'No configured TVs. Click "Scan Network" to find Samsung TVs.';
   });
   loadManagementSettings();
+  loadLibraryCollections().catch(() => {});
 
   document.getElementById('tv-select').addEventListener('change', (e) => {
     localStorage.setItem(storageKeys.tvGenerate, e.target.value || '');
@@ -885,10 +892,71 @@
   // =========================================================================
   // Gallery
   // =========================================================================
+  async function loadLibraryCollections() {
+    const response = await apiFetch('/library/collections');
+    managedCollections = await parseJSONResponse(response, 'Could not load collections.');
+    const options = managedCollections.map((collection) =>
+      '<option value="' + esc(collection.id) + '">' + esc(collection.name) +
+      ' (' + collection.item_count + ')</option>'
+    ).join('');
+    const filter = document.getElementById('gallery-collection-filter');
+    const target = document.getElementById('library-target-collection');
+    const filterValue = filter.value;
+    const targetValue = target.value;
+    filter.innerHTML = '<option value="">All collections</option>' + options;
+    target.innerHTML = '<option value="">Choose collection...</option>' + options;
+    if ([...filter.options].some((option) => option.value === filterValue)) {
+      filter.value = filterValue;
+    }
+    if ([...target.options].some((option) => option.value === targetValue)) {
+      target.value = targetValue;
+    }
+  }
+
+  async function setTagsForJobs(jobIds) {
+    if (!jobIds.length) return;
+    const existing = jobIds.length === 1 ? (loadedGalleryJobs[jobIds[0]]?.tags || []).join(', ') : '';
+    const value = window.prompt('Tags (comma separated). Leave blank to clear.', existing);
+    if (value === null) return;
+    const tags = value.split(',').map((tag) => tag.trim()).filter(Boolean);
+    for (const jobId of jobIds) {
+      const response = await apiFetch('/jobs/' + encodeURIComponent(jobId) + '/tags', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tags }),
+      });
+      await parseJSONResponse(response, 'Could not save tags.');
+    }
+    await loadGallery();
+    showToast('Artwork tags saved.', 'done');
+  }
+
+  async function addJobsToSelectedCollection(jobIds) {
+    const collectionId = document.getElementById('library-target-collection').value;
+    if (!collectionId) {
+      showToast('Choose a target collection first.', 'warn');
+      return;
+    }
+    const response = await apiFetch(
+      '/library/collections/' + encodeURIComponent(collectionId) + '/items',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job_ids: jobIds }),
+      },
+    );
+    await parseJSONResponse(response, 'Could not update collection.');
+    await Promise.all([loadLibraryCollections(), loadGallery()]);
+    showToast('Artwork added to collection.', 'done');
+  }
+
   function updateGallerySelectionUI() {
     const btn = document.getElementById('btn-gallery-delete-selected');
     const inlineDeleteBtn = document.getElementById('btn-library-delete-selected-inline');
     const inlineDisplayBtn = document.getElementById('btn-library-display-selected');
+    const inlineTagBtn = document.getElementById('btn-library-tag-selected');
+    const inlineCollectBtn = document.getElementById('btn-library-collect-selected');
+    const inlineUncollectBtn = document.getElementById('btn-library-uncollect-selected');
     const inlineClearBtn = document.getElementById('btn-library-clear-selection-inline');
     const bar = document.getElementById('library-selection-bar');
     const text = document.getElementById('library-selection-text');
@@ -900,6 +968,9 @@
     btn.textContent = n > 0 ? ('Delete Selected (' + n + ')') : 'Delete Selected';
     inlineDeleteBtn.disabled = !hasSelection;
     inlineDisplayBtn.disabled = !hasSelection;
+    inlineTagBtn.disabled = !hasSelection;
+    inlineCollectBtn.disabled = !hasSelection;
+    inlineUncollectBtn.disabled = !hasSelection;
     inlineClearBtn.disabled = !hasSelection;
     text.textContent = label;
     bar.classList.toggle('visible', hasSelection);
@@ -1057,13 +1128,22 @@
     grid.innerHTML = gallerySkeleton(6);
     empty.style.display = 'none';
     try {
-      const resp = await apiFetch('/jobs?limit=50');
-      const jobs = await resp.json();
+      const params = new URLSearchParams({ limit: '50' });
+      const query = document.getElementById('gallery-search').value.trim();
+      const tag = document.getElementById('gallery-tag-filter').value.trim();
+      const collection = document.getElementById('gallery-collection-filter').value;
+      if (query) params.set('q', query);
+      if (tag) params.set('tag', tag);
+      if (collection) params.set('collection', collection);
+      const resp = await apiFetch('/jobs?' + params.toString());
+      const jobs = await parseJSONResponse(resp, 'Could not load library.');
+      loadedGalleryJobs = Object.fromEntries(jobs.map((job) => [job.job_id, job]));
       if (!jobs.length) { grid.innerHTML = ''; empty.style.display = 'block'; return; }
       empty.style.display = 'none';
       grid.innerHTML = jobs.map(j => {
         const promptText = esc(j.prompt || j.job_id);
         const promptShort = esc((j.prompt || '').substring(0, 40));
+        const chips = [...(j.tags || []), ...(j.collections || []).map((name) => '#' + name)];
         return `
         <div class="gallery-item">
           <img src="/jobs/${esc(j.job_id)}/image" alt="${promptShort}" loading="lazy"
@@ -1076,6 +1156,9 @@
             </label>
             <div class="prompt">${promptText}</div>
             <div class="meta">${esc(j.provider || '')} ${j.content_id ? '&middot; on TV' : ''}</div>
+            <div class="library-chips">${chips.map((chip) =>
+              '<span class="library-chip">' + esc(chip) + '</span>'
+            ).join('')}</div>
           </div>
           <div class="actions">
             <button class="btn btn-secondary btn-small"
@@ -1084,6 +1167,7 @@
             <button class="btn btn-secondary btn-small"
                     onclick="openRemixFromJob('${esc(j.job_id)}', '${esc(j.prompt || j.job_id)}')">
               Edit / Generate New</button>
+            <button class="btn btn-ghost btn-small" data-tag-job-id="${esc(j.job_id)}">Tags</button>
           </div>
         </div>`;
       }).join('');
@@ -1102,12 +1186,120 @@
   document.getElementById('btn-gallery-clear-selection').addEventListener('click', () => setAllGallerySelections(false));
   document.getElementById('btn-gallery-delete-selected').addEventListener('click', deleteSelectedGalleryJobs);
   document.getElementById('btn-library-display-selected').addEventListener('click', openBatchUploadModal);
+  document.getElementById('btn-library-tag-selected').addEventListener('click', () => {
+    setTagsForJobs(Array.from(selectedGalleryJobIds)).catch((error) => {
+      showToast(error?.message || 'Could not save tags.', 'error');
+    });
+  });
+  document.getElementById('btn-library-collect-selected').addEventListener('click', () => {
+    addJobsToSelectedCollection(Array.from(selectedGalleryJobIds)).catch((error) => {
+      showToast(error?.message || 'Could not update collection.', 'error');
+    });
+  });
+  document.getElementById('btn-library-uncollect-selected').addEventListener('click', async () => {
+    const collectionId = document.getElementById('library-target-collection').value;
+    const jobIds = Array.from(selectedGalleryJobIds);
+    if (!collectionId) {
+      showToast('Choose a target collection first.', 'warn');
+      return;
+    }
+    try {
+      const response = await apiFetch(
+        '/library/collections/' + encodeURIComponent(collectionId) + '/items',
+        {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ job_ids: jobIds }),
+        },
+      );
+      await parseJSONResponse(response, 'Could not update collection.');
+      await Promise.all([loadLibraryCollections(), loadGallery()]);
+      showToast('Artwork removed from collection.', 'done');
+    } catch (error) {
+      showToast(error?.message || 'Could not update collection.', 'error');
+    }
+  });
   document.getElementById('btn-library-delete-selected-inline').addEventListener('click', deleteSelectedGalleryJobs);
   document.getElementById('btn-library-clear-selection-inline').addEventListener('click', () => setAllGallerySelections(false));
   document.getElementById('btn-batch-upload-cancel').addEventListener('click', () => {
     closeModal('batch-upload-modal');
   });
   document.getElementById('btn-batch-upload-apply').addEventListener('click', applyBatchUpload);
+  document.getElementById('gallery-grid').addEventListener('click', (event) => {
+    const button = event.target.closest('[data-tag-job-id]');
+    if (!button) return;
+    setTagsForJobs([button.dataset.tagJobId]).catch((error) => {
+      showToast(error?.message || 'Could not save tags.', 'error');
+    });
+  });
+  document.getElementById('btn-gallery-filter').addEventListener('click', loadGallery);
+  document.getElementById('gallery-search').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') loadGallery();
+  });
+  document.getElementById('btn-gallery-clear-filters').addEventListener('click', () => {
+    document.getElementById('gallery-search').value = '';
+    document.getElementById('gallery-tag-filter').value = '';
+    document.getElementById('gallery-collection-filter').value = '';
+    loadGallery();
+  });
+  document.getElementById('btn-library-create-collection').addEventListener('click', async () => {
+    const input = document.getElementById('library-collection-name');
+    const name = input.value.trim();
+    if (!name) return;
+    try {
+      const response = await apiFetch('/library/collections', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      });
+      await parseJSONResponse(response, 'Could not create collection.');
+      input.value = '';
+      await loadLibraryCollections();
+      showToast('Collection created.', 'done');
+    } catch (error) {
+      showToast(error?.message || 'Could not create collection.', 'error');
+    }
+  });
+  document.getElementById('btn-library-delete-collection').addEventListener('click', async () => {
+    const select = document.getElementById('library-target-collection');
+    const collectionId = select.value;
+    const collection = managedCollections.find((item) => item.id === collectionId);
+    if (!collection || !window.confirm('Delete collection ' + collection.name + '? Artwork is kept.')) {
+      return;
+    }
+    try {
+      const response = await apiFetch(
+        '/library/collections/' + encodeURIComponent(collectionId),
+        { method: 'DELETE' },
+      );
+      await parseJSONResponse(response, 'Could not delete collection.');
+      await Promise.all([loadLibraryCollections(), loadGallery()]);
+      showToast('Collection deleted; artwork was kept.', 'done');
+    } catch (error) {
+      showToast(error?.message || 'Could not delete collection.', 'error');
+    }
+  });
+  document.getElementById('btn-library-history').addEventListener('click', async () => {
+    const container = document.getElementById('library-history-list');
+    if (container.style.display !== 'none') {
+      container.style.display = 'none';
+      return;
+    }
+    try {
+      const response = await apiFetch('/library/history?limit=50');
+      const history = await parseJSONResponse(response, 'Could not load display history.');
+      container.innerHTML = history.length ? history.map((item) =>
+        '<div class="settings-item"><div class="settings-item-main"><strong>' +
+        esc(item.job_id || item.content_id || 'TV artwork') + '</strong><span>' +
+        esc(item.source) + ' · ' + esc(item.tv_target || 'TV') + ' · ' +
+        esc(new Date(item.displayed_at * 1000).toLocaleString()) +
+        '</span></div></div>'
+      ).join('') : '<div class="settings-item"><strong>No display history yet</strong></div>';
+      container.style.display = 'flex';
+    } catch (error) {
+      showToast(error?.message || 'Could not load display history.', 'error');
+    }
+  });
   document.getElementById('batch-upload-tv-select').addEventListener('change', (e) => {
     loadMattesForSelect('batch-upload-matte-select', e.target.value);
   });

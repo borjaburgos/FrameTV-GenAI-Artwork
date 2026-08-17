@@ -216,13 +216,35 @@
       <button class="btn btn-danger" id="btn-gallery-delete-selected" disabled>Delete Selected</button>
     </div>
   </div>
-  <p class="page-intro">Browse everything processed by FrameArt. Select multiple items for bulk actions.</p>
+  <p class="page-intro">Search, tag, and organize everything processed by FrameArt.</p>
+  <div class="library-tools">
+    <input id="gallery-search" type="search" maxlength="200" placeholder="Search prompts, providers, tags...">
+    <input id="gallery-tag-filter" maxlength="50" placeholder="Filter by tag">
+    <select id="gallery-collection-filter">
+      <option value="">All collections</option>
+    </select>
+    <button class="btn btn-secondary btn-small" id="btn-gallery-filter">Apply Filters</button>
+    <button class="btn btn-ghost btn-small" id="btn-gallery-clear-filters">Clear</button>
+  </div>
+  <div class="library-tools">
+    <input id="library-collection-name" maxlength="100" placeholder="New collection name">
+    <button class="btn btn-secondary btn-small" id="btn-library-create-collection">Create Collection</button>
+    <select id="library-target-collection">
+      <option value="">Choose collection...</option>
+    </select>
+    <button class="btn btn-danger btn-small" id="btn-library-delete-collection">Delete Collection</button>
+    <button class="btn btn-secondary btn-small" id="btn-library-history">Display History</button>
+  </div>
+  <div class="settings-list" id="library-history-list" style="display:none;"></div>
   <div class="gallery" id="gallery-grid"></div>
   <div class="empty" id="gallery-empty" style="display:none;">No artwork generated yet.</div>
   <div class="selection-bar" id="library-selection-bar">
     <div class="selection-meta" id="library-selection-text">0 selected</div>
     <div class="selection-actions">
       <button class="btn btn-secondary btn-small" id="btn-library-display-selected" disabled>Display Selected</button>
+      <button class="btn btn-secondary btn-small" id="btn-library-tag-selected" disabled>Set Tags</button>
+      <button class="btn btn-secondary btn-small" id="btn-library-collect-selected" disabled>Add to Collection</button>
+      <button class="btn btn-ghost btn-small" id="btn-library-uncollect-selected" disabled>Remove from Collection</button>
       <button class="btn btn-danger btn-small" id="btn-library-delete-selected-inline" disabled>Delete Selected</button>
       <button class="btn btn-ghost btn-small" id="btn-library-clear-selection-inline" disabled>Clear</button>
     </div>

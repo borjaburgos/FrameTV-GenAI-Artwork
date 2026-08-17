@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from threading import Event
 
 import pytest
@@ -112,4 +113,41 @@ class TestJobStore:
         with pytest.raises(JobQueueFullError, match="queue is full"):
             store.submit("overflow", lambda: 2)
 
+        release.set()
+
+    def test_completed_jobs_survive_store_restart(self, tmp_path):
+        database = tmp_path / "frameart.sqlite3"
+        store = JobStore(max_workers=1, database_path=database)
+        store.submit("persisted", lambda: {"job_id": "persisted", "value": 42})
+
+        for _ in range(50):
+            job = store.get("persisted")
+            if job and job.status == JobStatus.completed:
+                break
+            time.sleep(0.05)
+
+        restarted = JobStore(max_workers=1, database_path=database)
+        recovered = restarted.get("persisted")
+        assert recovered is not None
+        assert recovered.status == JobStatus.completed
+        assert recovered.result == {"job_id": "persisted", "value": 42}
+        assert Path(database).stat().st_mode & 0o777 == 0o600
+
+    def test_restart_marks_interrupted_jobs_failed(self, tmp_path):
+        database = tmp_path / "frameart.sqlite3"
+        release = Event()
+        store = JobStore(max_workers=1, database_path=database)
+        store.submit("interrupted", lambda: release.wait(2))
+
+        for _ in range(50):
+            job = store.get("interrupted")
+            if job and job.status == JobStatus.running:
+                break
+            time.sleep(0.01)
+
+        restarted = JobStore(max_workers=1, database_path=database)
+        recovered = restarted.get("interrupted")
+        assert recovered is not None
+        assert recovered.status == JobStatus.failed
+        assert recovered.error == "Interrupted by a server restart."
         release.set()

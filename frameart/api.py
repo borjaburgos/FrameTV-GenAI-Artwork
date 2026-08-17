@@ -46,6 +46,7 @@ import platform
 import re
 import secrets
 import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -72,6 +73,7 @@ import frameart.public_domain as public_domain
 from frameart import __version__
 from frameart.config import STYLE_PRESETS, ProviderConfig, Settings, TVProfile, load_settings
 from frameart.jobs import JobQueueFullError
+from frameart.library import LibraryStore
 from frameart.providers.registry import available_providers
 from frameart.settings_store import (
     SETTINGS_SCHEMA_VERSION,
@@ -587,6 +589,37 @@ class JobSummary(BaseModel):
     prompt: str | None = None
     provider: str | None = None
     content_id: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    collections: list[str] = Field(default_factory=list)
+
+
+class JobTagsRequest(BaseModel):
+    """Replace all tags assigned to an artwork."""
+
+    tags: list[Annotated[str, Field(min_length=1, max_length=50)]] = Field(
+        default_factory=list,
+        max_length=20,
+    )
+
+
+class CollectionCreateRequest(BaseModel):
+    """Create a named artwork collection."""
+
+    name: str = Field(..., min_length=1, max_length=100)
+
+    @field_validator("name")
+    @classmethod
+    def strip_name(cls, value: str) -> str:
+        return _strip_nonempty(value)
+
+
+class CollectionItemsRequest(BaseModel):
+    """Add or remove artwork jobs from a collection."""
+
+    job_ids: list[JobId] = Field(..., min_length=1, max_length=100)
+
+
+CollectionId = Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")]
 
 
 class DeleteJobsRequest(BaseModel):
@@ -641,6 +674,11 @@ class PublicDomainApplyRequest(BaseModel):
 def _settings():
     """Load settings for the current request."""
     return load_settings()
+
+
+def _library_store(settings=None) -> LibraryStore:
+    settings = settings or _settings()
+    return LibraryStore(settings.data_dir)
 
 
 _SENSITIVE_SETTING_TERMS = ("api_key", "password", "secret", "token")
@@ -998,17 +1036,35 @@ def _test_provider_connection(name: str, config: ProviderConfig) -> str:
 
 def _pipeline_result_to_response(result) -> JobResponse:
     """Convert a PipelineResult dataclass to a JSON-serialisable response."""
+    def value(name: str, default=None):
+        if isinstance(result, dict):
+            return result.get(name, default)
+        return getattr(result, name, default)
+
     return JobResponse(
-        job_id=result.job_id,
-        job_dir=str(result.job_dir),
-        source_path=str(result.source_path) if result.source_path else None,
-        final_path=str(result.final_path) if result.final_path else None,
-        content_id=result.content_id,
-        tv_switched=result.tv_switched,
-        metadata=result.metadata,
-        timings=result.timings,
-        error=result.error,
+        job_id=value("job_id"),
+        job_dir=str(value("job_dir")),
+        source_path=str(value("source_path")) if value("source_path") else None,
+        final_path=str(value("final_path")) if value("final_path") else None,
+        content_id=value("content_id"),
+        tv_switched=bool(value("tv_switched", False)),
+        metadata=value("metadata", {}),
+        timings=value("timings", {}),
+        error=value("error"),
     )
+
+
+def _configured_job_store(settings=None):
+    """Return the singleton job store configured for the active data directory."""
+    from frameart.jobs import job_store
+
+    settings = settings or _settings()
+    data_dir = settings.data_dir
+    if isinstance(data_dir, (str, Path)):
+        job_store.configure(Path(data_dir) / "frameart.sqlite3")
+    else:
+        job_store.configure(None)
+    return job_store
 
 
 def _read_validated_upload(image: UploadFile) -> tuple[str, str, bytes]:
@@ -2044,6 +2100,12 @@ def tv_display_art(req: DisplayArtRequest):
 
     profile = _resolve_tv_profile(req.tv, req.tv_ip)
     if switch_art(profile, req.content_id):
+        _library_store().record_display(
+            job_id=None,
+            content_id=req.content_id,
+            tv_target=req.tv or profile.ip,
+            source="tv-art",
+        )
         return {"ok": True, "content_id": req.content_id}
     raise HTTPException(status_code=500, detail="Failed to display artwork.")
 
@@ -2180,8 +2242,13 @@ def _find_job_dirs(artifacts_dir: Path, job_id: str) -> list[Path]:
 
 
 @app.get("/jobs", response_model=list[JobSummary])
-def list_jobs(limit: int = Query(20, ge=1, le=200, description="Max jobs to return.")):
-    """List recent generated jobs."""
+def list_jobs(
+    limit: int = Query(20, ge=1, le=200, description="Max jobs to return."),
+    q: str | None = Query(None, max_length=200, description="Prompt/provider text search."),
+    tag: str | None = Query(None, max_length=50, description="Required tag."),
+    collection: str | None = Query(None, max_length=32, description="Collection ID."),
+):
+    """Search recent generated jobs with persistent tags and collections."""
     import json as _json
 
     settings = _settings()
@@ -2189,28 +2256,122 @@ def list_jobs(limit: int = Query(20, ge=1, le=200, description="Max jobs to retu
     if not artifacts_dir.exists():
         return []
 
+    library = _library_store(settings)
     meta_files = sorted(artifacts_dir.rglob("meta.json"), reverse=True)
-    jobs: list[JobSummary] = []
+    candidates: list[tuple[Path, dict[str, Any]]] = []
     for meta_path in meta_files:
         job_dir = meta_path.parent
-        # Only show jobs that have an image preview the UI can render.
         if not (job_dir / "final.png").exists() and not (job_dir / "source.png").exists():
             continue
         try:
             meta = _json.loads(meta_path.read_text())
-            jobs.append(
-                JobSummary(
-                    job_id=meta.get("job_id", meta_path.parent.name),
-                    prompt=meta.get("prompt_original"),
-                    provider=meta.get("provider"),
-                    content_id=meta.get("content_id"),
-                )
-            )
         except Exception:
-            jobs.append(JobSummary(job_id=meta_path.parent.name))
+            meta = {}
+        candidates.append((meta_path, meta))
+
+    job_ids = [meta.get("job_id", path.parent.name) for path, meta in candidates]
+    library_metadata = library.metadata_for_jobs(job_ids)
+    collection_ids = library.collection_job_ids(collection) if collection else None
+    search = q.strip().lower() if q else None
+    required_tag = tag.strip().lower() if tag else None
+    jobs: list[JobSummary] = []
+    for meta_path, meta in candidates:
+        job_id = str(meta.get("job_id", meta_path.parent.name))
+        extra = library_metadata.get(job_id, {"tags": [], "collections": []})
+        if collection_ids is not None and job_id not in collection_ids:
+            continue
+        if required_tag and required_tag not in extra["tags"]:
+            continue
+        searchable = " ".join(
+            [
+                job_id,
+                str(meta.get("prompt_original") or ""),
+                str(meta.get("provider") or ""),
+                str(meta.get("content_id") or ""),
+                *extra["tags"],
+                *extra["collections"],
+            ]
+        ).lower()
+        if search and search not in searchable:
+            continue
+        jobs.append(
+            JobSummary(
+                job_id=job_id,
+                prompt=meta.get("prompt_original"),
+                provider=meta.get("provider"),
+                content_id=meta.get("content_id"),
+                tags=extra["tags"],
+                collections=extra["collections"],
+            )
+        )
         if len(jobs) >= limit:
             break
     return jobs
+
+
+@app.put("/jobs/{job_id}/tags")
+def update_job_tags(job_id: JobId, req: JobTagsRequest):
+    """Replace an artwork's persistent tags."""
+    settings = _settings()
+    if not _find_job_dirs(settings.data_dir / "artifacts", job_id):
+        raise HTTPException(status_code=404, detail="Artwork job was not found.")
+    return {"job_id": job_id, "tags": _library_store(settings).set_tags(job_id, req.tags)}
+
+
+@app.get("/library/collections")
+def list_library_collections():
+    return _library_store().list_collections()
+
+
+@app.post("/library/collections", status_code=201)
+def create_library_collection(req: CollectionCreateRequest):
+    try:
+        return _library_store().create_collection(req.name)
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="A collection with that name already exists.",
+        ) from exc
+
+
+@app.delete("/library/collections/{collection_id}")
+def delete_library_collection(collection_id: CollectionId):
+    if not _library_store().delete_collection(collection_id):
+        raise HTTPException(status_code=404, detail="Collection was not found.")
+    return {"deleted": collection_id}
+
+
+@app.post("/library/collections/{collection_id}/items")
+def add_library_collection_items(collection_id: CollectionId, req: CollectionItemsRequest):
+    settings = _settings()
+    missing = [
+        job_id
+        for job_id in req.job_ids
+        if not _find_job_dirs(settings.data_dir / "artifacts", job_id)
+    ]
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Artwork job(s) not found: {', '.join(missing)}",
+        )
+    try:
+        _library_store(settings).add_collection_items(collection_id, req.job_ids)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Collection was not found.") from exc
+    return {"collection_id": collection_id, "job_ids": req.job_ids}
+
+
+@app.delete("/library/collections/{collection_id}/items")
+def remove_library_collection_items(collection_id: CollectionId, req: CollectionItemsRequest):
+    _library_store().remove_collection_items(collection_id, req.job_ids)
+    return {"collection_id": collection_id, "job_ids": req.job_ids}
+
+
+@app.get("/library/history")
+def get_library_history(
+    limit: int = Query(100, ge=1, le=500, description="Maximum display events."),
+):
+    return _library_store().list_history(limit)
 
 
 @app.post("/jobs/delete", response_model=DeleteJobsResponse)
@@ -2218,6 +2379,8 @@ def delete_jobs(req: DeleteJobsRequest):
     """Delete generated job artifacts from the host filesystem."""
     settings = _settings()
     artifacts_dir = settings.data_dir / "artifacts"
+    library = _library_store(settings)
+    async_jobs = _configured_job_store(settings)
 
     if not artifacts_dir.exists():
         return DeleteJobsResponse(deleted=[], not_found=list(req.job_ids), failed={})
@@ -2239,6 +2402,8 @@ def delete_jobs(req: DeleteJobsRequest):
         try:
             for job_dir in job_dirs:
                 shutil.rmtree(job_dir)
+            library.remove_job(job_id)
+            async_jobs.delete(job_id)
             deleted.append(job_id)
         except Exception as e:
             failed[job_id] = str(e)
@@ -2526,6 +2691,12 @@ def apply_job_to_tv(job_id: str, req: JobApplyRequest):
         if reusable_content_id and switch_art(profile, reusable_content_id):
             source_preview = job_dir / "source.png"
             final_preview = job_dir / "final.png"
+            _library_store(settings).record_display(
+                job_id=job_id,
+                content_id=reusable_content_id,
+                tv_target=req.tv or profile.ip,
+                source="library-reuse",
+            )
             return JobResponse(
                 job_id=job_id,
                 job_dir=str(job_dir),
@@ -2591,9 +2762,8 @@ def apply_job_to_tv(job_id: str, req: JobApplyRequest):
 @app.get("/jobs/{job_id}/status", response_model=AsyncJobDetail)
 def get_job_status(job_id: str):
     """Get the detailed status of an async job."""
-    from frameart.jobs import job_store
-
     _validated_job_id(job_id)
+    job_store = _configured_job_store()
     job = job_store.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found in async queue")
@@ -2616,8 +2786,7 @@ def list_async_jobs(
     limit: int = Query(50, ge=1, le=200, description="Maximum number of async jobs to return."),
 ):
     """List recent async jobs (newest first)."""
-    from frameart.jobs import job_store
-
+    job_store = _configured_job_store()
     jobs = job_store.list_jobs(limit=limit)
     out: list[AsyncJobDetail] = []
     for job in jobs:
@@ -2640,10 +2809,10 @@ def list_async_jobs(
 def async_generate(req: GenerateRequest):
     """Submit an image generation job to the background queue."""
     from frameart.artifacts import generate_job_id
-    from frameart.jobs import job_store
     from frameart.pipeline import run_generate
 
     settings = _settings()
+    job_store = _configured_job_store(settings)
     job_id = generate_job_id()
 
     job_store.submit(
@@ -2676,10 +2845,10 @@ def async_generate(req: GenerateRequest):
 def async_generate_and_apply(req: GenerateAndApplyRequest):
     """Submit a generate-and-apply job to the background queue."""
     from frameart.artifacts import generate_job_id
-    from frameart.jobs import job_store
     from frameart.pipeline import run_generate_and_apply
 
     settings = _settings()
+    job_store = _configured_job_store(settings)
     job_id = generate_job_id()
 
     job_store.submit(

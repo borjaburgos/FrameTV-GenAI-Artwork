@@ -13,8 +13,9 @@ FrameArt is a self-hosted tool that accepts a text description, generates an ima
 - **Samsung Frame TV integration**: Upload art and switch display via WebSocket API
 - **TV auto-discovery**: Find Frame TVs on your LAN automatically via UPnP/SSDP
 - **HTTP API**: FastAPI server with sync and async endpoints — ideal for voice agents and Home Assistant
-- **Async job queue**: Submit long-running generation jobs and poll for results
+- **Persistent async job queue**: Restart-safe SQLite status, results, and bounded history
 - **Web UI**: Built-in browser interface with provider/model dropdowns and concurrent async job tracking
+- **Managed artwork library**: Search, tags, named collections, bulk organization, and display history
 - **Public domain artwork support**: Search and apply art from major open-access museum collections
 - **Style presets**: abstract, oil_painting, watercolor, kid_drawing, and more
 - **Pluggable upscalers**: Built-in Pillow LANCZOS, local HTTP (Real-ESRGAN), or remote services
@@ -68,6 +69,9 @@ Web-managed settings are stored below FrameArt's `data_dir`:
 - `secrets/provider-keys.yaml` contains provider API keys with owner-only file permissions.
 - `backups/settings/` contains up to 20 owner-only recovery snapshots created automatically
   before managed changes and on demand from the UI.
+- `frameart.sqlite3` contains persistent async job state, library tags/collections, and display
+  history. Running work interrupted by a restart is retained as failed so it can be diagnosed
+  or resubmitted.
 
 Environment variables remain authoritative over web-managed values. When authentication is
 enabled, all `/settings/*` API operations require an admin token. TVs found through **Scan
@@ -231,6 +235,10 @@ Loopback-only serving leaves authentication off by default. Non-loopback binds a
 | `GET` | `/tv/discover` | Auto-discover Samsung TVs via SSDP |
 | `GET` | `/jobs` | List recent jobs |
 | `GET` | `/jobs/{job_id}/image` | Serve the final processed image |
+| `PUT` | `/jobs/{job_id}/tags` | Replace persistent artwork tags |
+| `GET/POST` | `/library/collections` | List or create named collections |
+| `POST/DELETE` | `/library/collections/{id}/items` | Add or remove collection items |
+| `GET` | `/library/history` | List recent TV display history |
 
 **Public domain catalog**:
 
@@ -663,7 +671,8 @@ GitHub Actions. Failed browser runs upload a trace, screenshot, and HTML report 
 frameart/
   cli.py              # Click CLI commands
   api.py              # FastAPI HTTP server (sync + async endpoints)
-  jobs.py             # Async job queue (ThreadPoolExecutor, in-memory)
+  jobs.py             # Async executor + restart-safe SQLite status history
+  library.py          # Tags, collections, and TV display history
   pipeline.py         # Core orchestration: generate -> postprocess -> upload -> switch
   config.py           # Configuration management (YAML + env vars + CLI flags)
   postprocess.py      # 16:9 crop + 4K resize logic
@@ -694,7 +703,7 @@ frameart/
 ## Known Limitations
 
 - **No HTTPS on the API server.** Same recommendation: use a reverse proxy to terminate TLS.
-- **Async jobs are in-memory only.** They do not survive server restarts. The active queue and completed history are bounded, and the server intentionally runs one worker so job polling and TV locks remain consistent.
+- **Running jobs cannot resume mid-generation after a restart.** Their records survive and are marked failed with an interruption reason; completed results and bounded history remain available.
 - **API rate limiting is per process.** This is appropriate for the supported single-worker local deployment; use a reverse proxy for distributed/global limits.
 
 ### Potential Future Work
