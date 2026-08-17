@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from pathlib import Path
 
 import click
 
@@ -733,6 +734,64 @@ def cleanup(ctx, older_than, dry_run):
 
     action = "Would remove" if dry_run else "Removed"
     click.echo(f"{action} {removed} job(s) older than {older_than} days.")
+
+
+# --- data backup / restore --------------------------------------------------
+
+
+@main.group()
+def data():
+    """Back up or restore the complete FrameArt data directory."""
+
+
+@data.command("backup")
+@click.option(
+    "--output",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Destination .tar.gz path (default: current directory).",
+)
+@click.pass_context
+def data_backup(ctx, output):
+    """Create an owner-private backup with a consistent SQLite snapshot."""
+    from frameart.backup import create_data_backup
+
+    settings = ctx.obj["settings"]
+    try:
+        backup_path = create_data_backup(settings.data_dir, output)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.secho(f"Backup created: {backup_path}", fg="green")
+    click.echo("This archive can contain provider keys and TV tokens; store it securely.")
+
+
+@data.command("restore")
+@click.option(
+    "--archive",
+    "archive_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="FrameArt backup archive to restore.",
+)
+@click.option("--yes", is_flag=True, help="Confirm replacement of the current data directory.")
+@click.pass_context
+def data_restore(ctx, archive_path, yes):
+    """Restore a backup after the API service has been stopped."""
+    from frameart.backup import restore_data_backup
+
+    if not yes:
+        raise click.ClickException(
+            "Restore replaces the active data directory. Stop the API and pass --yes to confirm."
+        )
+    settings = ctx.obj["settings"]
+    logging.shutdown()
+    try:
+        safety_backup = restore_data_backup(settings.data_dir, archive_path)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.secho(f"Restored data from: {archive_path}", fg="green")
+    if safety_backup:
+        click.echo(f"Pre-restore safety backup: {safety_backup}")
 
 
 # --- serve (HTTP API) --------------------------------------------------------

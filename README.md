@@ -532,10 +532,17 @@ Optional key for Europeana (a demo key is used by default):
 #### docker-compose (recommended)
 
 ```bash
-# Edit docker-compose.yml with your settings, then start the LAN-aware service:
+# Keep secrets and image selection out of the Compose file:
+cp .env.example .env
+# Edit .env, then start the LAN-aware service:
 docker compose --profile lan up -d frameart-api-lan
 docker compose logs frameart-api-lan  # first start prints the generated admin token
 ```
+
+The included `Makefile` shortens the common lifecycle to `make build`, `make up`,
+`make logs`, `make backup`, and `make down`. Set `FRAMEART_IMAGE` in `.env` to use a
+published GHCR tag instead of building locally. Tagged releases publish provenance,
+an SBOM, and `linux/amd64` plus `linux/arm64` images.
 
 The `docker-compose.yml` includes three services:
 
@@ -562,6 +569,51 @@ service binds directly to the host's port 8000 and therefore does not use a `por
 
 ```bash
 docker compose --profile lan up -d frameart-api-lan
+```
+
+#### HTTPS for a home network
+
+Install Caddy on the same Linux host as `frameart-api-lan`, point your local DNS entry at
+that host, and run the supplied local-CA configuration:
+
+```bash
+export FRAMEART_DOMAIN=frameart.home.arpa
+caddy run --config deploy/Caddyfile.local
+```
+
+Trust Caddy's local root certificate on client devices before entering API tokens. For a
+public DNS name, remove `tls internal` so Caddy can request a publicly trusted certificate.
+
+#### Back up and restore
+
+Backups include settings, provider keys, TV tokens, artifacts, and a transactionally
+consistent SQLite snapshot. Archives are created mode `0600` and must be treated as secrets.
+
+```bash
+# Native install
+frameart data backup --output ./frameart-backup.tar.gz
+
+# Compose deployment (writes into the persistent volume)
+make backup
+
+# Stop the API before restore. A pre-restore safety backup is created automatically.
+frameart data restore --archive ./frameart-backup.tar.gz --yes
+# Compose: BACKUP is a path inside /data/frameart in the shared volume
+make restore BACKUP=/data/frameart/backups/manual-20260817T120000Z.tar.gz
+```
+
+#### Hardware smoke test
+
+The smoke script checks API readiness and real Samsung Art Mode support without changing
+the display. Add `--apply-job` only when you intentionally want an end-to-end upload/switch.
+
+```bash
+scripts/hardware-smoke.py --url https://frameart.home.arpa \
+  --token "$FRAMEART_AUTOMATION_TOKEN" --tv livingroom_frame
+
+scripts/hardware-smoke.py --url https://frameart.home.arpa \
+  --token "$FRAMEART_AUTOMATION_TOKEN" --tv livingroom_frame \
+  --apply-job 120000-abcd1234
 ```
 
 #### Build and run directly
@@ -708,6 +760,7 @@ frameart/
   jobs.py             # Async executor + restart-safe SQLite status history
   library.py          # Tags, collections, and TV display history
   automation.py       # TV groups, playlists, scheduler, webhooks, and MQTT
+  backup.py           # Consistent private backups and recoverable restore
   pipeline.py         # Core orchestration: generate -> postprocess -> upload -> switch
   config.py           # Configuration management (YAML + env vars + CLI flags)
   postprocess.py      # 16:9 crop + 4K resize logic

@@ -1,6 +1,7 @@
 services:
   # One-shot CLI commands: docker compose run --rm frameart <command>
   frameart:
+    image: ${FRAMEART_IMAGE:-frameart:local}
     build: .
     container_name: frameart
     volumes:
@@ -22,6 +23,7 @@ services:
   # Long-running HTTP API server without LAN multicast access:
   # docker compose up -d frameart-api
   frameart-api: &frameart-api-service
+    image: ${FRAMEART_IMAGE:-frameart:local}
     build: .
     container_name: frameart-api
     command: ["serve", "--host", "0.0.0.0", "--port", "8000"]
@@ -33,14 +35,21 @@ services:
       # - ./config.yaml:/app/config.yaml:ro
     environment:
       - FRAMEART_DATA_DIR=/data/frameart
-      - FRAMEART_AUTH_ENABLED=true
+      - FRAMEART_AUTH_ENABLED=${FRAMEART_AUTH_ENABLED:-true}
       # Optional: provide stable tokens in .env. If ADMIN is omitted, FrameArt
       # creates /data/frameart/secrets/admin-api.token on first startup.
-      # - FRAMEART_ADMIN_TOKEN=${FRAMEART_ADMIN_TOKEN}
-      # - FRAMEART_AUTOMATION_TOKEN=${FRAMEART_AUTOMATION_TOKEN}
+      - FRAMEART_ADMIN_TOKEN=${FRAMEART_ADMIN_TOKEN:-}
+      - FRAMEART_AUTOMATION_TOKEN=${FRAMEART_AUTOMATION_TOKEN:-}
+      # Optional schedule event publishing:
+      - FRAMEART_MQTT_BROKER=${FRAMEART_MQTT_BROKER:-}
+      - FRAMEART_MQTT_PORT=${FRAMEART_MQTT_PORT:-1883}
+      - FRAMEART_MQTT_USERNAME=${FRAMEART_MQTT_USERNAME:-}
+      - FRAMEART_MQTT_PASSWORD=${FRAMEART_MQTT_PASSWORD:-}
+      - FRAMEART_MQTT_TOPIC_PREFIX=${FRAMEART_MQTT_TOPIC_PREFIX:-frameart}
       # Provider API keys — set these in your .env file or shell:
-      # - OPENAI_API_KEY=${OPENAI_API_KEY}
-      # - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')"]

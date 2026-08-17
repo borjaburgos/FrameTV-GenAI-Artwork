@@ -15,8 +15,8 @@ COPY pyproject.toml README.md ./
 COPY frameart/ frameart/
 COPY config.example.yaml .
 
-# Install the package with API dependencies (FastAPI + uvicorn)
-RUN pip install --no-cache-dir ".[api]"
+# Install the API and optional local-integration dependencies.
+RUN pip install --no-cache-dir ".[api,integrations]"
 
 # Data volume
 RUN mkdir -p /data/frameart && chown -R frameart:frameart /data/frameart
