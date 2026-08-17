@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
-from frameart.config import STYLE_PRESETS
-from frameart.pipeline import normalize_edit_prompt, normalize_prompt
+import json
+from unittest.mock import patch
+
+from frameart.config import STYLE_PRESETS, Settings, TVProfile
+from frameart.pipeline import normalize_edit_prompt, normalize_prompt, run_apply
+from frameart.tv.controller import UploadResult
 
 
 class TestNormalizePrompt:
@@ -78,3 +82,38 @@ class TestNormalizeEditPrompt:
             auto_aspect_hint=True,
         )
         assert result.startswith("hello")
+
+
+@patch("frameart.pipeline.tv_ctrl.switch_art", return_value=False)
+@patch(
+    "frameart.pipeline.tv_ctrl.upload_image",
+    return_value=UploadResult(content_id="MY_F0006", success=True),
+)
+def test_apply_persists_upload_id_and_fails_when_display_is_not_confirmed(
+    mock_upload,
+    mock_switch,
+    tmp_path,
+):
+    image_path = tmp_path / "art.jpg"
+    image_path.write_bytes(b"uploaded image bytes")
+    settings = Settings(
+        data_dir=tmp_path,
+        tvs={"livingroom": TVProfile(ip="192.168.1.100")},
+    )
+
+    result = run_apply(settings, image_path, tv_name="livingroom")
+
+    assert result.content_id == "MY_F0006"
+    assert result.tv_switched is False
+    assert result.error is not None
+    assert "frameart tv display" in result.error
+    metadata = json.loads((result.job_dir / "meta.json").read_text())
+    assert metadata["content_id"] == "MY_F0006"
+    assert metadata["tv_switched"] is False
+    assert metadata["error"] == result.error
+    mock_upload.assert_called_once()
+    mock_switch.assert_called_once_with(
+        settings.tvs["livingroom"],
+        "MY_F0006",
+        wait_for_ready=True,
+    )
