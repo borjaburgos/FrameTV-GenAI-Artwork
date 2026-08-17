@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-import httpx
+import httpx2 as httpx
 from PIL import Image, UnidentifiedImageError
 
 MET_API_BASE = "https://collectionapi.metmuseum.org/public/collection/v1"

@@ -16,7 +16,7 @@ import logging
 import os
 from typing import Any
 
-import httpx
+import httpx2 as httpx
 from PIL import Image
 
 from frameart.config import ProviderConfig
