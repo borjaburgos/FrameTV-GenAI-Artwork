@@ -905,6 +905,17 @@ class TestTVDiscover:
         assert resp.status_code == 200
         assert resp.json() == []
 
+    @patch("frameart.tv.discovery.discover")
+    def test_reports_unavailable_discovery(self, mock_discover):
+        from frameart.tv.discovery import SSDPDiscoveryError
+
+        mock_discover.side_effect = SSDPDiscoveryError("Use the LAN deployment")
+
+        resp = client.get("/tv/discover")
+
+        assert resp.status_code == 503
+        assert resp.json() == {"detail": "Use the LAN deployment"}
+
 
 # ---------------------------------------------------------------------------
 # GET /tv/art
@@ -1709,3 +1720,11 @@ class TestWebUI:
         assert resp.status_code == 200
         assert "text/html" in resp.headers["content-type"]
         assert "FrameArt" in resp.text
+
+    def test_tv_discovery_has_manual_fallback_and_http_error_handling(self):
+        resp = client.get("/")
+
+        assert 'id="btn-add-tv"' in resp.text
+        assert 'id="add-tv-modal"' in resp.text
+        assert "parseJSONResponse(resp, 'TV discovery request failed.')" in resp.text
+        assert "frameart-api-lan" in resp.text

@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from frameart.tv.discovery import (
     _SEARCH_TARGETS,
     _SEND_COUNT,
     DiscoveredTV,
+    SSDPDiscoveryError,
     _query_device_info,
     _ssdp_search,
     discover,
@@ -15,6 +18,27 @@ from frameart.tv.discovery import (
 
 
 class TestSSDPSearch:
+    @patch("frameart.tv.discovery.socket.socket")
+    def test_reports_socket_creation_failure(self, mock_socket_cls):
+        mock_socket_cls.side_effect = PermissionError("UDP sockets are blocked")
+
+        with pytest.raises(SSDPDiscoveryError, match="frameart-api-lan"):
+            _ssdp_search(timeout=1)
+
+    @patch("frameart.tv.discovery.time.sleep")
+    @patch("frameart.tv.discovery.socket.socket")
+    def test_reports_multicast_send_failure_and_closes_socket(
+        self, mock_socket_cls, _mock_sleep
+    ):
+        mock_sock = MagicMock()
+        mock_socket_cls.return_value = mock_sock
+        mock_sock.sendto.side_effect = OSError("Network is unreachable")
+
+        with pytest.raises(SSDPDiscoveryError, match="Network is unreachable"):
+            _ssdp_search(timeout=1)
+
+        mock_sock.close.assert_called_once_with()
+
     @patch("frameart.tv.discovery.time.sleep")
     @patch("frameart.tv.discovery.socket.socket")
     def test_parses_location_header(self, mock_socket_cls, _mock_sleep):
