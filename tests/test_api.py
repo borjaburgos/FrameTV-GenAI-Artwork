@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from frameart.api import app
 
@@ -36,6 +39,12 @@ def _fake_result(**overrides) -> FakePipelineResult:
     return FakePipelineResult(**overrides)
 
 
+def _jpeg_bytes() -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (4, 4), "blue").save(output, format="JPEG")
+    return output.getvalue()
+
+
 # ---------------------------------------------------------------------------
 # /health
 # ---------------------------------------------------------------------------
@@ -47,6 +56,57 @@ class TestHealth:
         data = resp.json()
         assert data["status"] == "ok"
         assert "version" in data
+
+
+class TestAuthentication:
+    def test_admin_token_creates_browser_session(self, monkeypatch):
+        token = "admin-token-with-at-least-twenty-characters"
+        monkeypatch.setenv("FRAMEART_AUTH_ENABLED", "true")
+        monkeypatch.setenv("FRAMEART_ADMIN_TOKEN", token)
+
+        with TestClient(app) as secured_client:
+            assert secured_client.get("/health").status_code == 200
+            assert secured_client.get("/styles").status_code == 401
+
+            login = secured_client.post("/auth/session", json={"token": token})
+            assert login.status_code == 200
+            assert login.json()["scopes"] == ["admin", "control", "read"]
+            assert secured_client.get("/styles").status_code == 200
+
+    def test_automation_token_cannot_use_admin_scope(self, monkeypatch):
+        token = "automation-token-with-twenty-characters"
+        monkeypatch.setenv("FRAMEART_AUTH_ENABLED", "true")
+        monkeypatch.setenv("FRAMEART_ADMIN_TOKEN", "admin-token-with-twenty-characters")
+        monkeypatch.setenv("FRAMEART_AUTOMATION_TOKEN", token)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        with TestClient(app) as secured_client:
+            assert secured_client.get("/styles", headers=headers).status_code == 200
+            denied = secured_client.post(
+                "/jobs/delete",
+                json={"job_ids": ["job-1"]},
+                headers=headers,
+            )
+            assert denied.status_code == 403
+
+
+class TestServerSecurity:
+    @patch("uvicorn.run")
+    def test_loopback_server_uses_one_worker(self, mock_run, monkeypatch):
+        from frameart.api import run_server
+
+        monkeypatch.setenv("FRAMEART_AUTH_ENABLED", "false")
+        run_server(host="127.0.0.1", port=8123)
+        assert mock_run.call_args.kwargs["workers"] == 1
+
+    @patch("uvicorn.run")
+    def test_lan_bind_requires_authentication(self, mock_run, monkeypatch):
+        from frameart.api import run_server
+
+        monkeypatch.setenv("FRAMEART_AUTH_ENABLED", "false")
+        with pytest.raises(RuntimeError, match="non-loopback"):
+            run_server(host="0.0.0.0", port=8123)
+        mock_run.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +333,10 @@ class TestGenerate:
         resp = client.post("/generate", json={})
         assert resp.status_code == 422
 
+    def test_blank_prompt_returns_422(self):
+        resp = client.post("/generate", json={"prompt": "   "})
+        assert resp.status_code == 422
+
 
 # ---------------------------------------------------------------------------
 # POST /generate-and-apply
@@ -336,42 +400,26 @@ class TestGenerateAndApply:
         assert resp.status_code == 200
         assert mock_run.call_args.kwargs["matte"] == "none"
 
+    def test_rejects_public_tv_ip(self):
+        resp = client.post(
+            "/generate-and-apply",
+            json={"prompt": "flowers", "tv_ip": "8.8.8.8"},
+        )
+        assert resp.status_code == 422
+
 
 # ---------------------------------------------------------------------------
 # POST /apply
 # ---------------------------------------------------------------------------
 
 class TestApply:
-    @patch("frameart.api._settings")
-    @patch("frameart.pipeline.run_apply")
-    def test_success(self, mock_run, mock_settings):
-        mock_settings.return_value = MagicMock()
-        mock_run.return_value = _fake_result()
-
+    def test_server_path_endpoint_is_removed(self):
         resp = client.post(
             "/apply",
             json={"image_path": "/tmp/test.png", "tv_ip": "192.168.1.50"},
         )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["content_id"] == "MY_ART_001"
-
-    @patch("frameart.api._settings")
-    @patch("frameart.pipeline.run_apply")
-    def test_default_matte_is_none(self, mock_run, mock_settings):
-        mock_settings.return_value = MagicMock()
-        mock_run.return_value = _fake_result()
-
-        resp = client.post(
-            "/apply",
-            json={"image_path": "/tmp/test.png", "tv_ip": "192.168.1.50"},
-        )
-        assert resp.status_code == 200
-        assert mock_run.call_args.kwargs["matte"] == "none"
-
-    def test_missing_image_path_returns_422(self):
-        resp = client.post("/apply", json={"tv_ip": "192.168.1.50"})
-        assert resp.status_code == 422
+        assert resp.status_code == 404
+        assert "/apply" not in client.get("/openapi.json").json()["paths"]
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +438,7 @@ class TestUploadAndApply:
         resp = client.post(
             "/upload-and-apply",
             data={"tv_ip": "192.168.1.50", "matte": "none"},
-            files={"image": ("sample.jpg", b"fake-jpeg-bytes", "image/jpeg")},
+            files={"image": ("sample.jpg", _jpeg_bytes(), "image/jpeg")},
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -412,6 +460,15 @@ class TestUploadAndApply:
         assert resp.status_code == 400
         assert "Unsupported file type" in resp.json()["detail"]
 
+    def test_rejects_corrupt_image_content(self):
+        resp = client.post(
+            "/upload-and-apply",
+            data={"tv_ip": "192.168.1.50"},
+            files={"image": ("sample.jpg", b"not-a-real-jpeg", "image/jpeg")},
+        )
+        assert resp.status_code == 400
+        assert "not a valid image" in resp.json()["detail"]
+
 
 class TestEditAndApply:
     @patch("frameart.api._settings")
@@ -430,7 +487,7 @@ class TestEditAndApply:
                 "model": "gpt-image-1",
                 "tv_ip": "192.168.1.50",
             },
-            files={"image": ("sample.jpg", b"fake-jpeg-bytes", "image/jpeg")},
+            files={"image": ("sample.jpg", _jpeg_bytes(), "image/jpeg")},
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -449,7 +506,7 @@ class TestEditAndApply:
         resp = client.post(
             "/edit-and-apply",
             data={"prompt": "   ", "tv_ip": "192.168.1.50"},
-            files={"image": ("sample.jpg", b"fake-jpeg-bytes", "image/jpeg")},
+            files={"image": ("sample.jpg", _jpeg_bytes(), "image/jpeg")},
         )
         assert resp.status_code == 400
         assert "Edit prompt cannot be empty" in resp.json()["detail"]
@@ -469,7 +526,7 @@ class TestEditAndApply:
                 "provider": "openai",
                 "no_upload": "true",
             },
-            files={"image": ("sample.jpg", b"fake-jpeg-bytes", "image/jpeg")},
+            files={"image": ("sample.jpg", _jpeg_bytes(), "image/jpeg")},
         )
         assert resp.status_code == 200
         mock_run.assert_called_once()
@@ -739,6 +796,10 @@ class TestGetJobImage:
         resp = client.get("/jobs/doesnotexist/image")
         assert resp.status_code == 404
 
+    def test_rejects_glob_metacharacters(self):
+        resp = client.get("/jobs/%2A/image")
+        assert resp.status_code == 400
+
     @patch("frameart.api._settings")
     def test_falls_back_to_source_image(self, mock_settings):
         import tempfile
@@ -993,6 +1054,29 @@ class TestTVDeleteArt:
         data = resp.json()
         assert data["deleted"] == []
         assert data["skipped_favorites"] == ["MY_F0001"]
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.delete_art")
+    @patch("frameart.tv.controller.list_art_deduplicated")
+    def test_favorite_lookup_failure_cancels_delete(
+        self,
+        mock_list,
+        mock_delete,
+        mock_settings,
+    ):
+        settings = MagicMock()
+        settings.tvs = {}
+        mock_settings.return_value = settings
+        mock_list.side_effect = TimeoutError("TV did not respond")
+
+        resp = client.post(
+            "/tv/art/delete",
+            json={"content_ids": ["MY_F0001"], "tv_ip": "192.168.1.100"},
+        )
+
+        assert resp.status_code == 502
+        assert "deletion was cancelled" in resp.json()["detail"]
+        mock_delete.assert_not_called()
 
     @patch("frameart.api._settings")
     def test_no_tv_returns_400(self, mock_settings):
@@ -1566,18 +1650,13 @@ class TestAsyncGenerateAndApply:
 
 
 class TestAsyncApply:
-    @patch("frameart.api._settings")
-    @patch("frameart.pipeline.run_apply")
-    def test_submit(self, mock_run, mock_settings):
-        mock_settings.return_value = MagicMock()
-        mock_run.return_value = _fake_result()
-
+    def test_server_path_endpoint_is_removed(self):
         resp = client.post(
             "/async/apply",
             json={"image_path": "/tmp/test.png", "tv_ip": "10.0.0.1"},
         )
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "pending"
+        assert resp.status_code == 404
+        assert "/async/apply" not in client.get("/openapi.json").json()["paths"]
 
 
 # ---------------------------------------------------------------------------

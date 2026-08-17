@@ -10,8 +10,8 @@ Usage:
     frameart cleanup --older-than 30
 
 Debugging:
-    frameart --debug generate-and-apply --prompt "..." --tv-ip 1.2.3.4
-    frameart generate-and-apply --debug --prompt "..." --tv-ip 1.2.3.4
+    frameart --debug generate-and-apply --prompt "..." --tv-ip 192.168.1.100
+    frameart generate-and-apply --debug --prompt "..." --tv-ip 192.168.1.100
 """
 
 from __future__ import annotations
@@ -722,7 +722,10 @@ def serve(ctx, host, port):
 
     click.echo(f"Starting FrameArt API server on {host}:{port}")
     click.echo(f"  Docs: http://{host}:{port}/docs")
-    run_server(host=host, port=port)
+    try:
+        run_server(host=host, port=port)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 if __name__ == "__main__":

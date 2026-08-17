@@ -19,6 +19,13 @@ log_level: INFO
 # default_style: abstract
 auto_aspect_hint: true
 
+# HTTP API security. Required when serving beyond localhost. Admin tokens can
+# manage/delete; automation tokens can read, generate, upload, and display.
+auth_enabled: true
+# admin_token: "replace-with-a-long-random-token"
+# automation_token: "optional-separate-token-for-home-automation"
+api_rate_limit_per_minute: 60
+
 # --- TV profiles -------------------------------------------------------------
 tvs:
   livingroom_frame:

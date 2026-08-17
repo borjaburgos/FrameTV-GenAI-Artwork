@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import time
+from threading import Event
 
-from frameart.jobs import JobStatus, JobStore
+import pytest
+
+from frameart.jobs import JobQueueFullError, JobStatus, JobStore
 
 
 class TestJobStore:
@@ -100,3 +103,13 @@ class TestJobStore:
         # At most max_completed (2) finished jobs should remain
         remaining = [j for j in store.list_jobs() if j.status == JobStatus.completed]
         assert len(remaining) <= 2
+
+    def test_rejects_work_when_active_queue_is_full(self):
+        store = JobStore(max_workers=1, max_active=1)
+        release = Event()
+        store.submit("blocked", lambda: release.wait(2))
+
+        with pytest.raises(JobQueueFullError, match="queue is full"):
+            store.submit("overflow", lambda: 2)
+
+        release.set()

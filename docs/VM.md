@@ -141,7 +141,9 @@ frameart generate-and-apply \
 ```bash
 source ~/.venv/frameart/bin/activate
 
-# Start the API server (binds to all interfaces)
+# Authentication is required on all non-loopback interfaces. FrameArt creates
+# a persistent admin token in the data directory on first start.
+export FRAMEART_AUTH_ENABLED=true
 frameart serve --host 0.0.0.0 --port 8000
 ```
 
@@ -149,7 +151,9 @@ Then from any machine on the network:
 
 ```bash
 curl http://192.168.1.50:8000/health
+FRAMEART_TOKEN="$(cat /data/frameart/secrets/admin-api.token)"
 curl -X POST http://192.168.1.50:8000/generate-and-apply \
+  -H "Authorization: Bearer $FRAMEART_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"prompt": "a sunset over the ocean"}'
 ```
@@ -169,6 +173,7 @@ Type=simple
 User=frameart
 WorkingDirectory=/home/frameart/FrameTV-GenAI-Artwork
 Environment=FRAMEART_DATA_DIR=/data/frameart
+Environment=FRAMEART_AUTH_ENABLED=true
 Environment=OPENAI_API_KEY=sk-...
 ExecStart=/home/frameart/.venv/frameart/bin/frameart serve --host 0.0.0.0 --port 8000
 Restart=on-failure

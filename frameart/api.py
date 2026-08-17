@@ -8,7 +8,6 @@ Start with::
 Endpoints (sync):
     POST /generate              — generate image only (no TV upload)
     POST /generate-and-apply    — generate, upload to TV, switch display
-    POST /apply                 — upload an existing image to the TV
     POST /upload-and-apply      — upload image bytes from web/mobile and apply to TV
     POST /edit-and-apply        — upload + edit image with prompt, then apply to TV
     POST /jobs/{job_id}/edit-and-apply — edit from existing server artwork
@@ -17,7 +16,6 @@ Endpoints (sync):
 Endpoints (async — return immediately, poll for results):
     POST /async/generate            — returns {job_id, status}
     POST /async/generate-and-apply  — same, with TV upload
-    POST /async/apply               — same, upload-only
     GET  /jobs/{job_id}/status      — poll job progress and result
 
 TV and gallery:
@@ -43,31 +41,180 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import secrets
 import shutil
+import threading
+import time
 import uuid
+from collections import defaultdict, deque
+from collections.abc import Callable
+from io import BytesIO
+from ipaddress import ip_address
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 import httpx
-from fastapi import FastAPI, File, Form, HTTPException, Query, Response, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from PIL import Image, UnidentifiedImageError
+from pydantic import AfterValidator, BaseModel, Field, SecretStr
 
 import frameart.public_domain as public_domain
 from frameart import __version__
-from frameart.config import STYLE_PRESETS, load_settings
+from frameart.config import STYLE_PRESETS, TVProfile, load_settings
+from frameart.jobs import JobQueueFullError
 
 logger = logging.getLogger(__name__)
 
 _ALLOWED_UPLOAD_EXTS = {".jpg", ".jpeg", ".png"}
 _ALLOWED_UPLOAD_MIME = {"image/jpeg", "image/jpg", "image/png"}
 _MAX_UPLOAD_BYTES = 30 * 1024 * 1024
+_MAX_UPLOAD_PIXELS = 50_000_000
+_JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_IDENTIFIER_RE = r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+_PUBLIC_PATHS = {
+    "/",
+    "/health",
+    "/auth/session",
+    "/docs",
+    "/docs/oauth2-redirect",
+    "/openapi.json",
+    "/redoc",
+}
+_ADMIN_PATHS = {"/jobs/delete", "/tv/art/delete", "/tv/art/matte"}
+_rate_limit_events: dict[str, deque[float]] = defaultdict(deque)
+_rate_limit_lock = threading.Lock()
+
+
+def _strip_nonempty(value: str) -> str:
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError("must not be empty")
+    return stripped
+
+
+def _private_tv_ip(value: str) -> str:
+    return TVProfile(ip=value).ip
+
+
+Prompt = Annotated[
+    str,
+    Field(min_length=1, max_length=4000),
+    AfterValidator(_strip_nonempty),
+]
+PrivateTVIPv4 = Annotated[str, AfterValidator(_private_tv_ip)]
+ContentId = Annotated[str, Field(pattern=_IDENTIFIER_RE)]
+JobId = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")]
 
 app = FastAPI(
     title="FrameArt",
     version=__version__,
     description="Generate AI artwork and display it on Samsung Frame TVs.",
 )
+
+
+def _secret_value(value: SecretStr | str | None) -> str | None:
+    if isinstance(value, SecretStr):
+        return value.get_secret_value()
+    return value
+
+
+def _presented_token(request: Request) -> tuple[str | None, bool]:
+    """Return a presented API token and whether it came from a cookie."""
+    authorization = request.headers.get("authorization", "")
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip(), False
+    header_token = request.headers.get("x-frameart-token")
+    if header_token:
+        return header_token.strip(), False
+    cookie_token = request.cookies.get("frameart_session")
+    return (cookie_token, True) if cookie_token else (None, False)
+
+
+def _token_scopes(settings, token: str | None) -> set[str]:
+    if not token:
+        return set()
+    admin_token = _secret_value(settings.admin_token)
+    automation_token = _secret_value(settings.automation_token)
+    if admin_token and secrets.compare_digest(token, admin_token):
+        return {"read", "control", "admin"}
+    if automation_token and secrets.compare_digest(token, automation_token):
+        return {"read", "control"}
+    return set()
+
+
+def _required_scope(request: Request) -> str:
+    if request.method in {"GET", "HEAD", "OPTIONS"}:
+        return "read"
+    if request.url.path in _ADMIN_PATHS:
+        return "admin"
+    return "control"
+
+
+def _within_rate_limit(key: str, limit: int) -> bool:
+    """Apply a small in-process sliding-window limit to mutating requests."""
+    now = time.monotonic()
+    cutoff = now - 60.0
+    with _rate_limit_lock:
+        events = _rate_limit_events[key]
+        while events and events[0] < cutoff:
+            events.popleft()
+        if len(events) >= limit:
+            return False
+        events.append(now)
+        return True
+
+
+@app.middleware("http")
+async def authenticate_request(
+    request: Request,
+    call_next: Callable,
+):
+    """Enforce scoped tokens when API authentication is enabled."""
+    if request.url.path in _PUBLIC_PATHS:
+        return await call_next(request)
+
+    settings = load_settings()
+    if not settings.auth_enabled:
+        return await call_next(request)
+
+    token, from_cookie = _presented_token(request)
+    scopes = _token_scopes(settings, token)
+    required = _required_scope(request)
+    if required not in scopes:
+        status_code = 401 if not scopes else 403
+        return JSONResponse(
+            status_code=status_code,
+            content={"detail": f"A token with the {required!r} scope is required."},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if from_cookie and request.method not in {"GET", "HEAD", "OPTIONS"}:
+        origin = request.headers.get("origin")
+        if origin and origin.rstrip("/").split("://")[-1] != request.headers.get("host"):
+            return JSONResponse(status_code=403, content={"detail": "Origin check failed."})
+
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        client_id = f"{next(iter(sorted(scopes)))}:{request.client.host if request.client else '-'}"
+        if not _within_rate_limit(client_id, settings.api_rate_limit_per_minute):
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "API rate limit exceeded; retry in one minute."},
+                headers={"Retry-After": "60"},
+            )
+
+    request.state.frameart_scopes = scopes
+    return await call_next(request)
+
+
+@app.exception_handler(JobQueueFullError)
+async def job_queue_full_handler(_request: Request, exc: JobQueueFullError):
+    return JSONResponse(
+        status_code=429,
+        content={"detail": str(exc)},
+        headers={"Retry-After": "10"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -78,39 +225,31 @@ app = FastAPI(
 class GenerateRequest(BaseModel):
     """Request body for image generation."""
 
-    prompt: str = Field(..., description="Text description of the image to generate.")
-    style: str | None = Field(None, description="Style preset name or custom style text.")
-    provider: str | None = Field(None, description="Image provider (openai, ollama, etc.).")
-    model: str | None = Field(None, description="Provider-specific model ID.")
-    upscaler: str | None = Field(None, description="Upscaler to use.")
-    negative_prompt: str | None = Field(None, description="Negative prompt (if supported).")
+    prompt: Prompt = Field(..., description="Text description of the image to generate.")
+    style: str | None = Field(
+        None, max_length=500, description="Style preset name or custom style text."
+    )
+    provider: str | None = Field(None, max_length=100, description="Image provider name.")
+    model: str | None = Field(None, max_length=200, description="Provider-specific model ID.")
+    upscaler: str | None = Field(None, max_length=100, description="Upscaler to use.")
+    negative_prompt: str | None = Field(
+        None, max_length=4000, description="Negative prompt (if supported)."
+    )
     seed: int | None = Field(None, description="Deterministic seed (if supported).")
-    steps: int | None = Field(None, description="Diffusion steps (if supported).")
-    guidance: float | None = Field(None, description="Guidance scale (if supported).")
+    steps: int | None = Field(None, ge=1, le=500, description="Diffusion steps.")
+    guidance: float | None = Field(None, ge=0, le=100, description="Guidance scale.")
 
 
 class GenerateAndApplyRequest(GenerateRequest):
     """Request body for generate + upload + switch."""
 
-    tv: str | None = Field(None, description="TV profile name from config.")
-    tv_ip: str | None = Field(None, description="TV IP address (overrides profile).")
+    tv: str | None = Field(None, max_length=100, description="TV profile name from config.")
+    tv_ip: PrivateTVIPv4 | None = Field(None, description="Private TV IP address.")
     matte: str = Field(
-        "none",
+        "none", max_length=100,
         description="Matte style (e.g., none, shadowbox_polar, shadowbox_noir).",
     )
     no_switch: bool = Field(False, description="Upload but don't switch displayed art.")
-
-
-class ApplyRequest(BaseModel):
-    """Request body for uploading an existing image to the TV."""
-
-    image_path: str = Field(..., description="Path to the image file to upload.")
-    tv: str | None = Field(None, description="TV profile name from config.")
-    tv_ip: str | None = Field(None, description="TV IP address.")
-    matte: str = Field(
-        "none",
-        description="Matte style (run 'tv matte-list' to see options).",
-    )
 
 
 class JobResponse(BaseModel):
@@ -173,9 +312,11 @@ class TVArtItem(BaseModel):
 class DeleteArtRequest(BaseModel):
     """Request body for deleting artworks from the TV."""
 
-    content_ids: list[str] = Field(..., description="Content IDs to delete.")
-    tv: str | None = Field(None, description="TV profile name from config.")
-    tv_ip: str | None = Field(None, description="TV IP address.")
+    content_ids: list[ContentId] = Field(
+        ..., min_length=1, max_length=100, description="Content IDs to delete."
+    )
+    tv: str | None = Field(None, max_length=100, description="TV profile name from config.")
+    tv_ip: PrivateTVIPv4 | None = Field(None, description="Private TV IP address.")
     include_favorites: bool = Field(
         False, description="Also delete favourited artworks (skipped by default)."
     )
@@ -192,18 +333,21 @@ class DeleteArtResponse(BaseModel):
 class ChangeMatteRequest(BaseModel):
     """Request body for changing the matte on a TV artwork."""
 
-    content_id: str = Field(..., description="Content ID of the artwork.")
-    matte_id: str = Field(..., description="Matte ID to apply (see GET /tv/mattes).")
-    tv: str | None = Field(None, description="TV profile name from config.")
-    tv_ip: str | None = Field(None, description="TV IP address.")
+    content_id: ContentId = Field(..., description="Content ID of the artwork.")
+    matte_id: str = Field(
+        ..., min_length=1, max_length=100, pattern=_IDENTIFIER_RE,
+        description="Matte ID to apply (see GET /tv/mattes).",
+    )
+    tv: str | None = Field(None, max_length=100, description="TV profile name from config.")
+    tv_ip: PrivateTVIPv4 | None = Field(None, description="Private TV IP address.")
 
 
 class DisplayArtRequest(BaseModel):
     """Request body for displaying an existing TV artwork by content ID."""
 
-    content_id: str = Field(..., description="Content ID of the artwork to display.")
-    tv: str | None = Field(None, description="TV profile name from config.")
-    tv_ip: str | None = Field(None, description="TV IP address.")
+    content_id: ContentId = Field(..., description="Content ID of the artwork to display.")
+    tv: str | None = Field(None, max_length=100, description="TV profile name from config.")
+    tv_ip: PrivateTVIPv4 | None = Field(None, description="Private TV IP address.")
 
 
 class ConfiguredTVResponse(BaseModel):
@@ -219,6 +363,12 @@ class HealthResponse(BaseModel):
 
     status: str = "ok"
     version: str = __version__
+
+
+class AuthSessionRequest(BaseModel):
+    """Token exchange used by the browser UI."""
+
+    token: SecretStr = Field(..., min_length=20, max_length=4096)
 
 
 class ProviderOption(BaseModel):
@@ -249,7 +399,9 @@ class JobSummary(BaseModel):
 class DeleteJobsRequest(BaseModel):
     """Request body for deleting locally stored generated jobs."""
 
-    job_ids: list[str] = Field(..., description="Job IDs to delete from host artifacts.")
+    job_ids: list[JobId] = Field(
+        ..., min_length=1, max_length=100, description="Job IDs to delete from host artifacts."
+    )
 
 
 class DeleteJobsResponse(BaseModel):
@@ -273,17 +425,20 @@ class PublicDomainArtwork(BaseModel):
     license: str | None = None
     attribution: str | None = None
     source_url: str | None = None
-    is_public_domain: bool = True
+    is_public_domain: bool = False
 
 
 class PublicDomainApplyRequest(BaseModel):
     """Request body for downloading and displaying public-domain artwork."""
 
-    source: str = Field(..., description="Public domain source: met, aic, cma, or europeana.")
-    artwork_id: str = Field(..., description="Provider-specific artwork ID.")
-    tv: str | None = Field(None, description="TV profile name from config.")
-    tv_ip: str | None = Field(None, description="TV IP address.")
-    matte: str = Field("none", description="Matte style for upload.")
+    source: str = Field(
+        ..., min_length=1, max_length=20,
+        description="Public domain source: met, aic, cma, or europeana.",
+    )
+    artwork_id: str = Field(..., min_length=1, max_length=300)
+    tv: str | None = Field(None, max_length=100, description="TV profile name from config.")
+    tv_ip: PrivateTVIPv4 | None = Field(None, description="Private TV IP address.")
+    matte: str = Field("none", max_length=100, description="Matte style for upload.")
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +446,7 @@ class PublicDomainApplyRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _settings():
-    """Load settings (cached after first call via lru_cache in config)."""
+    """Load settings for the current request."""
     return load_settings()
 
 
@@ -308,6 +463,89 @@ def _pipeline_result_to_response(result) -> JobResponse:
         timings=result.timings,
         error=result.error,
     )
+
+
+def _read_validated_upload(image: UploadFile) -> tuple[str, str, bytes]:
+    """Validate upload metadata and decoded image content before writing it."""
+    filename = image.filename or "upload"
+    supplied_suffix = Path(filename).suffix.lower()
+    mime_type = (image.content_type or "").lower()
+
+    if supplied_suffix and supplied_suffix not in _ALLOWED_UPLOAD_EXTS:
+        raise HTTPException(status_code=400, detail="Unsupported file type. Use JPG or PNG.")
+    if mime_type and mime_type not in _ALLOWED_UPLOAD_MIME:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported content type. Use image/jpeg or image/png.",
+        )
+
+    payload = image.file.read(_MAX_UPLOAD_BYTES + 1)
+    if not payload:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    if len(payload) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Uploaded file is too large (max 30MB).")
+
+    try:
+        with Image.open(BytesIO(payload)) as decoded:
+            image_format = (decoded.format or "").upper()
+            if decoded.width * decoded.height > _MAX_UPLOAD_PIXELS:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Uploaded image is too large (max 50 megapixels).",
+                )
+            decoded.verify()
+    except HTTPException:
+        raise
+    except (UnidentifiedImageError, OSError) as exc:
+        raise HTTPException(status_code=400, detail="Uploaded file is not a valid image.") from exc
+
+    if image_format not in {"JPEG", "PNG"}:
+        raise HTTPException(status_code=400, detail="Unsupported image format. Use JPG or PNG.")
+
+    actual_suffix = ".jpg" if image_format == "JPEG" else ".png"
+    if supplied_suffix and (
+        (supplied_suffix in {".jpg", ".jpeg"} and actual_suffix != ".jpg")
+        or (supplied_suffix == ".png" and actual_suffix != ".png")
+    ):
+        raise HTTPException(status_code=400, detail="File extension does not match image data.")
+    if mime_type and (
+        (mime_type in {"image/jpeg", "image/jpg"} and actual_suffix != ".jpg")
+        or (mime_type == "image/png" and actual_suffix != ".png")
+    ):
+        raise HTTPException(status_code=400, detail="Content type does not match image data.")
+
+    return filename, actual_suffix, payload
+
+
+def _validate_form_value(
+    value: str | None,
+    name: str,
+    max_length: int,
+    *,
+    required: bool = False,
+) -> str | None:
+    if value is None:
+        if required:
+            raise HTTPException(status_code=400, detail=f"{name} is required.")
+        return None
+    stripped = value.strip()
+    if required and not stripped:
+        raise HTTPException(status_code=400, detail=f"{name} cannot be empty.")
+    if len(stripped) > max_length:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{name} is too long (max {max_length} characters).",
+        )
+    return stripped or None
+
+
+def _validate_form_tv_ip(tv_ip: str | None) -> str | None:
+    if not tv_ip:
+        return None
+    try:
+        return _private_tv_ip(tv_ip)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _is_openai_image_model(model_id: str) -> bool:
@@ -439,6 +677,48 @@ def _fetch_google_image_models(google_cfg) -> list[str]:
 def health():
     """Liveness check."""
     return HealthResponse()
+
+
+@app.post("/auth/session")
+def create_auth_session(req: AuthSessionRequest, response: Response):
+    """Exchange an API token for an HttpOnly browser session cookie."""
+    settings = _settings()
+    if not settings.auth_enabled:
+        return {"authenticated": True, "auth_enabled": False, "scopes": ["admin"]}
+
+    token = req.token.get_secret_value()
+    scopes = _token_scopes(settings, token)
+    if not scopes:
+        raise HTTPException(status_code=401, detail="Invalid API token.")
+
+    response.set_cookie(
+        key="frameart_session",
+        value=token,
+        max_age=7 * 24 * 60 * 60,
+        httponly=True,
+        samesite="strict",
+        path="/",
+    )
+    return {"authenticated": True, "auth_enabled": True, "scopes": sorted(scopes)}
+
+
+@app.get("/auth/status")
+def auth_status(request: Request):
+    """Return the authenticated token's effective scopes."""
+    settings = _settings()
+    scopes = getattr(request.state, "frameart_scopes", {"read", "control", "admin"})
+    return {
+        "authenticated": True,
+        "auth_enabled": settings.auth_enabled,
+        "scopes": sorted(scopes),
+    }
+
+
+@app.post("/auth/logout")
+def logout(response: Response):
+    """Clear the browser session cookie."""
+    response.delete_cookie("frameart_session", path="/")
+    return {"authenticated": False}
 
 
 @app.get("/styles", response_model=dict[str, str])
@@ -589,25 +869,6 @@ def generate_and_apply(req: GenerateAndApplyRequest):
     return resp
 
 
-@app.post("/apply", response_model=JobResponse)
-def apply_image(req: ApplyRequest):
-    """Upload an existing image to the Frame TV and switch to it."""
-    from frameart.pipeline import run_apply
-
-    settings = _settings()
-    result = run_apply(
-        settings,
-        req.image_path,
-        tv_name=req.tv,
-        tv_ip=req.tv_ip,
-        matte=req.matte,
-    )
-    resp = _pipeline_result_to_response(result)
-    if result.error:
-        raise HTTPException(status_code=500, detail=resp.model_dump())
-    return resp
-
-
 @app.post("/upload-and-apply", response_model=JobResponse)
 def upload_and_apply(
     image: UploadFile = File(..., description="Uploaded image file (jpg/png)."),  # noqa: B008
@@ -620,26 +881,11 @@ def upload_and_apply(
     """Upload user image bytes and run import+postprocess+apply pipeline."""
     from frameart.pipeline import run_import_and_apply
 
-    filename = image.filename or "upload"
-    suffix = Path(filename).suffix.lower()
-    mime_type = (image.content_type or "").lower()
-
-    if suffix and suffix not in _ALLOWED_UPLOAD_EXTS:
-        raise HTTPException(status_code=400, detail="Unsupported file type. Use JPG or PNG.")
-    if mime_type and mime_type not in _ALLOWED_UPLOAD_MIME:
-        raise HTTPException(
-            status_code=400,
-            detail="Unsupported content type. Use image/jpeg or image/png.",
-        )
-
-    payload = image.file.read(_MAX_UPLOAD_BYTES + 1)
-    if not payload:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-    if len(payload) > _MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="Uploaded file is too large (max 30MB).")
-
-    if not suffix:
-        suffix = ".png" if mime_type == "image/png" else ".jpg"
+    filename, suffix, payload = _read_validated_upload(image)
+    tv = _validate_form_value(tv, "TV profile", 100)
+    tv_ip = _validate_form_tv_ip(tv_ip)
+    matte = _validate_form_value(matte, "Matte", 100, required=True) or "none"
+    upscaler = _validate_form_value(upscaler, "Upscaler", 100)
 
     settings = _settings()
     upload_dir = settings.data_dir / "uploads"
@@ -690,30 +936,16 @@ def edit_and_apply(
     """Upload + edit an image with prompt, then post-process and apply to TV."""
     from frameart.pipeline import run_edit_and_apply
 
-    edit_prompt = prompt.strip()
-    if not edit_prompt:
+    edit_prompt = _validate_form_value(prompt, "Edit prompt", 4000, required=True)
+    if edit_prompt is None:  # pragma: no cover - required=True guarantees this
         raise HTTPException(status_code=400, detail="Edit prompt cannot be empty.")
-
-    filename = image.filename or "upload"
-    suffix = Path(filename).suffix.lower()
-    mime_type = (image.content_type or "").lower()
-
-    if suffix and suffix not in _ALLOWED_UPLOAD_EXTS:
-        raise HTTPException(status_code=400, detail="Unsupported file type. Use JPG or PNG.")
-    if mime_type and mime_type not in _ALLOWED_UPLOAD_MIME:
-        raise HTTPException(
-            status_code=400,
-            detail="Unsupported content type. Use image/jpeg or image/png.",
-        )
-
-    payload = image.file.read(_MAX_UPLOAD_BYTES + 1)
-    if not payload:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-    if len(payload) > _MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="Uploaded file is too large (max 30MB).")
-
-    if not suffix:
-        suffix = ".png" if mime_type == "image/png" else ".jpg"
+    filename, suffix, payload = _read_validated_upload(image)
+    provider = _validate_form_value(provider, "Provider", 100)
+    model = _validate_form_value(model, "Model", 200)
+    upscaler = _validate_form_value(upscaler, "Upscaler", 100)
+    tv = _validate_form_value(tv, "TV profile", 100)
+    tv_ip = _validate_form_tv_ip(tv_ip)
+    matte = _validate_form_value(matte, "Matte", 100, required=True) or "none"
 
     settings = _settings()
     upload_dir = settings.data_dir / "uploads"
@@ -753,24 +985,9 @@ def tv_status(
     tv_ip: str | None = Query(None, description="TV IP address."),
 ):
     """Check the status of a Frame TV."""
-    from frameart.config import TVProfile
     from frameart.tv.controller import get_status
 
-    settings = _settings()
-    profile = None
-    if tv and tv in settings.tvs:
-        profile = settings.tvs[tv]
-    elif tv_ip:
-        profile = TVProfile(ip=tv_ip)
-    elif len(settings.tvs) == 1:
-        profile = next(iter(settings.tvs.values()))
-
-    if profile is None:
-        raise HTTPException(
-            status_code=400,
-            detail="No TV specified. Pass ?tv=<name> or ?tv_ip=<ip>, "
-            "or configure exactly one TV in config.yaml.",
-        )
+    profile = _resolve_tv_profile(tv, tv_ip)
 
     status = get_status(profile)
     return TVStatusResponse(
@@ -804,14 +1021,17 @@ def tv_discover(
 
 def _resolve_tv_profile(tv: str | None, tv_ip: str | None):
     """Resolve a TVProfile from query params / request body, or raise 400."""
-    from frameart.config import TVProfile
-
     settings = _settings()
     profile = None
-    if tv and tv in settings.tvs:
-        profile = settings.tvs[tv]
+    if tv:
+        profile = settings.tvs.get(tv)
+        if profile is None:
+            raise HTTPException(status_code=404, detail=f"Unknown TV profile {tv!r}.")
     elif tv_ip:
-        profile = TVProfile(ip=tv_ip)
+        try:
+            profile = TVProfile(ip=tv_ip)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     elif len(settings.tvs) == 1:
         profile = next(iter(settings.tvs.values()))
 
@@ -851,9 +1071,12 @@ def tv_list_art(
 
 @app.get("/tv/art/thumbnail")
 def tv_art_thumbnail(
-    content_id: str = Query(..., description="Artwork content ID."),
-    tv: str | None = Query(None, description="TV profile name from config."),
-    tv_ip: str | None = Query(None, description="TV IP address."),
+    content_id: str = Query(
+        ..., min_length=1, max_length=128, pattern=_IDENTIFIER_RE,
+        description="Artwork content ID.",
+    ),
+    tv: str | None = Query(None, max_length=100, description="TV profile name."),
+    tv_ip: str | None = Query(None, max_length=45, description="Private TV IP address."),
 ):
     """Fetch thumbnail bytes for an artwork on the Frame TV."""
     from frameart.tv.controller import get_art_thumbnail
@@ -883,8 +1106,14 @@ def tv_delete_art(req: DeleteArtRequest):
         try:
             artworks = list_art_deduplicated(profile)
             fav_ids = {a["content_id"] for a in artworks if a.get("is_favourite")}
-        except Exception:
-            fav_ids = set()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Could not verify favourites; deletion was cancelled. "
+                    "Retry or set include_favorites=true explicitly."
+                ),
+            ) from exc
 
         skipped = [cid for cid in ids if cid in fav_ids]
         ids = [cid for cid in ids if cid not in fav_ids]
@@ -957,8 +1186,11 @@ def tv_configured():
 
 @app.get("/catalog/search", response_model=list[PublicDomainArtwork])
 def catalog_search(
-    source: str = Query(..., description="Catalog source: met, aic, cma, or europeana."),
-    q: str = Query(..., min_length=1, description="Search query."),
+    source: str = Query(
+        ..., min_length=1, max_length=20,
+        description="Catalog source: met, aic, cma, or europeana.",
+    ),
+    q: str = Query(..., min_length=1, max_length=500, description="Search query."),
     limit: int = Query(20, ge=1, le=50, description="Max results."),
 ):
     """Search public-domain artwork from supported providers."""
@@ -975,7 +1207,11 @@ def catalog_search(
     dropped = 0
     for item in items:
         try:
-            validated.append(PublicDomainArtwork(**item))
+            artwork = PublicDomainArtwork(**item)
+            if not artwork.is_public_domain:
+                dropped += 1
+                continue
+            validated.append(artwork)
         except Exception as e:
             dropped += 1
             logger.warning(
@@ -1031,6 +1267,24 @@ def catalog_apply(req: PublicDomainApplyRequest):
 # ---------------------------------------------------------------------------
 
 
+def _validated_job_id(job_id: str) -> str:
+    if not _JOB_ID_RE.fullmatch(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID.")
+    return job_id
+
+
+def _find_job_dirs(artifacts_dir: Path, job_id: str) -> list[Path]:
+    """Resolve a job ID without interpolating it into a glob expression."""
+    safe_job_id = _validated_job_id(job_id)
+    if not artifacts_dir.exists():
+        return []
+    return [
+        candidate
+        for candidate in artifacts_dir.glob("*/*/*/*")
+        if candidate.is_dir() and candidate.name == safe_job_id
+    ]
+
+
 @app.get("/jobs", response_model=list[JobSummary])
 def list_jobs(limit: int = Query(20, ge=1, le=200, description="Max jobs to return.")):
     """List recent generated jobs."""
@@ -1079,12 +1333,15 @@ def delete_jobs(req: DeleteJobsRequest):
     failed: dict[str, str] = {}
 
     for job_id in req.job_ids:
-        meta_matches = list(artifacts_dir.rglob(f"{job_id}/meta.json"))
-        if not meta_matches:
+        job_dirs = [
+            job_dir
+            for job_dir in _find_job_dirs(artifacts_dir, job_id)
+            if (job_dir / "meta.json").is_file()
+        ]
+        if not job_dirs:
             not_found.append(job_id)
             continue
 
-        job_dirs = {m.parent for m in meta_matches}
         try:
             for job_dir in job_dirs:
                 shutil.rmtree(job_dir)
@@ -1101,14 +1358,13 @@ def get_job_image(job_id: str):
     settings = _settings()
     artifacts_dir = settings.data_dir / "artifacts"
 
-    # Search date-structured dirs for the job.
-    final_matches = list(artifacts_dir.rglob(f"{job_id}/final.png"))
-    if final_matches:
-        return FileResponse(final_matches[0], media_type="image/png")
-
-    source_matches = list(artifacts_dir.rglob(f"{job_id}/source.png"))
-    if source_matches:
-        return FileResponse(source_matches[0], media_type="image/png")
+    for job_dir in _find_job_dirs(artifacts_dir, job_id):
+        final_path = job_dir / "final.png"
+        if final_path.is_file():
+            return FileResponse(final_path, media_type="image/png")
+        source_path = job_dir / "source.png"
+        if source_path.is_file():
+            return FileResponse(source_path, media_type="image/png")
 
     raise HTTPException(status_code=404, detail=f"No image found for job {job_id}")
 
@@ -1116,10 +1372,10 @@ def get_job_image(job_id: str):
 class JobApplyRequest(BaseModel):
     """Request body for uploading a previously generated job's image to a TV."""
 
-    tv: str | None = Field(None, description="TV profile name from config.")
-    tv_ip: str | None = Field(None, description="TV IP address.")
+    tv: str | None = Field(None, max_length=100, description="TV profile name from config.")
+    tv_ip: PrivateTVIPv4 | None = Field(None, description="Private TV IP address.")
     matte: str = Field(
-        "none",
+        "none", max_length=100,
         description="Matte style (e.g., none, shadowbox_polar, shadowbox_noir).",
     )
 
@@ -1127,13 +1383,13 @@ class JobApplyRequest(BaseModel):
 class EditFromExistingRequest(BaseModel):
     """Request body for creating a new image from existing artwork."""
 
-    prompt: str = Field(..., description="Edit/generation instruction prompt.")
-    provider: str | None = Field(None, description="Provider name (e.g., openai).")
-    model: str | None = Field(None, description="Provider model ID.")
-    upscaler: str | None = Field(None, description="Upscaler to use.")
-    tv: str | None = Field(None, description="Target TV profile name from config.")
-    tv_ip: str | None = Field(None, description="Target TV IP address.")
-    matte: str = Field("none", description="Matte style.")
+    prompt: Prompt = Field(..., description="Edit/generation instruction prompt.")
+    provider: str | None = Field(None, max_length=100, description="Provider name.")
+    model: str | None = Field(None, max_length=200, description="Provider model ID.")
+    upscaler: str | None = Field(None, max_length=100, description="Upscaler to use.")
+    tv: str | None = Field(None, max_length=100, description="Target TV profile name.")
+    tv_ip: PrivateTVIPv4 | None = Field(None, description="Private target TV IP address.")
+    matte: str = Field("none", max_length=100, description="Matte style.")
     no_upload: bool = Field(False, description="Edit/process only; skip TV upload.")
     no_switch: bool = Field(False, description="Upload but do not switch displayed art.")
 
@@ -1141,21 +1397,23 @@ class EditFromExistingRequest(BaseModel):
 class TVArtEditRequest(EditFromExistingRequest):
     """Request body for creating a new image from art already stored on a TV."""
 
-    content_id: str = Field(..., description="Source TV artwork content ID.")
-    source_tv: str | None = Field(None, description="Source TV profile name from config.")
-    source_tv_ip: str | None = Field(None, description="Source TV IP address.")
+    content_id: ContentId = Field(..., description="Source TV artwork content ID.")
+    source_tv: str | None = Field(
+        None, max_length=100, description="Source TV profile name from config."
+    )
+    source_tv_ip: PrivateTVIPv4 | None = Field(None, description="Private source TV IP.")
 
 
 def _find_job_image_path(settings, job_id: str) -> Path:
     """Find a generated job image path (prefer final, then source) or raise 404."""
     artifacts_dir = settings.data_dir / "artifacts"
-    final_matches = list(artifacts_dir.rglob(f"{job_id}/final.png"))
-    if final_matches:
-        return final_matches[0]
-
-    source_matches = list(artifacts_dir.rglob(f"{job_id}/source.png"))
-    if source_matches:
-        return source_matches[0]
+    for job_dir in _find_job_dirs(artifacts_dir, job_id):
+        final_path = job_dir / "final.png"
+        if final_path.is_file():
+            return final_path
+        source_path = job_dir / "source.png"
+        if source_path.is_file():
+            return source_path
 
     raise HTTPException(status_code=404, detail=f"No image found for job {job_id}")
 
@@ -1441,6 +1699,7 @@ def get_job_status(job_id: str):
     """Get the detailed status of an async job."""
     from frameart.jobs import job_store
 
+    _validated_job_id(job_id)
     job = job_store.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found in async queue")
@@ -1561,31 +1820,6 @@ def async_generate_and_apply(req: GenerateAndApplyRequest):
     return AsyncJobResponse(job_id=job_id, status="pending")
 
 
-@app.post("/async/apply", response_model=AsyncJobResponse)
-def async_apply(req: ApplyRequest):
-    """Submit an apply (upload) job to the background queue."""
-    from frameart.artifacts import generate_job_id
-    from frameart.jobs import job_store
-    from frameart.pipeline import run_apply
-
-    settings = _settings()
-    job_id = generate_job_id()
-
-    job_store.submit(
-        job_id=job_id,
-        func=run_apply,
-        args=(settings, req.image_path),
-        kwargs={
-            "tv_name": req.tv,
-            "tv_ip": req.tv_ip,
-            "matte": req.matte,
-        },
-        request_summary={"type": "apply", "image_path": req.image_path},
-    )
-
-    return AsyncJobResponse(job_id=job_id, status="pending")
-
-
 # ---------------------------------------------------------------------------
 # Web UI
 # ---------------------------------------------------------------------------
@@ -1607,8 +1841,59 @@ def web_ui():
 # ---------------------------------------------------------------------------
 
 
+def _is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _ensure_admin_token(settings) -> tuple[Path | None, bool]:
+    """Load or create the persistent bootstrap token for authenticated serving."""
+    configured = _secret_value(settings.admin_token)
+    if configured:
+        return None, False
+
+    secrets_dir = settings.data_dir / "secrets"
+    secrets_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    token_path = secrets_dir / "admin-api.token"
+    created = False
+    if token_path.exists():
+        token = token_path.read_text().strip()
+        if len(token) < 20:
+            raise RuntimeError(f"Admin token file is invalid: {token_path}")
+    else:
+        token = secrets.token_urlsafe(32)
+        token_path.write_text(token)
+        token_path.chmod(0o600)
+        created = True
+
+    # Environment values outrank YAML and are visible to the single uvicorn worker.
+    os.environ["FRAMEART_ADMIN_TOKEN"] = token
+    return token_path, created
+
+
 def run_server(host: str = "127.0.0.1", port: int = 8000) -> None:
     """Start the uvicorn server."""
     import uvicorn
 
-    uvicorn.run("frameart.api:app", host=host, port=port, workers=2)
+    settings = load_settings()
+    if not _is_loopback_host(host) and not settings.auth_enabled:
+        raise RuntimeError(
+            "Refusing a non-loopback bind without API authentication. Set "
+            "FRAMEART_AUTH_ENABLED=true or bind to 127.0.0.1."
+        )
+
+    if settings.auth_enabled:
+        token_path, created = _ensure_admin_token(settings)
+        if token_path:
+            state = "Created" if created else "Using"
+            print(f"{state} FrameArt admin token file: {token_path}")
+            if created:
+                print(f"Bootstrap admin token: {token_path.read_text().strip()}")
+
+    # Background jobs and per-TV locks are process-local, so multiple workers
+    # would cause intermittent job 404s and unsafe concurrent device operations.
+    uvicorn.run("frameart.api:app", host=host, port=port, workers=1)
