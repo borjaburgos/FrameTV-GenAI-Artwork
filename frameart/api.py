@@ -64,6 +64,7 @@ import httpx2 as httpx
 import yaml
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from PIL import Image, UnidentifiedImageError
 from pydantic import AfterValidator, BaseModel, Field, SecretStr, field_validator
 
@@ -104,6 +105,7 @@ _PUBLIC_PATHS = {
     "/openapi.json",
     "/redoc",
 }
+_PUBLIC_PREFIXES = ("/static/",)
 _ADMIN_PATHS = {"/jobs/delete", "/tv/art/delete", "/tv/art/matte"}
 _ADMIN_PREFIXES = ("/settings",)
 _rate_limit_events: dict[str, deque[float]] = defaultdict(deque)
@@ -197,7 +199,7 @@ async def authenticate_request(
     call_next: Callable,
 ):
     """Enforce scoped tokens when API authentication is enabled."""
-    if request.url.path in _PUBLIC_PATHS:
+    if request.url.path in _PUBLIC_PATHS or request.url.path.startswith(_PUBLIC_PREFIXES):
         return await call_next(request)
 
     settings = load_settings()
@@ -2717,6 +2719,7 @@ def async_generate_and_apply(req: GenerateAndApplyRequest):
 # ---------------------------------------------------------------------------
 
 _STATIC_DIR = Path(__file__).parent / "static"
+app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
 
 @app.get("/", response_class=HTMLResponse)

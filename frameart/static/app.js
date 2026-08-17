@@ -1,0 +1,2779 @@
+(function() {
+  // =========================================================================
+  // State: known TVs (merged from configured + discovered)
+  // =========================================================================
+  // Each entry: { ip, name, source ('config'|'discovered'), model?, frame_tv? }
+  let knownTVs = [];
+  let selectedTVArtIds = new Set();
+  let loadedTVArtById = {};
+  let selectedGalleryJobIds = new Set();
+  let configuredProviders = [];
+  let managedProviderSettings = null;
+  let managedTVSettings = [];
+  let managedSettingsBackups = [];
+  let editingProviderName = null;
+  let editingTVProfileId = null;
+  const generationJobs = new Map();
+  let generationPollTimer = null;
+  let authPromptPromise = null;
+  const storageKeys = {
+    page: 'frameart.page',
+    createMode: 'frameart.create.mode',
+    tvGenerate: 'frameart.tv.generate',
+    tvPublic: 'frameart.tv.public',
+    tvOwnUpload: 'frameart.tv.own_upload',
+    tvEditUpload: 'frameart.tv.edit_upload',
+    tvRemix: 'frameart.tv.remix',
+    tvUpload: 'frameart.tv.upload',
+    tvArt: 'frameart.tv.art',
+    providerGenerate: 'frameart.provider.generate',
+    modelGenerate: 'frameart.model.generate',
+    providerEdit: 'frameart.provider.edit',
+    modelEdit: 'frameart.model.edit',
+    providerRemix: 'frameart.provider.remix',
+    modelRemix: 'frameart.model.remix',
+    mattePublic: 'frameart.matte.public',
+    matteOwnUpload: 'frameart.matte.own_upload',
+    matteEditUpload: 'frameart.matte.edit_upload',
+    matteRemix: 'frameart.matte.remix',
+    matteUpload: 'frameart.matte.upload',
+  };
+
+  function showToast(message, kind) {
+    const wrap = document.getElementById('toast-wrap');
+    if (!wrap) return;
+    const toast = document.createElement('div');
+    toast.className = 'toast' + (kind ? ' ' + kind : '');
+    toast.textContent = message;
+    wrap.appendChild(toast);
+    setTimeout(() => toast.remove(), 3600);
+  }
+
+  async function establishAuthSession() {
+    const token = window.prompt('Enter your FrameArt admin or automation token:');
+    if (!token) return false;
+    const response = await window.fetch('/auth/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+    });
+    if (!response.ok) {
+      showToast('Authentication failed. Check the token and try again.', 'error');
+      return false;
+    }
+    return true;
+  }
+
+  async function apiFetch(input, init) {
+    let response = await window.fetch(input, init);
+    if (response.status !== 401) return response;
+    if (!authPromptPromise) {
+      authPromptPromise = establishAuthSession().finally(() => {
+        authPromptPromise = null;
+      });
+    }
+    if (await authPromptPromise) response = await window.fetch(input, init);
+    return response;
+  }
+
+  async function parseJSONResponse(response, fallbackMessage) {
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      const detail = payload && typeof payload.detail === 'string' ? payload.detail : null;
+      throw new Error(detail || fallbackMessage || ('Server returned ' + response.status));
+    }
+    return payload;
+  }
+
+  function animateStaggeredChildren(container, selector) {
+    if (!container) return;
+    const nodes = container.querySelectorAll(selector);
+    nodes.forEach((node, index) => {
+      node.classList.add('reveal-stagger');
+      node.style.animationDelay = (index * 22) + 'ms';
+    });
+  }
+
+  function findProviderOption(name) {
+    return configuredProviders.find((p) => p.name === name) || null;
+  }
+
+  function refreshModelSelectFor(providerName, preferredModel, modelSelectId) {
+    const modelSel = document.getElementById(modelSelectId);
+    if (!modelSel) return;
+    const provider = findProviderOption(providerName);
+    const models = provider?.models || [];
+    const defaultLabel = provider?.default_model
+      ? ('Provider default (' + provider.default_model + ')')
+      : 'Provider default';
+
+    modelSel.innerHTML = '';
+    const defaultOpt = document.createElement('option');
+    defaultOpt.value = '';
+    defaultOpt.textContent = defaultLabel;
+    modelSel.appendChild(defaultOpt);
+
+    for (const model of models) {
+      const opt = document.createElement('option');
+      opt.value = model;
+      opt.textContent = model;
+      modelSel.appendChild(opt);
+    }
+
+    if (preferredModel && [...modelSel.options].some((o) => o.value === preferredModel)) {
+      modelSel.value = preferredModel;
+    } else {
+      modelSel.value = '';
+    }
+  }
+
+  function refreshModelSelect(providerName, preferredModel) {
+    refreshModelSelectFor(providerName, preferredModel, 'model');
+  }
+
+  function refreshProviderSelects(payload) {
+    configuredProviders = payload?.providers || [];
+    const providerSel = document.getElementById('provider');
+    const editProviderSel = document.getElementById('edit-provider');
+    const remixProviderSel = document.getElementById('remix-provider');
+    const rememberedProvider = localStorage.getItem(storageKeys.providerGenerate);
+    const rememberedModel = localStorage.getItem(storageKeys.modelGenerate);
+    const rememberedEditProvider = localStorage.getItem(storageKeys.providerEdit);
+    const rememberedEditModel = localStorage.getItem(storageKeys.modelEdit);
+    const rememberedRemixProvider = localStorage.getItem(storageKeys.providerRemix);
+    const rememberedRemixModel = localStorage.getItem(storageKeys.modelRemix);
+    const fallback = payload?.default_provider || configuredProviders[0]?.name || '';
+    const preferredProvider = rememberedProvider || fallback;
+    const preferredEditProvider = rememberedEditProvider || fallback;
+    const preferredRemixProvider = rememberedRemixProvider || preferredEditProvider;
+
+    providerSel.innerHTML = '';
+    if (editProviderSel) editProviderSel.innerHTML = '';
+    if (remixProviderSel) remixProviderSel.innerHTML = '';
+    for (const provider of configuredProviders) {
+      const opt = document.createElement('option');
+      opt.value = provider.name;
+      opt.textContent = provider.is_default ? (provider.name + ' (default)') : provider.name;
+      providerSel.appendChild(opt);
+      if (editProviderSel) {
+        const editOpt = document.createElement('option');
+        editOpt.value = provider.name;
+        editOpt.textContent = provider.is_default ? (provider.name + ' (default)') : provider.name;
+        editProviderSel.appendChild(editOpt);
+      }
+      if (remixProviderSel) {
+        const remixOpt = document.createElement('option');
+        remixOpt.value = provider.name;
+        remixOpt.textContent = provider.is_default ? (provider.name + ' (default)') : provider.name;
+        remixProviderSel.appendChild(remixOpt);
+      }
+    }
+
+    if ([...providerSel.options].some((o) => o.value === preferredProvider)) {
+      providerSel.value = preferredProvider;
+    } else if (providerSel.options.length) {
+      providerSel.selectedIndex = 0;
+    }
+
+    refreshModelSelect(providerSel.value, rememberedModel || '');
+
+    if (editProviderSel) {
+      if ([...editProviderSel.options].some((o) => o.value === preferredEditProvider)) {
+        editProviderSel.value = preferredEditProvider;
+      } else if (editProviderSel.options.length) {
+        editProviderSel.selectedIndex = 0;
+      }
+      refreshModelSelectFor(editProviderSel.value, rememberedEditModel || '', 'edit-model');
+    }
+    if (remixProviderSel) {
+      if ([...remixProviderSel.options].some((o) => o.value === preferredRemixProvider)) {
+        remixProviderSel.value = preferredRemixProvider;
+      } else if (remixProviderSel.options.length) {
+        remixProviderSel.selectedIndex = 0;
+      }
+      refreshModelSelectFor(
+        remixProviderSel.value,
+        rememberedRemixModel || rememberedEditModel || '',
+        'remix-model',
+      );
+    }
+    renderSettingsProviders();
+  }
+
+  function renderSettingsProviders() {
+    const container = document.getElementById('settings-provider-list');
+    if (!container) return;
+    const providers = managedProviderSettings?.providers || [];
+    if (!managedProviderSettings) {
+      container.innerHTML = '<div class="settings-item"><strong>Loading...</strong><span></span></div>';
+      return;
+    }
+    if (!providers.length) {
+      container.innerHTML = '<div class="settings-item"><strong>No providers configured</strong><span></span></div>';
+      return;
+    }
+    container.innerHTML = providers.map((provider, index) => {
+      const model = provider.model || 'Provider default';
+      const keyState = provider.has_api_key
+        ? ('Key: ' + (provider.api_key_source || 'configured'))
+        : 'No API key';
+      const defaultBadge = provider.is_default
+        ? '<span class="badge badge-frame">Default</span>'
+        : '';
+      const deleteDisabled = provider.is_default ? ' disabled title="Choose another default first"' : '';
+      return '<div class="settings-item">' +
+        '<div class="settings-item-main"><strong>' + esc(provider.name) + '</strong>' +
+        '<span>' + esc(model) + ' · ' + esc(keyState) + '</span></div>' +
+        '<div class="settings-item-actions">' + defaultBadge +
+        '<button class="btn btn-ghost btn-small" data-provider-action="test" data-provider-index="' + index + '">Test</button>' +
+        '<button class="btn btn-secondary btn-small" data-provider-action="edit" data-provider-index="' + index + '">Edit</button>' +
+        '<button class="btn btn-danger btn-small" data-provider-action="delete" data-provider-index="' + index + '"' + deleteDisabled + '>Delete</button>' +
+        '</div></div>';
+    }).join('');
+
+    const defaultSelect = document.getElementById('settings-default-provider');
+    defaultSelect.innerHTML = providers.map((provider) =>
+      '<option value="' + esc(provider.name) + '">' + esc(provider.name) + '</option>'
+    ).join('');
+    defaultSelect.value = managedProviderSettings.default_provider;
+    document.getElementById('settings-default-model').value =
+      managedProviderSettings.default_model || '';
+
+    const available = managedProviderSettings.available_types || [];
+    const configured = new Set(providers.map((provider) => provider.name));
+    document.getElementById('btn-settings-add-provider').disabled =
+      !available.some((name) => !configured.has(name));
+  }
+
+  function setButtonBusy(btn, busyText) {
+    if (!btn) return;
+    btn.dataset.originalHtml = btn.innerHTML;
+    btn.dataset.originalText = btn.textContent;
+    btn.disabled = true;
+    btn.classList.add('busy');
+    btn.setAttribute('aria-busy', 'true');
+    const label = busyText || btn.dataset.originalText || 'Working...';
+    btn.innerHTML = '<span class="btn-spinner" aria-hidden="true"></span><span>' + esc(label) + '</span>';
+  }
+
+  function clearButtonBusy(btn) {
+    if (!btn) return;
+    btn.disabled = false;
+    btn.classList.remove('busy');
+    btn.removeAttribute('aria-busy');
+    if (btn.dataset.originalHtml) btn.innerHTML = btn.dataset.originalHtml;
+  }
+
+  function addTVs(tvs, source) {
+    for (const tv of tvs) {
+      const existing = knownTVs.find((known) => known.ip === tv.ip);
+      if (!existing) {
+        knownTVs.push({ ...tv, source });
+      } else if (source === 'config') {
+        Object.assign(existing, tv, { source });
+      }
+    }
+    refreshTVSelects();
+    renderTVList();
+  }
+
+  function removeSessionTV(index) {
+    const tv = knownTVs[index];
+    if (!tv || tv.source === 'config') return;
+    knownTVs.splice(index, 1);
+    refreshTVSelects();
+    renderTVList();
+    showToast('Removed ' + tv.name + ' from this session.', 'done');
+  }
+
+  function refreshTVSelects() {
+    // Update all TV <select> elements throughout the UI
+    const selectors = [
+      'tv-select',
+      'tv-art-select',
+      'upload-tv-select',
+      'batch-upload-tv-select',
+      'remix-tv-select',
+      'public-tv-select',
+      'own-upload-tv-select',
+      'edit-upload-tv-select',
+    ];
+    for (const id of selectors) {
+      const sel = document.getElementById(id);
+      if (!sel) continue;
+      const prev = sel.value;
+      if (id === 'tv-select') {
+        sel.innerHTML = '<option value="">Generate only (no TV)</option>';
+      } else if (id === 'public-tv-select') {
+        sel.innerHTML = '<option value="">Select TV...</option>';
+      } else if (id === 'own-upload-tv-select') {
+        sel.innerHTML = '<option value="">Select TV...</option>';
+      } else if (id === 'edit-upload-tv-select') {
+        sel.innerHTML = '<option value="">Edit only (no TV upload)</option>';
+      } else if (id === 'remix-tv-select') {
+        sel.innerHTML = '<option value="">Create only (save to Gallery)</option>';
+      } else {
+        sel.innerHTML = '';
+      }
+      for (const tv of knownTVs) {
+        const opt = document.createElement('option');
+        opt.value = tv.ip;
+        const label = tv.name + ' (' + tv.ip + ')';
+        opt.textContent = label;
+        sel.appendChild(opt);
+      }
+      // Restore previous selection if still valid
+      if (prev && [...sel.options].some(o => o.value === prev)) {
+        sel.value = prev;
+      } else {
+        const remembered = localStorage.getItem(
+          id === 'tv-select' ? storageKeys.tvGenerate :
+          id === 'public-tv-select' ? storageKeys.tvPublic :
+          id === 'own-upload-tv-select' ? storageKeys.tvOwnUpload :
+          id === 'edit-upload-tv-select' ? storageKeys.tvEditUpload :
+          id === 'remix-tv-select' ? storageKeys.tvRemix :
+          id === 'upload-tv-select' || id === 'batch-upload-tv-select' ? storageKeys.tvUpload :
+          storageKeys.tvArt
+        );
+        if (remembered && [...sel.options].some(o => o.value === remembered)) {
+          sel.value = remembered;
+        }
+      }
+    }
+    // Show the TV art section once we have TVs
+    const artSection = document.getElementById('tv-art-section');
+    artSection.style.display = knownTVs.length > 0 ? 'block' : 'none';
+  }
+
+  function renderTVList() {
+    const list = document.getElementById('tv-list');
+    const empty = document.getElementById('tv-empty');
+    if (!knownTVs.length) {
+      list.innerHTML = '';
+      empty.textContent = 'No TVs found. Click "Scan Network", use "Add by IP", or configure config.yaml.';
+      empty.style.display = 'block';
+      renderSettingsTVSummary();
+      return;
+    }
+    empty.style.display = 'none';
+    list.innerHTML = knownTVs.map((t, index) => {
+      let badgeClass = 'badge-config';
+      let badgeText = 'Configured';
+      if (t.source === 'discovered') {
+        badgeClass = t.frame_tv ? 'badge-frame' : 'badge-samsung';
+        badgeText = t.frame_tv ? 'Frame TV' : 'Samsung TV';
+      } else if (t.source === 'manual') {
+        badgeClass = 'badge-manual';
+        badgeText = 'Manual · session';
+      }
+      const detail = t.model ? (esc(t.model) + ' &middot; ' + esc(t.ip)) : esc(t.ip);
+      const removeButton = t.source === 'config' ? '' :
+        '<button class="btn btn-ghost btn-small" data-remove-tv-index="' +
+        index + '">Remove</button>';
+      const saveButton = t.source === 'config' ? '' :
+        '<button class="btn btn-secondary btn-small" data-save-tv-index="' +
+        index + '">Save</button>';
+      return `
+        <div class="tv-card">
+          <div class="tv-info">
+            <div class="tv-name">${esc(t.name)}</div>
+            <div class="tv-detail">${detail}</div>
+          </div>
+          <div class="tv-actions">
+            <span class="badge ${badgeClass}">${badgeText}</span>
+            ${saveButton}
+            ${removeButton}
+          </div>
+        </div>`;
+    }).join('');
+    animateStaggeredChildren(list, '.tv-card');
+    renderSettingsTVSummary();
+  }
+
+  function renderSettingsTVSummary() {
+    const container = document.getElementById('settings-tv-list');
+    if (!container) return;
+    if (!managedTVSettings.length) {
+      container.innerHTML = '<div class="settings-item"><div class="settings-item-main"><strong>No persistent TVs</strong><span>Use Add TV or save a discovered TV.</span></div></div>';
+      return;
+    }
+    container.innerHTML = managedTVSettings.map((tv, index) => {
+      const tokenState = tv.token_configured ? 'Paired' : 'Not paired';
+      return '<div class="settings-item">' +
+        '<div class="settings-item-main"><strong>' + esc(tv.profile_id) + '</strong>' +
+        '<span>' + esc(tv.ip) + ':' + tv.port + ' · ' + esc(tokenState) + '</span></div>' +
+        '<div class="settings-item-actions">' +
+        '<button class="btn btn-ghost btn-small" data-settings-tv-action="test" data-settings-tv-index="' + index + '">Test</button>' +
+        '<button class="btn btn-ghost btn-small" data-settings-tv-action="pair" data-settings-tv-index="' + index + '">Pair</button>' +
+        '<button class="btn btn-secondary btn-small" data-settings-tv-action="edit" data-settings-tv-index="' + index + '">Edit</button>' +
+        '<button class="btn btn-danger btn-small" data-settings-tv-action="delete" data-settings-tv-index="' + index + '">Delete</button>' +
+        '</div></div>';
+    }).join('');
+  }
+
+  document.getElementById('tv-list').addEventListener('click', (event) => {
+    const saveButton = event.target.closest('[data-save-tv-index]');
+    if (saveButton) {
+      const tv = knownTVs[Number(saveButton.dataset.saveTvIndex)];
+      if (tv) openTVSettingsEditor(null, tv);
+      return;
+    }
+    const button = event.target.closest('[data-remove-tv-index]');
+    if (!button) return;
+    removeSessionTV(Number(button.dataset.removeTvIndex));
+  });
+
+  // =========================================================================
+  // Navigation (top-level pages + create modes)
+  // =========================================================================
+  const pageTabs = document.querySelectorAll('.tabs button, .mobile-nav button');
+  const panels = document.querySelectorAll('.panel');
+  const createModeTabs = document.querySelectorAll('.create-modes button');
+  const createPanels = document.querySelectorAll('.create-panel');
+
+  function setActiveCreateMode(modeName) {
+    createModeTabs.forEach((tab) => tab.classList.toggle('active', tab.dataset.mode === modeName));
+    createPanels.forEach((panel) => panel.classList.toggle('active', panel.id === ('create-panel-' + modeName)));
+    localStorage.setItem(storageKeys.createMode, modeName);
+    if (modeName === 'ai') loadGenerationJobsFromAPI();
+  }
+
+  function setActivePage(pageName) {
+    pageTabs.forEach((tab) => tab.classList.toggle('active', tab.dataset.page === pageName));
+    panels.forEach((panel) => panel.classList.toggle('active', panel.id === ('panel-' + pageName)));
+    localStorage.setItem(storageKeys.page, pageName);
+    if (pageName === 'library') loadGallery();
+    if (pageName === 'create' && getActiveCreateModeName() === 'ai') loadGenerationJobsFromAPI();
+  }
+
+  pageTabs.forEach(btn => {
+    btn.addEventListener('click', () => {
+      setActivePage(btn.dataset.page);
+    });
+  });
+
+  createModeTabs.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      setActiveCreateMode(btn.dataset.mode);
+    });
+  });
+
+  function getActivePageName() {
+    const activeTab = document.querySelector('.tabs button.active');
+    return activeTab ? activeTab.dataset.page : 'create';
+  }
+
+  function getActiveCreateModeName() {
+    const activeMode = document.querySelector('.create-modes button.active');
+    return activeMode ? activeMode.dataset.mode : 'ai';
+  }
+
+  const rememberedCreateMode = localStorage.getItem(storageKeys.createMode);
+  if (rememberedCreateMode && [...createModeTabs].some((tab) => tab.dataset.mode === rememberedCreateMode)) {
+    setActiveCreateMode(rememberedCreateMode);
+  } else {
+    setActiveCreateMode('ai');
+  }
+
+  const rememberedPage = localStorage.getItem(storageKeys.page);
+  if (rememberedPage && [...pageTabs].some((tab) => tab.dataset.page === rememberedPage)) {
+    setActivePage(rememberedPage);
+  } else {
+    setActivePage('create');
+  }
+
+  // =========================================================================
+  // Startup: load styles + configured TVs in parallel
+  // =========================================================================
+  apiFetch('/styles').then(r => r.json()).then(styles => {
+    const sel = document.getElementById('style');
+    for (const [key] of Object.entries(styles)) {
+      const opt = document.createElement('option');
+      opt.value = key; opt.textContent = key.replace(/_/g, ' ');
+      sel.appendChild(opt);
+    }
+  }).catch(() => {});
+
+  apiFetch('/providers').then(r => r.json()).then((payload) => {
+    refreshProviderSelects(payload);
+  }).catch(() => {
+    configuredProviders = [{
+      name: 'openai',
+      is_default: true,
+      models: [],
+      default_model: '',
+    }];
+    const providerSel = document.getElementById('provider');
+    const modelSel = document.getElementById('model');
+    const editProviderSel = document.getElementById('edit-provider');
+    const editModelSel = document.getElementById('edit-model');
+    const remixProviderSel = document.getElementById('remix-provider');
+    const remixModelSel = document.getElementById('remix-model');
+    providerSel.innerHTML = '<option value="openai">openai</option>';
+    providerSel.value = 'openai';
+    modelSel.innerHTML = '<option value="">Provider default</option>';
+    editProviderSel.innerHTML = '<option value="openai">openai</option>';
+    editProviderSel.value = 'openai';
+    editModelSel.innerHTML = '<option value="">Provider default</option>';
+    remixProviderSel.innerHTML = '<option value="openai">openai</option>';
+    remixProviderSel.value = 'openai';
+    remixModelSel.innerHTML = '<option value="">Provider default</option>';
+    renderSettingsProviders();
+    showToast('Failed to load configured providers; using fallback defaults.', 'warn');
+  });
+
+  // Load pre-configured TVs and editable management settings on startup.
+  reloadConfiguredTVs().catch(() => {
+    document.getElementById('tv-empty').textContent =
+      'No configured TVs. Click "Scan Network" to find Samsung TVs.';
+  });
+  loadManagementSettings();
+
+  document.getElementById('tv-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.tvGenerate, e.target.value || '');
+  });
+  document.getElementById('provider').addEventListener('change', (e) => {
+    const provider = e.target.value || '';
+    localStorage.setItem(storageKeys.providerGenerate, provider);
+    refreshModelSelect(provider, '');
+    localStorage.setItem(storageKeys.modelGenerate, '');
+  });
+  document.getElementById('model').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.modelGenerate, e.target.value || '');
+  });
+  document.getElementById('edit-provider').addEventListener('change', (e) => {
+    const provider = e.target.value || '';
+    localStorage.setItem(storageKeys.providerEdit, provider);
+    refreshModelSelectFor(provider, '', 'edit-model');
+    localStorage.setItem(storageKeys.modelEdit, '');
+  });
+  document.getElementById('edit-model').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.modelEdit, e.target.value || '');
+  });
+  document.getElementById('remix-provider').addEventListener('change', (e) => {
+    const provider = e.target.value || '';
+    localStorage.setItem(storageKeys.providerRemix, provider);
+    refreshModelSelectFor(provider, '', 'remix-model');
+    localStorage.setItem(storageKeys.modelRemix, '');
+  });
+  document.getElementById('remix-model').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.modelRemix, e.target.value || '');
+  });
+  document.getElementById('tv-art-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.tvArt, e.target.value || '');
+  });
+  document.getElementById('upload-tv-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.tvUpload, e.target.value || '');
+  });
+  document.getElementById('batch-upload-tv-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.tvUpload, e.target.value || '');
+  });
+  document.getElementById('remix-tv-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.tvRemix, e.target.value || '');
+  });
+  document.getElementById('public-tv-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.tvPublic, e.target.value || '');
+  });
+  document.getElementById('own-upload-tv-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.tvOwnUpload, e.target.value || '');
+  });
+  document.getElementById('edit-upload-tv-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.tvEditUpload, e.target.value || '');
+  });
+  document.getElementById('public-matte-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.mattePublic, e.target.value || '');
+  });
+  document.getElementById('own-upload-matte-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.matteOwnUpload, e.target.value || '');
+  });
+  document.getElementById('edit-upload-matte-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.matteEditUpload, e.target.value || '');
+  });
+  document.getElementById('upload-matte-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.matteUpload, e.target.value || '');
+  });
+  document.getElementById('batch-upload-matte-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.matteUpload, e.target.value || '');
+  });
+  document.getElementById('remix-matte-select').addEventListener('change', (e) => {
+    localStorage.setItem(storageKeys.matteRemix, e.target.value || '');
+  });
+  const rememberedPublicMatte = localStorage.getItem(storageKeys.mattePublic);
+  if (rememberedPublicMatte) {
+    const sel = document.getElementById('public-matte-select');
+    if ([...sel.options].some(o => o.value === rememberedPublicMatte)) sel.value = rememberedPublicMatte;
+  }
+  const rememberedOwnUploadMatte = localStorage.getItem(storageKeys.matteOwnUpload);
+  if (rememberedOwnUploadMatte) {
+    const sel = document.getElementById('own-upload-matte-select');
+    if ([...sel.options].some(o => o.value === rememberedOwnUploadMatte)) sel.value = rememberedOwnUploadMatte;
+  }
+  const rememberedEditUploadMatte = localStorage.getItem(storageKeys.matteEditUpload);
+  if (rememberedEditUploadMatte) {
+    const sel = document.getElementById('edit-upload-matte-select');
+    if ([...sel.options].some(o => o.value === rememberedEditUploadMatte)) sel.value = rememberedEditUploadMatte;
+  }
+  const rememberedUploadMatte = localStorage.getItem(storageKeys.matteUpload);
+  if (rememberedUploadMatte) {
+    const sel = document.getElementById('upload-matte-select');
+    if ([...sel.options].some(o => o.value === rememberedUploadMatte)) sel.value = rememberedUploadMatte;
+    const batchSel = document.getElementById('batch-upload-matte-select');
+    if ([...batchSel.options].some(o => o.value === rememberedUploadMatte)) batchSel.value = rememberedUploadMatte;
+  }
+  const rememberedRemixMatte = localStorage.getItem(storageKeys.matteRemix);
+  if (rememberedRemixMatte) {
+    const sel = document.getElementById('remix-matte-select');
+    if ([...sel.options].some(o => o.value === rememberedRemixMatte)) sel.value = rememberedRemixMatte;
+  }
+
+  // =========================================================================
+  // Status helpers
+  // =========================================================================
+  const statusBar = document.getElementById('gen-status');
+  const statusText = document.getElementById('gen-status-text');
+  function showStatus(msg, cls) {
+    statusBar.className = 'status-bar visible' + (cls ? ' ' + cls : '');
+    statusText.textContent = msg;
+  }
+
+  function gallerySkeleton(count) {
+    return Array.from({ length: count }).map(() => `
+      <div class="skeleton-card">
+        <div class="sk-thumb"></div>
+        <div class="sk-line"></div>
+        <div class="sk-line short"></div>
+      </div>
+    `).join('');
+  }
+
+  // =========================================================================
+  // Generate
+  // =========================================================================
+  function renderGenerationJobs() {
+    const grid = document.getElementById('gen-jobs-grid');
+    const empty = document.getElementById('gen-jobs-empty');
+    const jobs = Array.from(generationJobs.values())
+      .sort((a, b) => b.createdAt - a.createdAt);
+
+    if (!jobs.length) {
+      grid.innerHTML = '';
+      empty.style.display = 'block';
+      return;
+    }
+    empty.style.display = 'none';
+    grid.innerHTML = jobs.map((job) => {
+      const providerLabel = job.provider || 'default';
+      const modelLabel = job.model || 'default';
+      const styleLabel = job.style || 'none';
+      const tvLabel = job.tvIp || 'no TV';
+      const cardClass = job.status === 'completed' ? ' done' : (job.status === 'failed' ? ' error' : '');
+      const prompt = esc(job.prompt || '');
+      const errorBlock = job.error ? `<div class="gen-job-meta" style="color:var(--err)">Error: ${esc(job.error)}</div>` : '';
+      const previewToken = job.previewNonce || '';
+      const imageJobId = job.resultJobId || job.jobId;
+      const previewBlock = (job.status === 'completed' && job.imageAvailable)
+        ? `<div class="gen-job-thumb-wrap">
+             <img src="/jobs/${esc(imageJobId)}/image?${previewToken}" alt="${prompt}" loading="lazy"
+               onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
+             <div class="gen-job-thumb-fallback">No image available</div>
+           </div>`
+        : '';
+      const actionsBlock = job.status === 'completed' && job.imageAvailable
+        ? `<div class="gen-job-actions">
+             <button class="btn btn-secondary btn-small btn-gen-open" data-job-id="${esc(imageJobId)}">Open Image</button>
+           </div>`
+        : '';
+      return `
+        <div class="gen-job-card${cardClass}">
+          <div class="gen-job-row">
+            <span class="gen-job-id">${esc(job.jobId)}</span>
+            <span class="gen-job-status ${esc(job.status)}">${esc(job.status)}</span>
+          </div>
+          <div class="gen-job-prompt">${prompt}</div>
+          <div class="gen-job-meta">Provider: ${esc(providerLabel)} · Model: ${esc(modelLabel)}</div>
+          <div class="gen-job-meta">Style: ${esc(styleLabel)} · TV: ${esc(tvLabel)}</div>
+          ${errorBlock}
+          ${previewBlock}
+          ${actionsBlock}
+        </div>
+      `;
+    }).join('');
+
+    grid.querySelectorAll('.btn-gen-open').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        const jobId = e.currentTarget.dataset.jobId;
+        if (!jobId) return;
+        window.showPreview(jobId);
+      });
+    });
+  }
+
+  function clearFinishedGenerationJobs() {
+    for (const [jobId, job] of generationJobs.entries()) {
+      if (job.status === 'completed' || job.status === 'failed') {
+        generationJobs.delete(jobId);
+      }
+    }
+    renderGenerationJobs();
+  }
+
+  function ensureGenerationPolling() {
+    if (generationPollTimer) return;
+    generationPollTimer = setInterval(pollGenerationJobs, 1800);
+  }
+
+  function stopGenerationPollingIfIdle() {
+    const hasActive = Array.from(generationJobs.values())
+      .some((j) => j.status === 'pending' || j.status === 'running');
+    if (!hasActive && generationPollTimer) {
+      clearInterval(generationPollTimer);
+      generationPollTimer = null;
+    }
+  }
+
+  async function pollGenerationJobs() {
+    const activeJobs = Array.from(generationJobs.values())
+      .filter((j) => j.status === 'pending' || j.status === 'running');
+    if (!activeJobs.length) {
+      stopGenerationPollingIfIdle();
+      return;
+    }
+
+    let changed = false;
+    await Promise.all(activeJobs.map(async (job) => {
+      try {
+        const resp = await apiFetch('/jobs/' + job.jobId + '/status');
+        if (!resp.ok) {
+          const nextError = 'Status check failed (' + resp.status + ')';
+          if (job.status !== 'failed' || job.error !== nextError) {
+            job.status = 'failed';
+            job.error = nextError;
+            changed = true;
+          }
+          return;
+        }
+        const data = await resp.json();
+        const nextStatus = data.status || job.status;
+        const nextError = data.error || null;
+        if (nextStatus !== job.status || nextError !== job.error) {
+          changed = true;
+          job.status = nextStatus;
+          job.error = nextError;
+        }
+        if (data.status === 'completed' && data.result) {
+          const nextResultJobId = data.result.job_id || job.jobId;
+          const nextImageAvailable = Boolean(data.result.final_path);
+          if (job.resultJobId !== nextResultJobId || job.imageAvailable !== nextImageAvailable) {
+            changed = true;
+            job.resultJobId = nextResultJobId;
+            job.imageAvailable = nextImageAvailable;
+          }
+          if (!job.previewNonce) {
+            changed = true;
+            job.previewNonce = Date.now();
+          }
+          showStatus('Done: ' + job.jobId, 'done');
+          if (job.imageAvailable) {
+            const img = document.getElementById('gen-preview-img');
+            img.src = '/jobs/' + job.resultJobId + '/image?' + Date.now();
+            document.getElementById('gen-preview').style.display = 'block';
+          }
+        } else if (data.status === 'failed') {
+          if (job.imageAvailable) {
+            job.imageAvailable = false;
+            changed = true;
+          }
+          showStatus('Failed: ' + (data.error || job.jobId), 'error');
+        }
+      } catch (e) {
+        if (job.status !== 'failed' || job.error !== e.message) {
+          job.status = 'failed';
+          job.error = e.message;
+          changed = true;
+        }
+      }
+    }));
+
+    if (changed) renderGenerationJobs();
+    stopGenerationPollingIfIdle();
+  }
+
+  const btnGen = document.getElementById('btn-generate');
+  document.getElementById('btn-gen-jobs-clear').addEventListener('click', clearFinishedGenerationJobs);
+  btnGen.addEventListener('click', async () => {
+    const prompt = document.getElementById('prompt').value.trim();
+    if (!prompt) { showStatus('Please enter a prompt.', 'error'); return; }
+
+    const style = document.getElementById('style').value || undefined;
+    const provider = document.getElementById('provider').value || undefined;
+    const model = document.getElementById('model').value || undefined;
+    const tvIp = document.getElementById('tv-select').value || undefined;
+
+    const useTV = !!tvIp;
+    const endpoint = useTV ? '/async/generate-and-apply' : '/async/generate';
+    const body = { prompt, style, provider, model };
+    if (useTV) { body.tv_ip = tvIp; }
+
+    setButtonBusy(btnGen, 'Queueing...');
+    showStatus('Submitting job...');
+
+    try {
+      const resp = await apiFetch(endpoint, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body),
+      });
+      if (!resp.ok) { throw new Error('Server returned ' + resp.status); }
+      const data = await resp.json();
+      generationJobs.set(data.job_id, {
+        jobId: data.job_id,
+        prompt,
+        provider,
+        model,
+        style,
+        tvIp,
+        status: data.status || 'pending',
+        error: null,
+        imageAvailable: false,
+        createdAt: Date.now(),
+      });
+      renderGenerationJobs();
+      ensureGenerationPolling();
+      showStatus('Queued job ' + data.job_id + '.', '');
+    } catch (e) {
+      showStatus('Failed: ' + e.message, 'error');
+    } finally {
+      clearButtonBusy(btnGen);
+    }
+  });
+
+  async function loadGenerationJobsFromAPI() {
+    try {
+      const resp = await apiFetch('/async/jobs?limit=60');
+      if (!resp.ok) throw new Error('Server returned ' + resp.status);
+      const items = await resp.json();
+      for (const item of items) {
+        const req = item.request || {};
+        const kind = req.type || '';
+        if (kind !== 'generate' && kind !== 'generate-and-apply') continue;
+        const existing = generationJobs.get(item.job_id);
+        const current = existing || {
+          jobId: item.job_id,
+          createdAt: Date.now(),
+        };
+        const resultJobId = item.result && item.result.job_id ? item.result.job_id : item.job_id;
+        current.prompt = req.prompt || current.prompt || '';
+        current.provider = req.provider || current.provider || '';
+        current.model = req.model || current.model || '';
+        current.style = req.style || current.style || '';
+        current.tvIp = req.tv_ip || current.tvIp || '';
+        current.status = item.status || current.status || 'pending';
+        current.error = item.error || null;
+        current.resultJobId = resultJobId;
+        current.imageAvailable = Boolean(item.result && item.result.final_path);
+        if (current.imageAvailable && !current.previewNonce) current.previewNonce = Date.now();
+        generationJobs.set(item.job_id, current);
+      }
+      renderGenerationJobs();
+      const hasActive = Array.from(generationJobs.values())
+        .some((j) => j.status === 'pending' || j.status === 'running');
+      if (hasActive) ensureGenerationPolling();
+    } catch (e) {
+      showToast('Failed to load async jobs: ' + e.message, 'warn');
+    }
+  }
+
+  // =========================================================================
+  // Gallery
+  // =========================================================================
+  function updateGallerySelectionUI() {
+    const btn = document.getElementById('btn-gallery-delete-selected');
+    const inlineDeleteBtn = document.getElementById('btn-library-delete-selected-inline');
+    const inlineDisplayBtn = document.getElementById('btn-library-display-selected');
+    const inlineClearBtn = document.getElementById('btn-library-clear-selection-inline');
+    const bar = document.getElementById('library-selection-bar');
+    const text = document.getElementById('library-selection-text');
+    const n = selectedGalleryJobIds.size;
+    const hasSelection = n > 0;
+    const label = n === 1 ? '1 artwork selected' : (n + ' artwork selected');
+
+    btn.disabled = n === 0;
+    btn.textContent = n > 0 ? ('Delete Selected (' + n + ')') : 'Delete Selected';
+    inlineDeleteBtn.disabled = !hasSelection;
+    inlineDisplayBtn.disabled = !hasSelection;
+    inlineClearBtn.disabled = !hasSelection;
+    text.textContent = label;
+    bar.classList.toggle('visible', hasSelection);
+  }
+
+  function bindGallerySelectionHandlers() {
+    const items = document.querySelectorAll('.gallery-select-item');
+    items.forEach((item) => {
+      item.addEventListener('change', (e) => {
+        const checkbox = e.target;
+        const card = checkbox.closest('.gallery-item');
+        const jobId = checkbox.dataset.jobId;
+        if (!jobId) return;
+        if (checkbox.checked) selectedGalleryJobIds.add(jobId);
+        else selectedGalleryJobIds.delete(jobId);
+        if (card) card.classList.toggle('selected', checkbox.checked);
+        updateGallerySelectionUI();
+      });
+    });
+  }
+
+  function setAllGallerySelections(checked) {
+    document.querySelectorAll('.gallery-select-item').forEach((el) => {
+      const jobId = el.dataset.jobId;
+      if (!jobId) return;
+      el.checked = checked;
+      const card = el.closest('.gallery-item');
+      if (card) card.classList.toggle('selected', checked);
+      if (checked) selectedGalleryJobIds.add(jobId);
+      else selectedGalleryJobIds.delete(jobId);
+    });
+    updateGallerySelectionUI();
+  }
+
+  async function deleteSelectedGalleryJobs() {
+    const selectedIds = Array.from(selectedGalleryJobIds);
+    if (!selectedIds.length) return;
+
+    if (!confirm('Delete ' + selectedIds.length + ' selected artwork item(s) from host storage?')) return;
+
+    const btn = document.getElementById('btn-gallery-delete-selected');
+    setButtonBusy(btn, 'Deleting...');
+
+    try {
+      const resp = await apiFetch('/jobs/delete', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ job_ids: selectedIds }),
+      });
+      if (!resp.ok) throw new Error('Server returned ' + resp.status);
+      const data = await resp.json();
+      if (data.failed && Object.keys(data.failed).length) {
+        showToast('Some items failed to delete: ' + Object.keys(data.failed).join(', '), 'warn');
+      }
+      if (data.not_found && data.not_found.length) {
+        showToast('Some items were not found: ' + data.not_found.join(', '), 'warn');
+      }
+      selectedGalleryJobIds = new Set();
+      updateGallerySelectionUI();
+      await loadGallery();
+      showToast('Deleted selected gallery items.', 'done');
+    } catch (e) {
+      showToast('Failed to delete selected artwork: ' + e.message, 'error');
+      updateGallerySelectionUI();
+    } finally {
+      clearButtonBusy(btn);
+    }
+  }
+
+  function openBatchUploadModal() {
+    const selectedIds = Array.from(selectedGalleryJobIds);
+    if (!selectedIds.length) return;
+    document.getElementById('batch-upload-count').textContent = String(selectedIds.length);
+    const statusEl = document.getElementById('batch-upload-status');
+    const statusTextEl = document.getElementById('batch-upload-status-text');
+    statusEl.classList.remove('visible');
+
+    refreshTVSelects();
+    const batchTvSel = document.getElementById('batch-upload-tv-select');
+    const rememberedTv = localStorage.getItem(storageKeys.tvUpload);
+    if (rememberedTv && [...batchTvSel.options].some((o) => o.value === rememberedTv)) {
+      batchTvSel.value = rememberedTv;
+    }
+    if (!knownTVs.length) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'No TVs available. Configure one or run Scan Network first.';
+    }
+    loadMattesForSelect('batch-upload-matte-select', batchTvSel.value || knownTVs[0]?.ip);
+    openModal('batch-upload-modal', '#batch-upload-tv-select');
+  }
+
+  async function applyBatchUpload() {
+    const selectedIds = Array.from(selectedGalleryJobIds);
+    const tvIp = document.getElementById('batch-upload-tv-select').value;
+    const matte = document.getElementById('batch-upload-matte-select').value || 'none';
+    const statusEl = document.getElementById('batch-upload-status');
+    const statusTextEl = document.getElementById('batch-upload-status-text');
+    const btn = document.getElementById('btn-batch-upload-apply');
+
+    if (!selectedIds.length) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'No library items selected.';
+      return;
+    }
+    if (!tvIp) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Please select a TV.';
+      return;
+    }
+
+    setButtonBusy(btn, 'Displaying...');
+    statusEl.className = 'status-bar visible';
+    statusTextEl.textContent = 'Uploading selected artwork...';
+
+    let success = 0;
+    const failed = [];
+    for (const jobId of selectedIds) {
+      try {
+        const resp = await apiFetch('/jobs/' + encodeURIComponent(jobId) + '/apply', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ tv_ip: tvIp, matte: matte }),
+        });
+        if (!resp.ok) throw new Error('Server returned ' + resp.status);
+        success += 1;
+      } catch {
+        failed.push(jobId);
+      }
+    }
+
+    if (success > 0) {
+      selectedGalleryJobIds = new Set();
+      updateGallerySelectionUI();
+      await loadGallery();
+    }
+
+    if (failed.length) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Displayed ' + success + ', failed ' + failed.length + '.';
+      showToast('Some selected items failed to display on TV.', 'warn');
+    } else {
+      statusEl.className = 'status-bar visible done';
+      statusTextEl.textContent = 'Displayed ' + success + ' selected artwork on TV.';
+      showToast('Displayed selected artwork on TV.', 'done');
+      closeModal('batch-upload-modal');
+    }
+    clearButtonBusy(btn);
+  }
+
+  async function loadGallery() {
+    const grid = document.getElementById('gallery-grid');
+    const empty = document.getElementById('gallery-empty');
+    selectedGalleryJobIds = new Set();
+    updateGallerySelectionUI();
+    grid.innerHTML = gallerySkeleton(6);
+    empty.style.display = 'none';
+    try {
+      const resp = await apiFetch('/jobs?limit=50');
+      const jobs = await resp.json();
+      if (!jobs.length) { grid.innerHTML = ''; empty.style.display = 'block'; return; }
+      empty.style.display = 'none';
+      grid.innerHTML = jobs.map(j => {
+        const promptText = esc(j.prompt || j.job_id);
+        const promptShort = esc((j.prompt || '').substring(0, 40));
+        return `
+        <div class="gallery-item">
+          <img src="/jobs/${esc(j.job_id)}/image" alt="${promptShort}" loading="lazy"
+               onclick="showPreview('${esc(j.job_id)}')"
+               onerror="this.style.display='none'">
+          <div class="info">
+            <label class="select-row">
+              <input type="checkbox" class="gallery-select-item" data-job-id="${esc(j.job_id)}">
+              <span>Select</span>
+            </label>
+            <div class="prompt">${promptText}</div>
+            <div class="meta">${esc(j.provider || '')} ${j.content_id ? '&middot; on TV' : ''}</div>
+          </div>
+          <div class="actions">
+            <button class="btn btn-secondary btn-small"
+                    onclick="openUploadModal('${esc(j.job_id)}', '${esc(j.prompt || j.job_id)}')">
+              Upload to TV</button>
+            <button class="btn btn-secondary btn-small"
+                    onclick="openRemixFromJob('${esc(j.job_id)}', '${esc(j.prompt || j.job_id)}')">
+              Edit / Generate New</button>
+          </div>
+        </div>`;
+      }).join('');
+      animateStaggeredChildren(grid, '.gallery-item');
+      bindGallerySelectionHandlers();
+    } catch (e) {
+      grid.innerHTML = '<div class="empty">Failed to load gallery. Use Refresh to retry.</div>';
+      showToast('Failed to load gallery: ' + e.message, 'error');
+    } finally {
+      updateGallerySelectionUI();
+    }
+  }
+
+  document.getElementById('btn-refresh-gallery').addEventListener('click', loadGallery);
+  document.getElementById('btn-gallery-select-all').addEventListener('click', () => setAllGallerySelections(true));
+  document.getElementById('btn-gallery-clear-selection').addEventListener('click', () => setAllGallerySelections(false));
+  document.getElementById('btn-gallery-delete-selected').addEventListener('click', deleteSelectedGalleryJobs);
+  document.getElementById('btn-library-display-selected').addEventListener('click', openBatchUploadModal);
+  document.getElementById('btn-library-delete-selected-inline').addEventListener('click', deleteSelectedGalleryJobs);
+  document.getElementById('btn-library-clear-selection-inline').addEventListener('click', () => setAllGallerySelections(false));
+  document.getElementById('btn-batch-upload-cancel').addEventListener('click', () => {
+    closeModal('batch-upload-modal');
+  });
+  document.getElementById('btn-batch-upload-apply').addEventListener('click', applyBatchUpload);
+  document.getElementById('batch-upload-tv-select').addEventListener('change', (e) => {
+    loadMattesForSelect('batch-upload-matte-select', e.target.value);
+  });
+
+  const modalIds = [
+    'modal',
+    'matte-modal',
+    'upload-modal',
+    'batch-upload-modal',
+    'remix-modal',
+    'provider-settings-modal',
+    'tv-settings-modal',
+    'add-tv-modal',
+    'shortcuts-modal',
+  ];
+  let lastFocusedBeforeModal = null;
+
+  function openModal(modalId, focusSelector) {
+    const modal = document.getElementById(modalId);
+    if (!modal) return;
+    lastFocusedBeforeModal = document.activeElement;
+    modal.classList.add('visible');
+    if (!focusSelector) return;
+    const focusTarget = modal.querySelector(focusSelector);
+    if (focusTarget) setTimeout(() => focusTarget.focus(), 20);
+  }
+
+  function closeModal(modalId) {
+    const modal = document.getElementById(modalId);
+    if (!modal) return;
+    modal.classList.remove('visible');
+    if (lastFocusedBeforeModal && typeof lastFocusedBeforeModal.focus === 'function') {
+      setTimeout(() => lastFocusedBeforeModal.focus(), 20);
+    }
+  }
+
+  function closeAllModals() {
+    modalIds.forEach((id) => {
+      const modal = document.getElementById(id);
+      if (modal) modal.classList.remove('visible');
+    });
+  }
+
+  document.getElementById('btn-shortcuts').addEventListener('click', () => {
+    openModal('shortcuts-modal', '#btn-shortcuts-close');
+  });
+  document.getElementById('btn-shortcuts-close').addEventListener('click', () => {
+    closeModal('shortcuts-modal');
+  });
+
+  window.showPreview = function(jobId) {
+    document.getElementById('modal-img').src = '/jobs/' + jobId + '/image';
+    openModal('modal');
+  };
+  document.getElementById('modal').addEventListener('click', function() {
+    closeModal('modal');
+  });
+
+  // =========================================================================
+  // Persistent settings management
+  // =========================================================================
+  function setSettingsModalError(prefix, message) {
+    const status = document.getElementById(prefix + '-error');
+    const text = document.getElementById(prefix + '-error-text');
+    text.textContent = message || '';
+    status.classList.toggle('visible', Boolean(message));
+  }
+
+  async function reloadRuntimeProviders() {
+    const response = await apiFetch('/providers');
+    refreshProviderSelects(await parseJSONResponse(response, 'Could not reload providers.'));
+  }
+
+  async function reloadConfiguredTVs() {
+    const response = await apiFetch('/tv/configured');
+    const configured = await parseJSONResponse(response, 'Could not reload configured TVs.');
+    knownTVs = knownTVs.filter((tv) => tv.source !== 'config');
+    addTVs(configured.map((tv) => ({
+      ip: tv.ip,
+      name: tv.name,
+      profile_id: tv.name,
+      model: null,
+      frame_tv: true,
+    })), 'config');
+  }
+
+  async function loadManagementSettings(triggerButton) {
+    if (triggerButton) setButtonBusy(triggerButton, 'Refreshing...');
+    try {
+      const [providerResponse, tvResponse, backupResponse] = await Promise.all([
+        apiFetch('/settings/providers'),
+        apiFetch('/settings/tvs'),
+        apiFetch('/settings/backups'),
+      ]);
+      managedProviderSettings = await parseJSONResponse(
+        providerResponse,
+        'Could not load provider settings.',
+      );
+      const tvPayload = await parseJSONResponse(tvResponse, 'Could not load TV settings.');
+      const backupPayload = await parseJSONResponse(
+        backupResponse,
+        'Could not load settings backups.',
+      );
+      managedTVSettings = tvPayload.tvs || [];
+      managedSettingsBackups = backupPayload.backups || [];
+      renderSettingsProviders();
+      renderSettingsTVSummary();
+      renderSettingsBackups();
+    } catch (error) {
+      const message = error?.message || 'Settings could not be loaded.';
+      document.getElementById('settings-provider-list').innerHTML =
+        '<div class="settings-item"><strong>Unavailable</strong><span>' + esc(message) + '</span></div>';
+      document.getElementById('settings-tv-list').innerHTML =
+        '<div class="settings-item"><strong>Unavailable</strong><span>' + esc(message) + '</span></div>';
+      document.getElementById('settings-backup-list').innerHTML =
+        '<div class="settings-item"><strong>Unavailable</strong><span>' + esc(message) + '</span></div>';
+      showToast('Settings management: ' + message, 'error');
+    } finally {
+      if (triggerButton) clearButtonBusy(triggerButton);
+    }
+  }
+
+  function renderSettingsBackups() {
+    const container = document.getElementById('settings-backup-list');
+    if (!managedSettingsBackups.length) {
+      container.innerHTML = '<div class="settings-item"><div class="settings-item-main">' +
+        '<strong>No backups yet</strong><span>Create one before a major configuration change.</span>' +
+        '</div></div>';
+      return;
+    }
+    container.innerHTML = managedSettingsBackups.map((backup, index) =>
+      '<div class="settings-item"><div class="settings-item-main">' +
+      '<strong>' + esc(backup.created_at || backup.backup_id) + '</strong>' +
+      '<span>' + esc(backup.reason || 'snapshot') + ' · ' + esc(backup.backup_id) + '</span>' +
+      '</div><div class="settings-item-actions">' +
+      '<button class="btn btn-secondary btn-small" data-backup-index="' + index + '">Restore</button>' +
+      '</div></div>'
+    ).join('');
+  }
+
+  async function downloadAdminFile(url, fallbackName) {
+    const response = await apiFetch(url);
+    if (!response.ok) throw new Error(await readApiError(response, 'Download failed.'));
+    const disposition = response.headers.get('content-disposition') || '';
+    const match = disposition.match(/filename="?([^";]+)"?/i);
+    const blob = await response.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = objectUrl;
+    anchor.download = match?.[1] || fallbackName;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(objectUrl);
+  }
+
+  async function runSettingsDiagnostics(button) {
+    setButtonBusy(button, 'Checking...');
+    try {
+      const response = await apiFetch('/settings/diagnostics');
+      const diagnostics = await parseJSONResponse(response, 'Diagnostics failed.');
+      const checks = diagnostics.checks || [];
+      document.getElementById('settings-diagnostics-list').innerHTML = checks.map((check) =>
+        '<div class="settings-item"><div class="settings-item-main"><strong>' +
+        esc(check.name.replaceAll('_', ' ')) + '</strong><span>' + esc(check.status) +
+        '</span></div><span class="badge ' +
+        (check.status === 'error' ? 'badge-error' : 'badge-frame') + '">' +
+        esc(check.status) + '</span></div>'
+      ).join('');
+      showToast(
+        diagnostics.status === 'ok' ? 'Local diagnostics passed.' : 'Diagnostics found a problem.',
+        diagnostics.status === 'ok' ? 'done' : 'error',
+      );
+    } catch (error) {
+      document.getElementById('settings-diagnostics-list').innerHTML =
+        '<div class="settings-item"><strong>Diagnostics failed</strong><span>' +
+        esc(error?.message || 'Unknown error') + '</span></div>';
+      showToast(error?.message || 'Diagnostics failed.', 'error');
+    } finally {
+      clearButtonBusy(button);
+    }
+  }
+
+  document.getElementById('btn-settings-diagnostics').addEventListener('click', (event) => {
+    runSettingsDiagnostics(event.currentTarget);
+  });
+  document.getElementById('btn-settings-support').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    setButtonBusy(button, 'Preparing...');
+    try {
+      await downloadAdminFile('/settings/diagnostics/support-bundle', 'frameart-support.json');
+      showToast('Redacted support bundle downloaded.', 'done');
+    } catch (error) {
+      showToast(error?.message || 'Support bundle download failed.', 'error');
+    } finally {
+      clearButtonBusy(button);
+    }
+  });
+  document.getElementById('btn-settings-export').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    setButtonBusy(button, 'Exporting...');
+    try {
+      await downloadAdminFile('/settings/export', 'frameart-settings.json');
+      showToast('Non-secret settings exported.', 'done');
+    } catch (error) {
+      showToast(error?.message || 'Settings export failed.', 'error');
+    } finally {
+      clearButtonBusy(button);
+    }
+  });
+  document.getElementById('btn-settings-backup').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    setButtonBusy(button, 'Creating...');
+    try {
+      const response = await apiFetch('/settings/backups', { method: 'POST' });
+      const backup = await parseJSONResponse(response, 'Could not create backup.');
+      managedSettingsBackups = [backup, ...managedSettingsBackups].slice(0, 20);
+      renderSettingsBackups();
+      showToast('Settings backup created.', 'done');
+    } catch (error) {
+      showToast(error?.message || 'Could not create backup.', 'error');
+    } finally {
+      clearButtonBusy(button);
+    }
+  });
+  document.getElementById('settings-backup-list').addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-backup-index]');
+    if (!button) return;
+    const backup = managedSettingsBackups[Number(button.dataset.backupIndex)];
+    if (!backup || !window.confirm(
+      'Restore settings backup ' + backup.backup_id + '? Current settings will be backed up first.',
+    )) return;
+    setButtonBusy(button, 'Restoring...');
+    try {
+      const response = await apiFetch(
+        '/settings/backups/' + encodeURIComponent(backup.backup_id) + '/restore',
+        { method: 'POST' },
+      );
+      await parseJSONResponse(response, 'Could not restore backup.');
+      await loadManagementSettings();
+      await Promise.all([reloadRuntimeProviders(), reloadConfiguredTVs()]);
+      showToast('Settings backup restored.', 'done');
+    } catch (error) {
+      showToast(error?.message || 'Could not restore backup.', 'error');
+    } finally {
+      clearButtonBusy(button);
+    }
+  });
+  document.getElementById('btn-settings-import').addEventListener('click', () => {
+    document.getElementById('settings-import-file').click();
+  });
+  document.getElementById('settings-import-file').addEventListener('change', async (event) => {
+    const input = event.currentTarget;
+    const file = input.files?.[0];
+    if (!file) return;
+    try {
+      const payload = JSON.parse(await file.text());
+      if (!payload || typeof payload !== 'object' || typeof payload.settings !== 'object') {
+        throw new Error('Select a FrameArt settings export JSON file.');
+      }
+      if (!window.confirm(
+        'Import these non-secret settings? Provider keys are preserved and a backup is created first.',
+      )) return;
+      const response = await apiFetch('/settings/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      await parseJSONResponse(response, 'Settings import failed.');
+      await loadManagementSettings();
+      await Promise.all([reloadRuntimeProviders(), reloadConfiguredTVs()]);
+      showToast('Settings imported.', 'done');
+    } catch (error) {
+      showToast(error?.message || 'Settings import failed.', 'error');
+    } finally {
+      input.value = '';
+    }
+  });
+
+  function openProviderSettingsEditor(provider) {
+    editingProviderName = provider?.name || null;
+    const nameSelect = document.getElementById('provider-settings-name');
+    const configured = new Set(
+      (managedProviderSettings?.providers || []).map((item) => item.name),
+    );
+    const choices = editingProviderName
+      ? [editingProviderName]
+      : (managedProviderSettings?.available_types || []).filter((name) => !configured.has(name));
+    if (!choices.length) {
+      showToast('All available provider types are already configured.', 'warn');
+      return;
+    }
+    nameSelect.innerHTML = choices.map((name) =>
+      '<option value="' + esc(name) + '">' + esc(name) + '</option>'
+    ).join('');
+    nameSelect.disabled = Boolean(editingProviderName);
+    document.getElementById('provider-settings-title').textContent =
+      editingProviderName ? ('Edit ' + editingProviderName) : 'Add Provider';
+    document.getElementById('provider-settings-base-url').value = provider?.base_url || '';
+    document.getElementById('provider-settings-model').value = provider?.model || '';
+    document.getElementById('provider-settings-timeout').value = provider?.timeout || 120;
+    document.getElementById('provider-settings-models').value =
+      (provider?.models || []).join('\n');
+    document.getElementById('provider-settings-api-key').value = '';
+    const clearKey = document.getElementById('provider-settings-clear-key');
+    clearKey.checked = false;
+    clearKey.disabled = provider?.api_key_source === 'environment' || !provider?.has_api_key;
+    const keyState = provider?.has_api_key
+      ? ('A key is configured via ' + provider.api_key_source + '. Leave blank to keep it.')
+      : 'No API key is currently configured.';
+    document.getElementById('provider-settings-key-state').textContent = keyState;
+    setSettingsModalError('provider-settings', '');
+    openModal('provider-settings-modal', '#provider-settings-name');
+  }
+
+  async function saveProviderSettings() {
+    const button = document.getElementById('btn-provider-settings-save');
+    const name = document.getElementById('provider-settings-name').value;
+    const apiKey = document.getElementById('provider-settings-api-key').value.trim();
+    const models = document.getElementById('provider-settings-models').value
+      .split(/[\n,]+/)
+      .map((model) => model.trim())
+      .filter(Boolean);
+    const payload = {
+      base_url: document.getElementById('provider-settings-base-url').value.trim() || null,
+      model: document.getElementById('provider-settings-model').value.trim() || null,
+      timeout: Number(document.getElementById('provider-settings-timeout').value),
+      models,
+      clear_api_key: document.getElementById('provider-settings-clear-key').checked,
+    };
+    if (apiKey) payload.api_key = apiKey;
+    if (!editingProviderName) payload.name = name;
+
+    setSettingsModalError('provider-settings', '');
+    setButtonBusy(button, 'Saving...');
+    try {
+      const endpoint = editingProviderName
+        ? ('/settings/providers/' + encodeURIComponent(editingProviderName))
+        : '/settings/providers';
+      const response = await apiFetch(endpoint, {
+        method: editingProviderName ? 'PUT' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      managedProviderSettings = await parseJSONResponse(response, 'Could not save provider.');
+      renderSettingsProviders();
+      closeModal('provider-settings-modal');
+      await reloadRuntimeProviders();
+      showToast('Provider settings saved.', 'done');
+    } catch (error) {
+      setSettingsModalError('provider-settings', error?.message || 'Could not save provider.');
+    } finally {
+      clearButtonBusy(button);
+    }
+  }
+
+  document.getElementById('settings-provider-list').addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-provider-action]');
+    if (!button) return;
+    const provider = managedProviderSettings?.providers?.[Number(button.dataset.providerIndex)];
+    if (!provider) return;
+    const action = button.dataset.providerAction;
+    if (action === 'edit') {
+      openProviderSettingsEditor(provider);
+      return;
+    }
+    if (action === 'delete') {
+      if (!window.confirm('Delete provider ' + provider.name + ' and its managed key?')) return;
+      setButtonBusy(button, 'Deleting...');
+      try {
+        const response = await apiFetch(
+          '/settings/providers/' + encodeURIComponent(provider.name),
+          { method: 'DELETE' },
+        );
+        managedProviderSettings = await parseJSONResponse(response, 'Could not delete provider.');
+        renderSettingsProviders();
+        await reloadRuntimeProviders();
+        showToast('Provider deleted.', 'done');
+      } catch (error) {
+        showToast(error?.message || 'Could not delete provider.', 'error');
+      } finally {
+        clearButtonBusy(button);
+      }
+      return;
+    }
+    if (action === 'test') {
+      setButtonBusy(button, 'Testing...');
+      try {
+        const response = await apiFetch(
+          '/settings/providers/' + encodeURIComponent(provider.name) + '/test',
+          { method: 'POST' },
+        );
+        const result = await parseJSONResponse(response, 'Provider test failed.');
+        showToast(result.detail, result.ok ? 'done' : 'error');
+      } catch (error) {
+        showToast(error?.message || 'Provider test failed.', 'error');
+      } finally {
+        clearButtonBusy(button);
+      }
+    }
+  });
+
+  document.getElementById('btn-settings-add-provider').addEventListener('click', () => {
+    openProviderSettingsEditor(null);
+  });
+  document.getElementById('btn-provider-settings-cancel').addEventListener('click', () => {
+    closeModal('provider-settings-modal');
+  });
+  document.getElementById('btn-provider-settings-save').addEventListener(
+    'click',
+    saveProviderSettings,
+  );
+
+  document.getElementById('btn-settings-save-defaults').addEventListener('click', async () => {
+    const button = document.getElementById('btn-settings-save-defaults');
+    setButtonBusy(button, 'Saving...');
+    try {
+      const response = await apiFetch('/settings/defaults', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          provider: document.getElementById('settings-default-provider').value,
+          model: document.getElementById('settings-default-model').value.trim() || null,
+        }),
+      });
+      managedProviderSettings = await parseJSONResponse(response, 'Could not save defaults.');
+      renderSettingsProviders();
+      await reloadRuntimeProviders();
+      showToast('Generation defaults saved.', 'done');
+    } catch (error) {
+      showToast(error?.message || 'Could not save defaults.', 'error');
+    } finally {
+      clearButtonBusy(button);
+    }
+  });
+
+  function suggestedProfileId(name) {
+    const candidate = (name || 'frame_tv').toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 64);
+    return candidate || 'frame_tv';
+  }
+
+  function openTVSettingsEditor(tv, discoveredTV) {
+    editingTVProfileId = tv?.profile_id || null;
+    const profileId = document.getElementById('tv-settings-profile-id');
+    profileId.disabled = Boolean(editingTVProfileId);
+    profileId.value = editingTVProfileId || suggestedProfileId(discoveredTV?.name);
+    document.getElementById('tv-settings-title').textContent =
+      editingTVProfileId ? ('Edit ' + editingTVProfileId) : 'Add TV';
+    document.getElementById('tv-settings-ip').value = tv?.ip || discoveredTV?.ip || '';
+    document.getElementById('tv-settings-port').value = tv?.port || 8002;
+    document.getElementById('tv-settings-client-name').value = tv?.client_name || 'FrameArt';
+    document.getElementById('tv-settings-ssl').checked = tv ? tv.ssl : true;
+    setSettingsModalError('tv-settings', '');
+    openModal('tv-settings-modal', '#tv-settings-profile-id');
+  }
+
+  async function saveTVSettings() {
+    const button = document.getElementById('btn-tv-settings-save');
+    const profileId = document.getElementById('tv-settings-profile-id').value.trim();
+    const ip = normalizePrivateIPv4(document.getElementById('tv-settings-ip').value);
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(profileId)) {
+      setSettingsModalError('tv-settings', 'Profile ID may contain letters, numbers, _ and -.');
+      return;
+    }
+    if (!ip) {
+      setSettingsModalError('tv-settings', 'Enter an RFC1918 private IPv4 address.');
+      return;
+    }
+    const payload = {
+      ip,
+      port: Number(document.getElementById('tv-settings-port').value),
+      client_name: document.getElementById('tv-settings-client-name').value.trim(),
+      ssl: document.getElementById('tv-settings-ssl').checked,
+    };
+    if (!editingTVProfileId) payload.profile_id = profileId;
+
+    setSettingsModalError('tv-settings', '');
+    setButtonBusy(button, 'Saving...');
+    try {
+      const endpoint = editingTVProfileId
+        ? ('/settings/tvs/' + encodeURIComponent(editingTVProfileId))
+        : '/settings/tvs';
+      const response = await apiFetch(endpoint, {
+        method: editingTVProfileId ? 'PUT' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const result = await parseJSONResponse(response, 'Could not save TV.');
+      managedTVSettings = result.tvs || [];
+      renderSettingsTVSummary();
+      closeModal('tv-settings-modal');
+      await reloadConfiguredTVs();
+      showToast('TV profile saved.', 'done');
+    } catch (error) {
+      setSettingsModalError('tv-settings', error?.message || 'Could not save TV.');
+    } finally {
+      clearButtonBusy(button);
+    }
+  }
+
+  document.getElementById('settings-tv-list').addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-settings-tv-action]');
+    if (!button) return;
+    const tv = managedTVSettings[Number(button.dataset.settingsTvIndex)];
+    if (!tv) return;
+    const action = button.dataset.settingsTvAction;
+    if (action === 'edit') {
+      openTVSettingsEditor(tv, null);
+      return;
+    }
+    if (action === 'delete') {
+      if (!window.confirm('Delete TV profile ' + tv.profile_id + '? Pairing tokens are retained.')) return;
+      setButtonBusy(button, 'Deleting...');
+      try {
+        const response = await apiFetch(
+          '/settings/tvs/' + encodeURIComponent(tv.profile_id),
+          { method: 'DELETE' },
+        );
+        const result = await parseJSONResponse(response, 'Could not delete TV.');
+        managedTVSettings = result.tvs || [];
+        renderSettingsTVSummary();
+        await reloadConfiguredTVs();
+        showToast('TV profile deleted.', 'done');
+      } catch (error) {
+        showToast(error?.message || 'Could not delete TV.', 'error');
+      } finally {
+        clearButtonBusy(button);
+      }
+      return;
+    }
+    if (action === 'pair' && !window.confirm(
+      'Start pairing with ' + tv.profile_id + '? Accept the prompt shown on the TV.',
+    )) return;
+
+    setButtonBusy(button, action === 'pair' ? 'Pairing...' : 'Testing...');
+    try {
+      const response = await apiFetch(
+        '/settings/tvs/' + encodeURIComponent(tv.profile_id) + '/' + action,
+        { method: action === 'pair' ? 'POST' : 'GET' },
+      );
+      const result = await parseJSONResponse(response, 'TV ' + action + ' failed.');
+      showToast(result.detail, result.ok ? 'done' : 'error');
+      if (action === 'pair' && result.ok) await loadManagementSettings();
+    } catch (error) {
+      showToast(error?.message || ('TV ' + action + ' failed.'), 'error');
+    } finally {
+      clearButtonBusy(button);
+    }
+  });
+
+  document.getElementById('btn-settings-add-tv').addEventListener('click', () => {
+    openTVSettingsEditor(null, null);
+  });
+  document.getElementById('btn-tv-settings-cancel').addEventListener('click', () => {
+    closeModal('tv-settings-modal');
+  });
+  document.getElementById('btn-tv-settings-save').addEventListener('click', saveTVSettings);
+  document.getElementById('btn-settings-refresh').addEventListener('click', (event) => {
+    loadManagementSettings(event.currentTarget);
+  });
+
+  // =========================================================================
+  // Public domain catalog
+  // =========================================================================
+  const publicStatus = document.getElementById('public-status');
+  const publicStatusText = document.getElementById('public-status-text');
+
+  function showPublicStatus(msg, cls) {
+    publicStatus.className = 'status-bar visible' + (cls ? ' ' + cls : '');
+    publicStatusText.textContent = msg;
+  }
+
+  async function readApiError(resp, fallbackPrefix) {
+    const contentType = resp.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+      const err = await resp.json().catch(() => ({}));
+      if (typeof err?.detail === 'string') return err.detail;
+      if (err?.detail && typeof err.detail === 'object') return JSON.stringify(err.detail);
+      if (typeof err?.error === 'string') return err.error;
+    }
+    const text = await resp.text().catch(() => '');
+    const trimmed = (text || '').trim();
+    if (trimmed) return trimmed.slice(0, 300);
+    return fallbackPrefix + ' ' + resp.status;
+  }
+
+  function renderPublicResults(items) {
+    const grid = document.getElementById('public-grid');
+    const empty = document.getElementById('public-empty');
+
+    if (!items.length) {
+      grid.innerHTML = '';
+      empty.textContent = 'No public-domain results found for this query.';
+      empty.style.display = 'block';
+      return;
+    }
+
+    empty.style.display = 'none';
+    grid.innerHTML = items.map(item => {
+      const title = esc(item.title || (item.source + ' ' + item.artwork_id));
+      const artist = esc(item.artist || 'Unknown artist');
+      const date = esc(item.date || '');
+      const meta = date ? (artist + ' · ' + date) : artist;
+      const thumb = esc(item.thumbnail_url || item.image_url || '');
+      const link = esc(item.source_url || '#');
+      return `
+        <div class="gallery-item">
+          <img src="${thumb}" alt="${title}" loading="lazy" onerror="this.style.display='none'">
+          <div class="info">
+            <div class="prompt">${title}</div>
+            <div class="meta">${meta}</div>
+          </div>
+          <div class="actions">
+            <button class="btn btn-small btn-pd-display"
+                    data-source="${esc(item.source)}"
+                    data-id="${esc(item.artwork_id)}">
+              Display on TV</button>
+            <a class="btn btn-secondary btn-small" href="${link}" target="_blank" rel="noopener noreferrer">
+              Source</a>
+          </div>
+        </div>
+      `;
+    }).join('');
+    animateStaggeredChildren(grid, '.gallery-item');
+
+    grid.querySelectorAll('.btn-pd-display').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        const source = e.currentTarget.dataset.source;
+        const artworkId = e.currentTarget.dataset.id;
+        await applyPublicArtwork(source, artworkId, e.currentTarget);
+      });
+    });
+  }
+
+  async function searchPublicDomain() {
+    const searchBtn = document.getElementById('btn-public-search');
+    const source = document.getElementById('public-source').value;
+    const q = document.getElementById('public-query').value.trim();
+    const grid = document.getElementById('public-grid');
+    const empty = document.getElementById('public-empty');
+
+    if (!q) {
+      showPublicStatus('Enter search text first.', 'error');
+      return;
+    }
+
+    showPublicStatus('Searching ' + source.toUpperCase() + '...', '');
+    setButtonBusy(searchBtn, 'Searching...');
+    grid.innerHTML = '<div class="empty">Searching...</div>';
+    empty.style.display = 'none';
+
+    try {
+      const resp = await apiFetch(
+        '/catalog/search?source=' + encodeURIComponent(source) +
+        '&q=' + encodeURIComponent(q) + '&limit=20'
+      );
+      if (!resp.ok) {
+        const detail = await readApiError(resp, 'Server returned');
+        throw new Error(detail);
+      }
+      const items = await resp.json();
+      renderPublicResults(items);
+      showPublicStatus('Found ' + items.length + ' result(s).', items.length ? 'done' : '');
+      if (items.length) showToast('Public results updated (' + items.length + ').', 'done');
+    } catch (e) {
+      grid.innerHTML = '';
+      empty.textContent = 'Search failed.';
+      empty.style.display = 'block';
+      showPublicStatus('Search failed: ' + e.message, 'error');
+      showToast('Public search failed: ' + e.message, 'error');
+    } finally {
+      clearButtonBusy(searchBtn);
+    }
+  }
+
+  async function applyPublicArtwork(source, artworkId, btn) {
+    const tvIp = document.getElementById('public-tv-select').value;
+    const matte = document.getElementById('public-matte-select').value || 'none';
+    if (!tvIp) {
+      showPublicStatus('Select a TV first.', 'error');
+      return;
+    }
+
+    setButtonBusy(btn, 'Applying...');
+    showPublicStatus('Downloading and uploading artwork...', '');
+    try {
+      const resp = await apiFetch('/catalog/apply', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          source: source,
+          artwork_id: artworkId,
+          tv_ip: tvIp,
+          matte: matte,
+        }),
+      });
+      if (!resp.ok) {
+        const detail = await readApiError(resp, 'Server returned');
+        throw new Error(detail);
+      }
+
+      const data = await resp.json();
+      showPublicStatus('Displayed on TV. Job ' + data.job_id, 'done');
+      showToast('Displayed on TV from public catalog.', 'done');
+    } catch (e) {
+      showPublicStatus('Failed: ' + e.message, 'error');
+      showToast('Failed to display public artwork: ' + e.message, 'error');
+    } finally {
+      clearButtonBusy(btn);
+    }
+  }
+
+  document.getElementById('btn-public-search').addEventListener('click', searchPublicDomain);
+  document.getElementById('public-query').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      searchPublicDomain();
+    }
+  });
+  document.getElementById('public-tv-select').addEventListener('change', (e) => {
+    loadMattesForSelect('public-matte-select', e.target.value);
+  });
+  document.getElementById('own-upload-tv-select').addEventListener('change', (e) => {
+    loadMattesForSelect('own-upload-matte-select', e.target.value);
+  });
+  document.getElementById('edit-upload-tv-select').addEventListener('change', (e) => {
+    loadMattesForSelect('edit-upload-matte-select', e.target.value);
+  });
+  document.getElementById('remix-tv-select').addEventListener('change', (e) => {
+    loadMattesForSelect('remix-matte-select', e.target.value);
+  });
+
+  async function uploadOwnImage() {
+    const fileInput = document.getElementById('own-image-file');
+    const tvIp = document.getElementById('own-upload-tv-select').value;
+    const matte = document.getElementById('own-upload-matte-select').value || 'none';
+    const statusEl = document.getElementById('own-upload-status');
+    const statusTextEl = document.getElementById('own-upload-status-text');
+    const btn = document.getElementById('btn-own-upload');
+
+    const file = fileInput.files && fileInput.files[0] ? fileInput.files[0] : null;
+    if (!file) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Please choose a JPG or PNG image.';
+      return;
+    }
+    if (!tvIp) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Please select a TV.';
+      return;
+    }
+
+    const formData = new FormData();
+    formData.append('image', file);
+    formData.append('tv_ip', tvIp);
+    formData.append('matte', matte);
+
+    setButtonBusy(btn, 'Processing...');
+    statusEl.className = 'status-bar visible';
+    statusTextEl.textContent = 'Processing image, cropping/upscaling, and uploading...';
+
+    try {
+      const resp = await apiFetch('/upload-and-apply', {
+        method: 'POST',
+        body: formData,
+      });
+      if (!resp.ok) {
+        const detail = await readApiError(resp, 'Server returned');
+        throw new Error(detail);
+      }
+      const data = await resp.json();
+      statusEl.className = 'status-bar visible done';
+      statusTextEl.textContent = 'Displayed on TV. Job ' + data.job_id;
+      showToast('Uploaded and displayed your image on TV.', 'done');
+      fileInput.value = '';
+      loadGallery();
+    } catch (e) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Failed: ' + e.message;
+      showToast('Image upload failed: ' + e.message, 'error');
+    } finally {
+      clearButtonBusy(btn);
+    }
+  }
+
+  document.getElementById('btn-own-upload').addEventListener('click', uploadOwnImage);
+
+  async function uploadEditImage() {
+    const fileInput = document.getElementById('edit-image-file');
+    const promptInput = document.getElementById('edit-prompt');
+    const providerInput = document.getElementById('edit-provider');
+    const modelInput = document.getElementById('edit-model');
+    const tvIp = document.getElementById('edit-upload-tv-select').value;
+    const matte = document.getElementById('edit-upload-matte-select').value || 'none';
+    const statusEl = document.getElementById('edit-upload-status');
+    const statusTextEl = document.getElementById('edit-upload-status-text');
+    const btn = document.getElementById('btn-edit-upload');
+
+    const file = fileInput.files && fileInput.files[0] ? fileInput.files[0] : null;
+    const editPrompt = promptInput.value.trim();
+    if (!file) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Please choose a JPG or PNG image.';
+      return;
+    }
+    if (!editPrompt) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Please provide an edit prompt.';
+      return;
+    }
+    const noUpload = !tvIp;
+
+    const formData = new FormData();
+    formData.append('image', file);
+    formData.append('prompt', editPrompt);
+    if (tvIp) formData.append('tv_ip', tvIp);
+    formData.append('matte', matte);
+    if (noUpload) formData.append('no_upload', 'true');
+    if (providerInput.value) formData.append('provider', providerInput.value);
+    if (modelInput.value) formData.append('model', modelInput.value);
+
+    setButtonBusy(btn, 'Editing...');
+    statusEl.className = 'status-bar visible';
+    statusTextEl.textContent = noUpload
+      ? 'Editing image and preparing gallery output...'
+      : 'Editing image and preparing TV output...';
+
+    try {
+      const resp = await apiFetch('/edit-and-apply', {
+        method: 'POST',
+        body: formData,
+      });
+      if (!resp.ok) {
+        const detail = await readApiError(resp, 'Server returned');
+        throw new Error(detail);
+      }
+      const data = await resp.json();
+      statusEl.className = 'status-bar visible done';
+      statusTextEl.textContent = noUpload
+        ? ('Edited image saved. Job ' + data.job_id)
+        : ('Edited image displayed on TV. Job ' + data.job_id);
+      showToast(
+        noUpload ? 'Edited image saved to Gallery.' : 'Edited image displayed on TV.',
+        'done'
+      );
+      fileInput.value = '';
+      promptInput.value = '';
+      loadGallery();
+    } catch (e) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Failed: ' + e.message;
+      showToast('Image edit failed: ' + e.message, 'error');
+    } finally {
+      clearButtonBusy(btn);
+    }
+  }
+
+  document.getElementById('btn-edit-upload').addEventListener('click', uploadEditImage);
+
+  // =========================================================================
+  // Remix modal (edit / generate from existing library or TV artwork)
+  // =========================================================================
+  let remixSource = null;
+
+  window.openRemixFromJob = function(jobId, label) {
+    remixSource = { kind: 'job', jobId: jobId, label: label || jobId };
+    document.getElementById('remix-source-label').textContent = 'Library · ' + (label || jobId);
+    document.getElementById('remix-status').classList.remove('visible');
+    refreshTVSelects();
+
+    const remixTvSel = document.getElementById('remix-tv-select');
+    const rememberedTv = localStorage.getItem(storageKeys.tvRemix);
+    if (rememberedTv && [...remixTvSel.options].some((o) => o.value === rememberedTv)) {
+      remixTvSel.value = rememberedTv;
+    }
+    loadMattesForSelect('remix-matte-select', remixTvSel.value || knownTVs[0]?.ip);
+    openModal('remix-modal', '#remix-prompt');
+  };
+
+  window.openRemixFromTVArt = function(contentId, tvIp) {
+    remixSource = { kind: 'tv_art', contentId: contentId, tvIp: tvIp };
+    document.getElementById('remix-source-label').textContent = 'TV · ' + contentId;
+    document.getElementById('remix-status').classList.remove('visible');
+    refreshTVSelects();
+
+    const remixTvSel = document.getElementById('remix-tv-select');
+    if (tvIp && [...remixTvSel.options].some((o) => o.value === tvIp)) {
+      remixTvSel.value = tvIp;
+    } else {
+      const rememberedTv = localStorage.getItem(storageKeys.tvRemix);
+      if (rememberedTv && [...remixTvSel.options].some((o) => o.value === rememberedTv)) {
+        remixTvSel.value = rememberedTv;
+      }
+    }
+    loadMattesForSelect('remix-matte-select', remixTvSel.value || tvIp || knownTVs[0]?.ip);
+    openModal('remix-modal', '#remix-prompt');
+  };
+
+  async function applyRemixFromExisting() {
+    if (!remixSource) return;
+
+    const promptInput = document.getElementById('remix-prompt');
+    const providerInput = document.getElementById('remix-provider');
+    const modelInput = document.getElementById('remix-model');
+    const tvInput = document.getElementById('remix-tv-select');
+    const matteInput = document.getElementById('remix-matte-select');
+    const statusEl = document.getElementById('remix-status');
+    const statusTextEl = document.getElementById('remix-status-text');
+    const btn = document.getElementById('btn-remix-apply');
+
+    const prompt = promptInput.value.trim();
+    if (!prompt) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Please provide an edit prompt.';
+      return;
+    }
+
+    const tvIp = tvInput.value || '';
+    const noUpload = !tvIp;
+    const body = {
+      prompt: prompt,
+      matte: matteInput.value || 'none',
+      no_upload: noUpload,
+    };
+    if (providerInput.value) body.provider = providerInput.value;
+    if (modelInput.value) body.model = modelInput.value;
+    if (tvIp) body.tv_ip = tvIp;
+
+    let endpoint = '';
+    if (remixSource.kind === 'job') {
+      endpoint = '/jobs/' + encodeURIComponent(remixSource.jobId) + '/edit-and-apply';
+    } else if (remixSource.kind === 'tv_art') {
+      endpoint = '/tv/art/edit-and-apply';
+      body.content_id = remixSource.contentId;
+      if (remixSource.tvIp) body.source_tv_ip = remixSource.tvIp;
+    } else {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Invalid remix source.';
+      return;
+    }
+
+    setButtonBusy(btn, 'Creating...');
+    statusEl.className = 'status-bar visible';
+    statusTextEl.textContent = noUpload
+      ? 'Creating new image and saving to Gallery...'
+      : 'Creating new image and displaying on TV...';
+
+    try {
+      const resp = await apiFetch(endpoint, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body),
+      });
+      if (!resp.ok) {
+        const detail = await readApiError(resp, 'Server returned');
+        throw new Error(detail);
+      }
+      const data = await resp.json();
+      statusEl.className = 'status-bar visible done';
+      statusTextEl.textContent = noUpload
+        ? ('Created new image and saved to Gallery. Job ' + data.job_id)
+        : ('Created new image and displayed on TV. Job ' + data.job_id);
+      showToast(
+        noUpload ? 'New image created from existing art.' : 'New image created and displayed on TV.',
+        'done'
+      );
+      loadGallery();
+      if (getActivePageName() === 'tvs') loadTVArt();
+    } catch (e) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Failed: ' + e.message;
+      showToast('Failed to create image from existing art: ' + e.message, 'error');
+    } finally {
+      clearButtonBusy(btn);
+    }
+  }
+
+  document.getElementById('btn-remix-cancel').addEventListener('click', () => {
+    closeModal('remix-modal');
+  });
+  document.getElementById('btn-remix-apply').addEventListener('click', applyRemixFromExisting);
+
+  // =========================================================================
+  // Upload-to-TV modal (from gallery)
+  // =========================================================================
+  let uploadJobId = null;
+
+  window.openUploadModal = function(jobId, promptLabel) {
+    uploadJobId = jobId;
+    document.getElementById('upload-job-id').textContent = promptLabel;
+    document.getElementById('upload-status').classList.remove('visible');
+
+    // Populate TV select with known TVs
+    refreshTVSelects();
+    const uploadTvSel = document.getElementById('upload-tv-select');
+    const rememberedTv = localStorage.getItem(storageKeys.tvUpload);
+    if (rememberedTv && [...uploadTvSel.options].some(o => o.value === rememberedTv)) {
+      uploadTvSel.value = rememberedTv;
+    }
+
+    if (!knownTVs.length) {
+      document.getElementById('upload-status').className = 'status-bar visible error';
+      document.getElementById('upload-status-text').textContent =
+        'No TVs available. Configure one or use Scan Network first.';
+    }
+
+    // Try to load mattes for selected TV, fallback to first known TV.
+    loadMattesForSelect('upload-matte-select', uploadTvSel.value || knownTVs[0]?.ip);
+
+    openModal('upload-modal', '#upload-tv-select');
+  };
+
+  document.getElementById('btn-upload-cancel').addEventListener('click', () => {
+    closeModal('upload-modal');
+  });
+
+  document.getElementById('upload-tv-select').addEventListener('change', (e) => {
+    loadMattesForSelect('upload-matte-select', e.target.value);
+  });
+
+  document.getElementById('btn-upload-apply').addEventListener('click', async () => {
+    const tvIp = document.getElementById('upload-tv-select').value;
+    const matte = document.getElementById('upload-matte-select').value || 'none';
+    const statusEl = document.getElementById('upload-status');
+    const statusTextEl = document.getElementById('upload-status-text');
+
+    if (!tvIp) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Please select a TV.';
+      return;
+    }
+
+    const btn = document.getElementById('btn-upload-apply');
+    setButtonBusy(btn, 'Uploading...');
+    statusEl.className = 'status-bar visible';
+    statusTextEl.textContent = 'Uploading...';
+
+    try {
+      const resp = await apiFetch('/jobs/' + uploadJobId + '/apply', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ tv_ip: tvIp, matte: matte }),
+      });
+
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.detail || 'Server returned ' + resp.status);
+      }
+
+      statusEl.className = 'status-bar visible done';
+      statusTextEl.textContent = 'Uploaded successfully!';
+      showToast('Artwork uploaded to TV.', 'done');
+    } catch (e) {
+      statusEl.className = 'status-bar visible error';
+      statusTextEl.textContent = 'Failed: ' + e.message;
+      showToast('Upload to TV failed: ' + e.message, 'error');
+    } finally {
+      clearButtonBusy(btn);
+    }
+  });
+
+  // =========================================================================
+  // TV Discovery
+  // =========================================================================
+  const tvDiscoveryStatus = document.getElementById('tv-discovery-status');
+  const tvDiscoveryStatusText = document.getElementById('tv-discovery-status-text');
+
+  function showTVDiscoveryStatus(message, kind) {
+    tvDiscoveryStatus.className = 'status-bar visible' + (kind ? ' ' + kind : '');
+    tvDiscoveryStatusText.textContent = message;
+  }
+
+  function normalizePrivateIPv4(value) {
+    const parts = value.trim().split('.');
+    if (parts.length !== 4 || parts.some((part) => !/^\d{1,3}$/.test(part))) return null;
+    const octets = parts.map(Number);
+    if (octets.some((part) => part < 0 || part > 255)) return null;
+    const [first, second] = octets;
+    const isPrivate = first === 10 ||
+      (first === 172 && second >= 16 && second <= 31) ||
+      (first === 192 && second === 168);
+    return isPrivate ? octets.join('.') : null;
+  }
+
+  function showManualTVError(message) {
+    const status = document.getElementById('manual-tv-error');
+    document.getElementById('manual-tv-error-text').textContent = message || '';
+    status.classList.toggle('visible', Boolean(message));
+  }
+
+  document.getElementById('btn-add-tv').addEventListener('click', () => {
+    showManualTVError('');
+    document.getElementById('manual-tv-name').value = '';
+    document.getElementById('manual-tv-ip').value = '';
+    openModal('add-tv-modal', '#manual-tv-name');
+  });
+
+  document.getElementById('btn-add-tv-cancel').addEventListener('click', () => {
+    closeModal('add-tv-modal');
+  });
+
+  function addManualTV() {
+    const nameInput = document.getElementById('manual-tv-name');
+    const ipInput = document.getElementById('manual-tv-ip');
+    const ip = normalizePrivateIPv4(ipInput.value);
+    if (!ip) {
+      showManualTVError('Enter an RFC1918 private IPv4 address, such as 192.168.1.100.');
+      ipInput.focus();
+      return;
+    }
+    if (knownTVs.some((tv) => tv.ip === ip)) {
+      showManualTVError('That TV is already in the list.');
+      ipInput.focus();
+      return;
+    }
+
+    const name = nameInput.value.trim() || ('Frame TV ' + ip);
+    addTVs([{ ip, name, model: null, frame_tv: true }], 'manual');
+    closeModal('add-tv-modal');
+    showToast('Added ' + name + ' for this session.', 'done');
+  }
+
+  document.getElementById('btn-add-tv-apply').addEventListener('click', addManualTV);
+  document.getElementById('manual-tv-ip').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      addManualTV();
+    }
+  });
+
+  const btnDiscover = document.getElementById('btn-discover');
+  btnDiscover.addEventListener('click', async () => {
+    const empty = document.getElementById('tv-empty');
+    setButtonBusy(btnDiscover, 'Scanning...');
+    showTVDiscoveryStatus('Scanning the local network for Samsung TVs...', '');
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 45000);
+
+    try {
+      const resp = await apiFetch('/tv/discover?timeout=4', { signal: controller.signal });
+      const tvs = await parseJSONResponse(resp, 'TV discovery request failed.');
+      if (!Array.isArray(tvs)) throw new Error('The server returned an invalid discovery response.');
+      if (!tvs.length && !knownTVs.length) {
+        empty.textContent = 'No Samsung TVs found on network.';
+        empty.style.display = 'block';
+        showTVDiscoveryStatus(
+          'No TVs responded. If FrameArt runs in Docker, use frameart-api-lan, or add the TV by IP.',
+          '',
+        );
+        return;
+      }
+      addTVs(tvs, 'discovered');
+      showTVDiscoveryStatus(
+        tvs.length ? ('Found ' + tvs.length + ' TV(s).') : 'Scan complete; no new TVs found.',
+        'done',
+      );
+      showToast(tvs.length ? ('Found ' + tvs.length + ' TV(s).') : 'Scan complete.', 'done');
+    } catch (e) {
+      let message = e && e.message ? e.message : 'Unknown discovery error.';
+      if (e && e.name === 'AbortError') {
+        message = 'Discovery timed out after 45 seconds. Add the TV by IP or check LAN access.';
+      } else if (/failed to fetch|networkerror/i.test(message)) {
+        message = 'Could not reach the FrameArt API. Confirm the server is running and reload this page.';
+      }
+      showTVDiscoveryStatus('Discovery failed: ' + message, 'error');
+      showToast('TV discovery failed: ' + message, 'error');
+    } finally {
+      window.clearTimeout(timer);
+      clearButtonBusy(btnDiscover);
+    }
+  });
+
+  // =========================================================================
+  // TV Art — list art on TV
+  // =========================================================================
+  document.getElementById('tv-art-select').addEventListener('change', () => {
+    selectedTVArtIds = new Set();
+    loadedTVArtById = {};
+    updateTVSelectionUI();
+    document.getElementById('tv-art-grid').innerHTML = '';
+    const empty = document.getElementById('tv-art-empty');
+    empty.textContent = 'Select a TV and click "Load Art".';
+    empty.style.display = 'block';
+  });
+  document.getElementById('btn-load-art').addEventListener('click', loadTVArt);
+  document.getElementById('btn-delete-selected').addEventListener('click', deleteSelectedTVArt);
+  document.getElementById('btn-tv-art-select-all').addEventListener('click', () => setAllTVArtSelections(true));
+  document.getElementById('btn-tv-art-clear').addEventListener('click', () => setAllTVArtSelections(false));
+  document.getElementById('btn-tv-delete-selected-inline').addEventListener('click', deleteSelectedTVArt);
+  document.getElementById('btn-tv-clear-selection-inline').addEventListener('click', () => setAllTVArtSelections(false));
+  document.getElementById('btn-tv-display-selected').addEventListener('click', (e) => displaySelectedTVArt(e.currentTarget));
+  document.getElementById('btn-tv-matte-selected').addEventListener('click', openMatteForSelectedTVArt);
+  document.getElementById('btn-delete-all-art').addEventListener('click', deleteAllTVArt);
+  document.getElementById('btn-delete-all-except-fav').addEventListener('click', deleteAllExceptFavoritesTVArt);
+
+  function updateTVSelectionUI() {
+    const btn = document.getElementById('btn-delete-selected');
+    const inlineDeleteBtn = document.getElementById('btn-tv-delete-selected-inline');
+    const inlineDisplayBtn = document.getElementById('btn-tv-display-selected');
+    const inlineMatteBtn = document.getElementById('btn-tv-matte-selected');
+    const inlineClearBtn = document.getElementById('btn-tv-clear-selection-inline');
+    const bar = document.getElementById('tv-selection-bar');
+    const text = document.getElementById('tv-selection-text');
+    const n = selectedTVArtIds.size;
+    const hasSelection = n > 0;
+    const isSingle = n === 1;
+    const label = n === 1 ? '1 artwork selected on TV' : (n + ' artwork selected on TV');
+
+    btn.disabled = n === 0;
+    btn.textContent = n > 0 ? ('Delete Selected (' + n + ')') : 'Delete Selected';
+    inlineDeleteBtn.disabled = !hasSelection;
+    inlineDisplayBtn.disabled = !isSingle;
+    inlineMatteBtn.disabled = !isSingle;
+    inlineClearBtn.disabled = !hasSelection;
+    text.textContent = label;
+    bar.classList.toggle('visible', hasSelection);
+  }
+
+  function setAllTVArtSelections(checked) {
+    document.querySelectorAll('.tv-art-select-item').forEach((el) => {
+      const cid = el.dataset.contentId;
+      if (!cid) return;
+      el.checked = checked;
+      const card = el.closest('.tv-art-item');
+      if (card) card.classList.toggle('selected', checked);
+      if (checked) selectedTVArtIds.add(cid);
+      else selectedTVArtIds.delete(cid);
+    });
+    updateTVSelectionUI();
+  }
+
+  async function loadTVArt() {
+    const tvIp = document.getElementById('tv-art-select').value;
+    const grid = document.getElementById('tv-art-grid');
+    const empty = document.getElementById('tv-art-empty');
+
+    selectedTVArtIds = new Set();
+    loadedTVArtById = {};
+    updateTVSelectionUI();
+
+    if (!tvIp) {
+      empty.textContent = 'Please select a TV.';
+      empty.style.display = 'block';
+      grid.innerHTML = '';
+      return;
+    }
+
+    grid.innerHTML = gallerySkeleton(8);
+    empty.style.display = 'none';
+
+    try {
+      const resp = await apiFetch('/tv/art?tv_ip=' + encodeURIComponent(tvIp));
+      if (!resp.ok) throw new Error('Server returned ' + resp.status);
+      const artworks = await resp.json();
+
+      if (!artworks.length) {
+        grid.innerHTML = '';
+        empty.textContent = 'No artwork on this TV.';
+        empty.style.display = 'block';
+        return;
+      }
+
+      loadedTVArtById = Object.fromEntries(artworks.map(a => [a.content_id, a]));
+
+      grid.innerHTML = artworks.map(a => `
+        <div class="tv-art-item">
+          <label class="art-select-row">
+            <input type="checkbox" class="tv-art-select-item" data-content-id="${esc(a.content_id)}">
+            <span class="art-id">${esc(a.content_id)}</span>
+            ${a.is_favourite ? '<span class="art-fav">\u2665 favourite</span>' : ''}
+          </label>
+          <div class="art-thumb-wrap">
+            <img class="art-thumb"
+                 src="/tv/art/thumbnail?tv_ip=${encodeURIComponent(tvIp)}&content_id=${encodeURIComponent(a.content_id)}"
+                 alt="Thumbnail ${esc(a.content_id)}"
+                 loading="lazy"
+                 onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
+            <div class="art-thumb-fallback">No thumbnail</div>
+          </div>
+          <div class="art-actions">
+            <button class="btn btn-small"
+                    onclick="displayTVArt('${esc(a.content_id)}', '${esc(tvIp)}', this)">
+              Display on TV</button>
+            <button class="btn btn-secondary btn-small"
+                    onclick="openMatteModal('${esc(a.content_id)}', '${esc(tvIp)}')">
+              Change Matte</button>
+            <button class="btn btn-secondary btn-small"
+                    onclick="openRemixFromTVArt('${esc(a.content_id)}', '${esc(tvIp)}')">
+              Edit / Generate New</button>
+            <button class="btn btn-danger btn-small"
+                    onclick="deleteTVArt('${esc(a.content_id)}', '${esc(tvIp)}', ${a.is_favourite})">
+              Delete</button>
+          </div>
+        </div>
+      `).join('');
+      animateStaggeredChildren(grid, '.tv-art-item');
+
+      grid.querySelectorAll('.tv-art-select-item').forEach(el => {
+        el.addEventListener('change', (e) => {
+          const checkbox = e.target;
+          const card = checkbox.closest('.tv-art-item');
+          const cid = checkbox.dataset.contentId;
+          if (!cid) return;
+          if (checkbox.checked) {
+            selectedTVArtIds.add(cid);
+          } else {
+            selectedTVArtIds.delete(cid);
+          }
+          if (card) card.classList.toggle('selected', checkbox.checked);
+          updateTVSelectionUI();
+        });
+      });
+    } catch (e) {
+      grid.innerHTML = '<div class="empty">Failed to load art: ' + esc(e.message) + '</div>';
+      showToast('Failed to load TV art: ' + e.message, 'error');
+    } finally {
+      updateTVSelectionUI();
+    }
+  }
+
+  // =========================================================================
+  // Display Existing TV Art
+  // =========================================================================
+  window.displayTVArt = async function(contentId, tvIp, btn) {
+    setButtonBusy(btn, 'Displaying...');
+    try {
+      const resp = await apiFetch('/tv/art/display', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          content_id: contentId,
+          tv_ip: tvIp,
+        }),
+      });
+      if (!resp.ok) throw new Error('Server returned ' + resp.status);
+      showToast('TV switched to ' + contentId + '.', 'done');
+    } catch (e) {
+      showToast('Failed to display artwork: ' + e.message, 'error');
+    } finally {
+      clearButtonBusy(btn);
+    }
+  };
+
+  function getSingleSelectedTVArtId() {
+    const selected = Array.from(selectedTVArtIds);
+    return selected.length === 1 ? selected[0] : null;
+  }
+
+  async function displaySelectedTVArt(btn) {
+    const tvIp = document.getElementById('tv-art-select').value;
+    const contentId = getSingleSelectedTVArtId();
+    if (!tvIp || !contentId) return;
+    await window.displayTVArt(contentId, tvIp, btn);
+  }
+
+  function openMatteForSelectedTVArt() {
+    const tvIp = document.getElementById('tv-art-select').value;
+    const contentId = getSingleSelectedTVArtId();
+    if (!tvIp || !contentId) return;
+    window.openMatteModal(contentId, tvIp);
+  }
+
+  // =========================================================================
+  // Delete TV Art
+  // =========================================================================
+  window.deleteTVArt = async function(contentId, tvIp, isFav) {
+    const msg = isFav
+      ? 'This artwork is favourited. Delete anyway? (content: ' + contentId + ')'
+      : 'Delete artwork ' + contentId + ' from TV?';
+    if (!confirm(msg)) return;
+
+    try {
+      const resp = await apiFetch('/tv/art/delete', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          content_ids: [contentId],
+          tv_ip: tvIp,
+          include_favorites: isFav,
+        }),
+      });
+      if (!resp.ok) throw new Error('Server returned ' + resp.status);
+      const data = await resp.json();
+      if (data.deleted.length) {
+        loadTVArt(); // Refresh the list
+        showToast('Artwork deleted from TV.', 'done');
+      } else if (data.skipped_favorites.length) {
+        showToast('Artwork was skipped because it is a favourite.', 'warn');
+      }
+    } catch (e) {
+      showToast('Failed to delete: ' + e.message, 'error');
+    }
+  };
+
+  async function deleteSelectedTVArt() {
+    const tvIp = document.getElementById('tv-art-select').value;
+    const selectedIds = Array.from(selectedTVArtIds);
+    if (!tvIp || !selectedIds.length) return;
+
+    const favCount = selectedIds.filter(cid => loadedTVArtById[cid]?.is_favourite).length;
+    const msg = favCount
+      ? ('Delete ' + selectedIds.length + ' selected artworks? This includes ' + favCount + ' favourite(s).')
+      : ('Delete ' + selectedIds.length + ' selected artworks from TV?');
+    if (!confirm(msg)) return;
+
+    const btn = document.getElementById('btn-delete-selected');
+    setButtonBusy(btn, 'Deleting...');
+
+    try {
+      const resp = await apiFetch('/tv/art/delete', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          content_ids: selectedIds,
+          tv_ip: tvIp,
+          include_favorites: favCount > 0,
+        }),
+      });
+      if (!resp.ok) throw new Error('Server returned ' + resp.status);
+      const data = await resp.json();
+      if (data.deleted.length) {
+        await loadTVArt();
+        showToast('Deleted selected artwork from TV.', 'done');
+      }
+      if (data.skipped_favorites.length) {
+        showToast('Some favourites were skipped: ' + data.skipped_favorites.join(', '), 'warn');
+      }
+    } catch (e) {
+      showToast('Failed to delete selected artwork: ' + e.message, 'error');
+    } finally {
+      clearButtonBusy(btn);
+      updateTVSelectionUI();
+    }
+  }
+
+  async function deleteAllTVArt() {
+    const tvIp = document.getElementById('tv-art-select').value;
+    if (!tvIp) return;
+    const allIds = Object.keys(loadedTVArtById);
+    if (!allIds.length) { showToast('No artwork loaded. Click "Load Art" first.', 'warn'); return; }
+    if (!confirm('Delete ALL ' + allIds.length + ' artworks from TV? This includes favourites and cannot be undone.')) return;
+
+    const btn = document.getElementById('btn-delete-all-art');
+    setButtonBusy(btn, 'Deleting all...');
+    try {
+      const resp = await apiFetch('/tv/art/delete', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ content_ids: allIds, tv_ip: tvIp, include_favorites: true }),
+      });
+      if (!resp.ok) throw new Error('Server returned ' + resp.status);
+      const data = await resp.json();
+      await loadTVArt();
+      showToast('Deleted ' + data.deleted.length + ' artwork(s) from TV.', 'done');
+    } catch (e) {
+      showToast('Failed to delete all: ' + e.message, 'error');
+    } finally {
+      clearButtonBusy(btn);
+    }
+  }
+
+  async function deleteAllExceptFavoritesTVArt() {
+    const tvIp = document.getElementById('tv-art-select').value;
+    if (!tvIp) return;
+    const nonFavIds = Object.entries(loadedTVArtById)
+      .filter(([, a]) => !a.is_favourite)
+      .map(([cid]) => cid);
+    if (!nonFavIds.length) { showToast('All artwork on this TV is favourited.', 'warn'); return; }
+    const favCount = Object.keys(loadedTVArtById).length - nonFavIds.length;
+    const msg = 'Delete ' + nonFavIds.length + ' non-favourite artwork(s) from TV?'
+      + (favCount > 0 ? ' (' + favCount + ' favourite(s) will be kept.)' : '');
+    if (!confirm(msg)) return;
+
+    const btn = document.getElementById('btn-delete-all-except-fav');
+    setButtonBusy(btn, 'Deleting...');
+    try {
+      const resp = await apiFetch('/tv/art/delete', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ content_ids: nonFavIds, tv_ip: tvIp, include_favorites: false }),
+      });
+      if (!resp.ok) throw new Error('Server returned ' + resp.status);
+      const data = await resp.json();
+      await loadTVArt();
+      showToast('Deleted ' + data.deleted.length + ' artwork(s), kept ' + favCount + ' favourite(s).', 'done');
+    } catch (e) {
+      showToast('Failed to delete: ' + e.message, 'error');
+    } finally {
+      clearButtonBusy(btn);
+    }
+  }
+
+  // =========================================================================
+  // Change Matte modal
+  // =========================================================================
+  let matteContentId = null;
+  let matteTvIp = null;
+
+  window.openMatteModal = async function(contentId, tvIp) {
+    matteContentId = contentId;
+    matteTvIp = tvIp;
+    document.getElementById('matte-content-id').textContent = contentId;
+    openModal('matte-modal', '#matte-select');
+
+    loadMattesForSelect('matte-select', tvIp);
+  };
+
+  async function loadMattesForSelect(selectId, tvIp) {
+    const sel = document.getElementById(selectId);
+    if (!tvIp) return;
+
+    sel.innerHTML = '<option value="">Loading...</option>';
+    try {
+      const resp = await apiFetch('/tv/mattes?tv_ip=' + encodeURIComponent(tvIp));
+      if (!resp.ok) throw new Error('Failed to load');
+      const mattes = await resp.json();
+      sel.innerHTML = '';
+      if (!mattes.length) {
+        sel.innerHTML = '<option value="none">none</option>' +
+                        '<option value="shadowbox_polar">shadowbox_polar</option>';
+        return;
+      }
+      for (const m of mattes) {
+        const id = m.matte_id || m;
+        const opt = document.createElement('option');
+        opt.value = id;
+        opt.textContent = id;
+        sel.appendChild(opt);
+      }
+      const remembered = localStorage.getItem(
+        selectId === 'public-matte-select' ? storageKeys.mattePublic :
+        selectId === 'own-upload-matte-select' ? storageKeys.matteOwnUpload :
+        selectId === 'edit-upload-matte-select' ? storageKeys.matteEditUpload :
+        selectId === 'remix-matte-select' ? storageKeys.matteRemix :
+        storageKeys.matteUpload
+      );
+      if (remembered && [...sel.options].some(o => o.value === remembered)) sel.value = remembered;
+    } catch {
+      sel.innerHTML = '<option value="none">none</option>' +
+                      '<option value="shadowbox_polar">shadowbox_polar</option>' +
+                      '<option value="shadowbox_noir">shadowbox_noir</option>';
+      const remembered = localStorage.getItem(
+        selectId === 'public-matte-select' ? storageKeys.mattePublic :
+        selectId === 'own-upload-matte-select' ? storageKeys.matteOwnUpload :
+        selectId === 'edit-upload-matte-select' ? storageKeys.matteEditUpload :
+        selectId === 'remix-matte-select' ? storageKeys.matteRemix :
+        storageKeys.matteUpload
+      );
+      if (remembered && [...sel.options].some(o => o.value === remembered)) sel.value = remembered;
+    }
+  }
+
+  document.getElementById('btn-matte-cancel').addEventListener('click', () => {
+    closeModal('matte-modal');
+  });
+
+  document.getElementById('btn-matte-apply').addEventListener('click', async () => {
+    const matteId = document.getElementById('matte-select').value;
+    if (!matteId) return;
+
+    const btn = document.getElementById('btn-matte-apply');
+    btn.disabled = true;
+
+    try {
+      const resp = await apiFetch('/tv/art/matte', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          content_id: matteContentId,
+          matte_id: matteId,
+          tv_ip: matteTvIp,
+        }),
+      });
+      if (!resp.ok) throw new Error('Server returned ' + resp.status);
+      closeModal('matte-modal');
+    } catch (e) {
+      alert('Failed to change matte: ' + e.message);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  // Close modals on overlay click (but not dialog click)
+  modalIds.forEach((modalId) => {
+    const modal = document.getElementById(modalId);
+    if (!modal) return;
+    modal.addEventListener('click', function(e) {
+      if (e.target === this) closeModal(modalId);
+    });
+  });
+
+  function isTypingTarget(el) {
+    if (!el) return false;
+    const tag = (el.tagName || '').toLowerCase();
+    return tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable;
+  }
+
+  // =========================================================================
+  // Keyboard shortcuts (Phase 2B)
+  // =========================================================================
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      closeAllModals();
+      return;
+    }
+
+    // Cmd/Ctrl+Enter: generate from prompt
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+      const activePage = getActivePageName();
+      const createMode = getActiveCreateModeName();
+      if (activePage === 'create' && createMode === 'ai') {
+        e.preventDefault();
+        document.getElementById('btn-generate').click();
+      }
+      return;
+    }
+
+    const typing = isTypingTarget(e.target);
+
+    // Alt+Shift shortcuts for page + create mode navigation.
+    if (e.altKey && e.shiftKey) {
+      const key = e.key.toLowerCase();
+      if (key === 'c') setActivePage('create');
+      else if (key === 'l') setActivePage('library');
+      else if (key === 't') setActivePage('tvs');
+      else if (key === 's') setActivePage('settings');
+      else if (key === 'a') { setActivePage('create'); setActiveCreateMode('ai'); }
+      else if (key === 'p') { setActivePage('create'); setActiveCreateMode('public'); }
+      else if (key === 'u') { setActivePage('create'); setActiveCreateMode('upload'); }
+      else if (key === 'e') { setActivePage('create'); setActiveCreateMode('edit'); }
+      else return;
+      e.preventDefault();
+      return;
+    }
+
+    if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
+
+    // Slash focuses primary input in current context.
+    if (e.key === '/') {
+      const activePage = getActivePageName();
+      if (activePage === 'create') {
+        const mode = getActiveCreateModeName();
+        e.preventDefault();
+        if (mode === 'public') document.getElementById('public-query').focus();
+        else if (mode === 'upload') document.getElementById('own-image-file').focus();
+        else if (mode === 'edit') document.getElementById('edit-prompt').focus();
+        else document.getElementById('prompt').focus();
+      } else if (activePage === 'library') {
+        e.preventDefault();
+        document.getElementById('btn-refresh-gallery').focus();
+      } else if (activePage === 'tvs') {
+        e.preventDefault();
+        document.getElementById('tv-art-select').focus();
+      }
+    }
+  });
+
+  // =========================================================================
+  // Helpers
+  // =========================================================================
+  function esc(str) {
+    const el = document.createElement('span');
+    el.textContent = str || '';
+    return el.innerHTML;
+  }
+})();

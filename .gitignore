@@ -43,3 +43,9 @@ Thumbs.db
 .coverage
 htmlcov/
 .ruff_cache/
+
+# Browser tests
+node_modules/
+.e2e-data/
+playwright-report/
+test-results/

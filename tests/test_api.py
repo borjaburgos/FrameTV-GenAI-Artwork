@@ -152,6 +152,7 @@ class TestAuthentication:
 
         with TestClient(app) as secured_client:
             assert secured_client.get("/health").status_code == 200
+            assert secured_client.get("/static/app.css").status_code == 200
             assert secured_client.get("/styles").status_code == 401
 
             login = secured_client.post("/auth/session", json={"token": token})
@@ -1964,21 +1965,28 @@ class TestWebUI:
         assert resp.status_code == 200
         assert "text/html" in resp.headers["content-type"]
         assert "FrameArt" in resp.text
+        assert 'href="/static/app.css"' in resp.text
+        assert 'src="/static/app.js"' in resp.text
+
+        assert client.get("/static/app.css").status_code == 200
+        assert client.get("/static/app.js").status_code == 200
 
     def test_tv_discovery_has_manual_fallback_and_http_error_handling(self):
         resp = client.get("/")
+        script = client.get("/static/app.js")
 
         assert 'id="btn-add-tv"' in resp.text
         assert 'id="add-tv-modal"' in resp.text
-        assert "parseJSONResponse(resp, 'TV discovery request failed.')" in resp.text
-        assert "frameart-api-lan" in resp.text
+        assert "parseJSONResponse(resp, 'TV discovery request failed.')" in script.text
+        assert "frameart-api-lan" in script.text
 
     def test_settings_ui_has_provider_and_persistent_tv_management(self):
         resp = client.get("/")
+        script = client.get("/static/app.js")
 
         assert 'id="btn-settings-add-provider"' in resp.text
         assert 'id="provider-settings-modal"' in resp.text
         assert 'id="btn-settings-add-tv"' in resp.text
         assert 'id="tv-settings-modal"' in resp.text
-        assert "'/settings/providers'" in resp.text
-        assert "'/settings/tvs'" in resp.text
+        assert "'/settings/providers'" in script.text
+        assert "'/settings/tvs'" in script.text
