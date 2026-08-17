@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 
+import pytest
 import yaml
+from pydantic import ValidationError
 
 from frameart.config import STYLE_PRESETS, Settings, TVProfile, load_settings
 
@@ -22,6 +24,11 @@ class TestSettings:
         assert profile.port == 8002
         assert profile.name == "FrameArt"
         assert profile.ssl is True
+
+    @pytest.mark.parametrize("ip", ["8.8.8.8", "127.0.0.1", "not-an-ip", "::1"])
+    def test_tv_profile_rejects_non_private_ipv4(self, ip):
+        with pytest.raises(ValidationError):
+            TVProfile(ip=ip)
 
 
 class TestStylePresets:
@@ -71,3 +78,14 @@ class TestLoadSettings:
             assert settings.tvs["test_tv"].ip == "10.0.0.1"
         finally:
             del os.environ["FRAMEART_CONFIG"]
+
+    def test_environment_overrides_yaml(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("default_provider: ollama\nlog_level: WARNING\n")
+        monkeypatch.setenv("FRAMEART_CONFIG", str(config_file))
+        monkeypatch.setenv("FRAMEART_DEFAULT_PROVIDER", "openai")
+
+        settings = load_settings()
+
+        assert settings.default_provider == "openai"
+        assert settings.log_level == "WARNING"

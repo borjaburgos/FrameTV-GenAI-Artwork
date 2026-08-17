@@ -9,12 +9,18 @@ Config sources (in priority order):
 from __future__ import annotations
 
 import os
+from ipaddress import IPv4Address, IPv4Network, ip_address
 from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic.fields import FieldInfo
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
 
 
 def _default_data_dir() -> Path:
@@ -61,10 +67,30 @@ class TVProfile(BaseModel):
     """Configuration for a single Samsung Frame TV."""
 
     ip: str
-    port: int = 8002
+    port: int = Field(8002, ge=1, le=65535)
     name: str = "FrameArt"
     token_file: str | None = None
     ssl: bool = True
+
+    @field_validator("ip")
+    @classmethod
+    def validate_private_ipv4(cls, value: str) -> str:
+        """Samsung TV control is intentionally limited to private IPv4 networks."""
+        try:
+            address = ip_address(value.strip())
+        except ValueError as exc:
+            raise ValueError("TV IP must be a valid IPv4 address") from exc
+
+        private_networks = (
+            IPv4Network("10.0.0.0/8"),
+            IPv4Network("172.16.0.0/12"),
+            IPv4Network("192.168.0.0/16"),
+        )
+        if not isinstance(address, IPv4Address) or not any(
+            address in network for network in private_networks
+        ):
+            raise ValueError("TV IP must be an RFC1918 private IPv4 address")
+        return str(address)
 
 
 class ProviderConfig(BaseModel):
@@ -120,6 +146,31 @@ class Settings(BaseSettings):
     default_style: str | None = None
     auto_aspect_hint: bool = True
 
+    # HTTP API security. Loopback-only serving may leave auth disabled; the
+    # server refuses non-loopback binds unless auth is enabled.
+    auth_enabled: bool = False
+    admin_token: SecretStr | None = None
+    automation_token: SecretStr | None = None
+    api_rate_limit_per_minute: int = Field(60, ge=1, le=10_000)
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Make the documented precedence explicit: args > env > YAML."""
+        del dotenv_settings
+        return (
+            init_settings,
+            env_settings,
+            _YamlSettingsSource(settings_cls),
+            file_secret_settings,
+        )
+
 
 def _find_config_file() -> Path | None:
     """Return the first existing config file, or None."""
@@ -141,17 +192,27 @@ def _load_yaml_config(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+class _YamlSettingsSource(PydanticBaseSettingsSource):
+    """Read the first configured YAML file as the lowest-priority source."""
+
+    def get_field_value(
+        self,
+        field: FieldInfo,
+        field_name: str,
+    ) -> tuple[Any, str, bool]:
+        data = self()
+        return data.get(field_name), field_name, False
+
+    def __call__(self) -> dict[str, Any]:
+        config_path = _find_config_file()
+        if not config_path:
+            return {}
+        return _load_yaml_config(config_path)
+
+
 def load_settings(**overrides: Any) -> Settings:
     """Load settings from config file + env vars + explicit overrides.
 
     Overrides are applied last and take highest priority.
     """
-    file_data: dict[str, Any] = {}
-    config_path = _find_config_file()
-    if config_path:
-        file_data = _load_yaml_config(config_path)
-
-    # Merge: file data is the base, env vars and overrides layer on top.
-    # Pydantic-settings reads env vars automatically; we inject file data as init kwargs.
-    merged = {**file_data, **{k: v for k, v in overrides.items() if v is not None}}
-    return Settings(**merged)
+    return Settings(**{k: v for k, v in overrides.items() if v is not None})

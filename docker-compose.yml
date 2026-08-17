@@ -32,6 +32,11 @@ services:
       # - ./config.yaml:/app/config.yaml:ro
     environment:
       - FRAMEART_DATA_DIR=/data/frameart
+      - FRAMEART_AUTH_ENABLED=true
+      # Optional: provide stable tokens in .env. If ADMIN is omitted, FrameArt
+      # creates /data/frameart/secrets/admin-api.token on first startup.
+      # - FRAMEART_ADMIN_TOKEN=${FRAMEART_ADMIN_TOKEN}
+      # - FRAMEART_AUTOMATION_TOKEN=${FRAMEART_AUTOMATION_TOKEN}
       # Provider API keys — set these in your .env file or shell:
       # - OPENAI_API_KEY=${OPENAI_API_KEY}
       # - OLLAMA_BASE_URL=http://host.docker.internal:11434

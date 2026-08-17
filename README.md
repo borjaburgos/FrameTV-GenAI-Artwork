@@ -173,11 +173,15 @@ pip install ".[api]"
 # Start on localhost:8000
 frameart serve
 
-# Or bind to all interfaces on a custom port
+# LAN access requires authentication. A persistent admin token is generated
+# under the data directory when FRAMEART_ADMIN_TOKEN is not provided.
+export FRAMEART_AUTH_ENABLED=true
 frameart serve --host 0.0.0.0 --port 8000
 ```
 
 Interactive API docs are available at `http://localhost:8000/docs` and the web UI at `http://localhost:8000/` once the server is running.
+
+Loopback-only serving leaves authentication off by default. Non-loopback binds are refused unless authentication is enabled. Admin tokens have `read`, `control`, and `admin` access; the optional `FRAMEART_AUTOMATION_TOKEN` has `read` and `control` access but cannot delete artwork or jobs. API clients can send either `Authorization: Bearer <token>` or `X-FrameArt-Token: <token>`. The web UI prompts for a token and stores it in an HttpOnly session cookie.
 
 ### Endpoints
 
@@ -187,7 +191,8 @@ Interactive API docs are available at `http://localhost:8000/docs` and the web U
 |--------|------|-------------|
 | `POST` | `/generate` | Generate image only (no TV upload) |
 | `POST` | `/generate-and-apply` | Full pipeline: prompt to TV display |
-| `POST` | `/apply` | Upload an existing image to the TV |
+| `POST` | `/upload-and-apply` | Validate and upload multipart JPG/PNG bytes |
+| `POST` | `/jobs/{job_id}/apply` | Display a previously generated artifact |
 
 **Async** (return immediately, poll for results):
 
@@ -195,7 +200,6 @@ Interactive API docs are available at `http://localhost:8000/docs` and the web U
 |--------|------|-------------|
 | `POST` | `/async/generate` | Submit generation job, returns `{job_id}` |
 | `POST` | `/async/generate-and-apply` | Submit generate+apply job |
-| `POST` | `/async/apply` | Submit upload job |
 | `GET` | `/jobs/{job_id}/status` | Poll job progress and result |
 | `GET` | `/async/jobs` | List recent async jobs with status and metadata |
 
@@ -258,9 +262,10 @@ curl -X POST http://localhost:8000/generate \
 **Upload an existing image:**
 
 ```bash
-curl -X POST http://localhost:8000/apply \
-  -H "Content-Type: application/json" \
-  -d '{"image_path": "/data/frameart/artifacts/2025/01/15/120000-abc123/final.png", "tv_ip": "192.168.1.100"}'
+curl -X POST http://localhost:8000/upload-and-apply \
+  -F "image=@artwork.jpg" \
+  -F "tv_ip=192.168.1.100" \
+  -F "matte=none"
 ```
 
 **Check TV status:**
@@ -346,6 +351,7 @@ rest_command:
     method: POST
     headers:
       Content-Type: "application/json"
+      Authorization: "Bearer YOUR_AUTOMATION_TOKEN"
     payload: '{"prompt": "{{ prompt }}"}'
     timeout: 120
 ```
@@ -372,7 +378,7 @@ Create a shortcut that sends an HTTP request:
 2. Add a **"Get Contents of URL"** action:
    - URL: `http://<frameart-host>:8000/generate-and-apply`
    - Method: POST
-   - Headers: `Content-Type: application/json`
+   - Headers: `Content-Type: application/json`, `Authorization: Bearer YOUR_AUTOMATION_TOKEN`
    - Request Body: `{"prompt": "<input>"}`
 3. Trigger it with "Hey Siri, generate art" or add it to a scene.
 
@@ -418,6 +424,10 @@ See [`config.example.yaml`](config.example.yaml) for all options.
 | `FRAMEART_DEFAULT_PROVIDER` | Default image provider |
 | `FRAMEART_DEFAULT_UPSCALER` | Default upscaler |
 | `FRAMEART_LOG_LEVEL` | Logging level (`DEBUG`, `INFO`, `WARNING`) |
+| `FRAMEART_AUTH_ENABLED` | Require scoped API tokens (`true`/`false`) |
+| `FRAMEART_ADMIN_TOKEN` | Full-access API token; generated on first authenticated start when omitted |
+| `FRAMEART_AUTOMATION_TOKEN` | Optional read/control token without destructive admin access |
+| `FRAMEART_API_RATE_LIMIT_PER_MINUTE` | Per-client mutation limit (default: `60`) |
 
 ### Multiple TVs
 
@@ -457,6 +467,7 @@ Optional key for Europeana (a demo key is used by default):
 ```bash
 # Edit docker-compose.yml with your settings, then:
 docker compose up -d frameart-api
+docker compose logs frameart-api  # first start prints the generated admin token
 ```
 
 The `docker-compose.yml` includes two service profiles:
@@ -496,6 +507,7 @@ docker run --rm \
 # API server mode
 docker run -d --name frameart-api \
     -e OPENAI_API_KEY="$OPENAI_API_KEY" \
+    -e FRAMEART_AUTH_ENABLED=true \
     -v frameart_data:/data/frameart \
     -p 8000:8000 \
     --network host \
@@ -632,16 +644,12 @@ frameart/
 
 ## Known Limitations
 
-- **No authentication on the HTTP API.** The server binds to `127.0.0.1` by default. For LAN-only use this is typically fine; for anything else, put it behind a reverse proxy with authentication (e.g., Caddy, nginx + basic auth, or Authelia).
 - **No HTTPS on the API server.** Same recommendation: use a reverse proxy to terminate TLS.
-- **No rate limiting.** Each request triggers an AI provider API call. If exposed without rate limiting, it could rack up provider costs quickly.
-- **`/apply` is path-based.** The `/apply` endpoint takes a filesystem path, while multipart uploads are handled by `/upload-and-apply`.
-- **Async jobs are in-memory only.** They do not survive server restarts. Completed jobs are evicted after 200 entries to bound memory usage.
+- **Async jobs are in-memory only.** They do not survive server restarts. The active queue and completed history are bounded, and the server intentionally runs one worker so job polling and TV locks remain consistent.
+- **API rate limiting is per process.** This is appropriate for the supported single-worker local deployment; use a reverse proxy for distributed/global limits.
 
 ### Potential Future Work
 
-- API key / bearer token authentication
-- HTTP multipart image upload for `/apply`
 - Webhook/callback on job completion
 - Scheduling (cron-like "change art every morning")
 - Multi-TV fan-out (upload to all TVs at once)

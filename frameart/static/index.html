@@ -1077,6 +1077,7 @@
   let configuredProviders = [];
   const generationJobs = new Map();
   let generationPollTimer = null;
+  let authPromptPromise = null;
   const storageKeys = {
     page: 'frameart.page',
     createMode: 'frameart.create.mode',
@@ -1108,6 +1109,33 @@
     toast.textContent = message;
     wrap.appendChild(toast);
     setTimeout(() => toast.remove(), 3600);
+  }
+
+  async function establishAuthSession() {
+    const token = window.prompt('Enter your FrameArt admin or automation token:');
+    if (!token) return false;
+    const response = await window.fetch('/auth/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+    });
+    if (!response.ok) {
+      showToast('Authentication failed. Check the token and try again.', 'error');
+      return false;
+    }
+    return true;
+  }
+
+  async function apiFetch(input, init) {
+    let response = await window.fetch(input, init);
+    if (response.status !== 401) return response;
+    if (!authPromptPromise) {
+      authPromptPromise = establishAuthSession().finally(() => {
+        authPromptPromise = null;
+      });
+    }
+    if (await authPromptPromise) response = await window.fetch(input, init);
+    return response;
   }
 
   function animateStaggeredChildren(container, selector) {
@@ -1429,7 +1457,7 @@
   // =========================================================================
   // Startup: load styles + configured TVs in parallel
   // =========================================================================
-  fetch('/styles').then(r => r.json()).then(styles => {
+  apiFetch('/styles').then(r => r.json()).then(styles => {
     const sel = document.getElementById('style');
     for (const [key] of Object.entries(styles)) {
       const opt = document.createElement('option');
@@ -1438,7 +1466,7 @@
     }
   }).catch(() => {});
 
-  fetch('/providers').then(r => r.json()).then((payload) => {
+  apiFetch('/providers').then(r => r.json()).then((payload) => {
     refreshProviderSelects(payload);
   }).catch(() => {
     configuredProviders = [{
@@ -1467,7 +1495,7 @@
   });
 
   // Load pre-configured TVs on startup
-  fetch('/tv/configured').then(r => r.json()).then(configured => {
+  apiFetch('/tv/configured').then(r => r.json()).then(configured => {
     addTVs(configured.map(c => ({
       ip: c.ip, name: c.name, model: null, frame_tv: true,
     })), 'config');
@@ -1689,7 +1717,7 @@
     let changed = false;
     await Promise.all(activeJobs.map(async (job) => {
       try {
-        const resp = await fetch('/jobs/' + job.jobId + '/status');
+        const resp = await apiFetch('/jobs/' + job.jobId + '/status');
         if (!resp.ok) {
           const nextError = 'Status check failed (' + resp.status + ')';
           if (job.status !== 'failed' || job.error !== nextError) {
@@ -1765,7 +1793,7 @@
     showStatus('Submitting job...');
 
     try {
-      const resp = await fetch(endpoint, {
+      const resp = await apiFetch(endpoint, {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(body),
       });
@@ -1795,7 +1823,7 @@
 
   async function loadGenerationJobsFromAPI() {
     try {
-      const resp = await fetch('/async/jobs?limit=60');
+      const resp = await apiFetch('/async/jobs?limit=60');
       if (!resp.ok) throw new Error('Server returned ' + resp.status);
       const items = await resp.json();
       for (const item of items) {
@@ -1891,7 +1919,7 @@
     setButtonBusy(btn, 'Deleting...');
 
     try {
-      const resp = await fetch('/jobs/delete', {
+      const resp = await apiFetch('/jobs/delete', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ job_ids: selectedIds }),
@@ -1965,7 +1993,7 @@
     const failed = [];
     for (const jobId of selectedIds) {
       try {
-        const resp = await fetch('/jobs/' + encodeURIComponent(jobId) + '/apply', {
+        const resp = await apiFetch('/jobs/' + encodeURIComponent(jobId) + '/apply', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({ tv_ip: tvIp, matte: matte }),
@@ -2004,7 +2032,7 @@
     grid.innerHTML = gallerySkeleton(6);
     empty.style.display = 'none';
     try {
-      const resp = await fetch('/jobs?limit=50');
+      const resp = await apiFetch('/jobs?limit=50');
       const jobs = await resp.json();
       if (!jobs.length) { grid.innerHTML = ''; empty.style.display = 'block'; return; }
       empty.style.display = 'none';
@@ -2201,7 +2229,7 @@
     empty.style.display = 'none';
 
     try {
-      const resp = await fetch(
+      const resp = await apiFetch(
         '/catalog/search?source=' + encodeURIComponent(source) +
         '&q=' + encodeURIComponent(q) + '&limit=20'
       );
@@ -2235,7 +2263,7 @@
     setButtonBusy(btn, 'Applying...');
     showPublicStatus('Downloading and uploading artwork...', '');
     try {
-      const resp = await fetch('/catalog/apply', {
+      const resp = await apiFetch('/catalog/apply', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
@@ -2311,7 +2339,7 @@
     statusTextEl.textContent = 'Processing image, cropping/upscaling, and uploading...';
 
     try {
-      const resp = await fetch('/upload-and-apply', {
+      const resp = await apiFetch('/upload-and-apply', {
         method: 'POST',
         body: formData,
       });
@@ -2377,7 +2405,7 @@
       : 'Editing image and preparing TV output...';
 
     try {
-      const resp = await fetch('/edit-and-apply', {
+      const resp = await apiFetch('/edit-and-apply', {
         method: 'POST',
         body: formData,
       });
@@ -2497,7 +2525,7 @@
       : 'Creating new image and displaying on TV...';
 
     try {
-      const resp = await fetch(endpoint, {
+      const resp = await apiFetch(endpoint, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(body),
@@ -2587,7 +2615,7 @@
     statusTextEl.textContent = 'Uploading...';
 
     try {
-      const resp = await fetch('/jobs/' + uploadJobId + '/apply', {
+      const resp = await apiFetch('/jobs/' + uploadJobId + '/apply', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ tv_ip: tvIp, matte: matte }),
@@ -2622,7 +2650,7 @@
     empty.style.display = 'none';
 
     try {
-      const resp = await fetch('/tv/discover?timeout=4');
+      const resp = await apiFetch('/tv/discover?timeout=4');
       const tvs = await resp.json();
       clearButtonBusy(btnDiscover);
       if (!tvs.length && !knownTVs.length) {
@@ -2719,7 +2747,7 @@
     empty.style.display = 'none';
 
     try {
-      const resp = await fetch('/tv/art?tv_ip=' + encodeURIComponent(tvIp));
+      const resp = await apiFetch('/tv/art?tv_ip=' + encodeURIComponent(tvIp));
       if (!resp.ok) throw new Error('Server returned ' + resp.status);
       const artworks = await resp.json();
 
@@ -2794,7 +2822,7 @@
   window.displayTVArt = async function(contentId, tvIp, btn) {
     setButtonBusy(btn, 'Displaying...');
     try {
-      const resp = await fetch('/tv/art/display', {
+      const resp = await apiFetch('/tv/art/display', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
@@ -2840,7 +2868,7 @@
     if (!confirm(msg)) return;
 
     try {
-      const resp = await fetch('/tv/art/delete', {
+      const resp = await apiFetch('/tv/art/delete', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
@@ -2877,7 +2905,7 @@
     setButtonBusy(btn, 'Deleting...');
 
     try {
-      const resp = await fetch('/tv/art/delete', {
+      const resp = await apiFetch('/tv/art/delete', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
@@ -2913,7 +2941,7 @@
     const btn = document.getElementById('btn-delete-all-art');
     setButtonBusy(btn, 'Deleting all...');
     try {
-      const resp = await fetch('/tv/art/delete', {
+      const resp = await apiFetch('/tv/art/delete', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ content_ids: allIds, tv_ip: tvIp, include_favorites: true }),
@@ -2944,7 +2972,7 @@
     const btn = document.getElementById('btn-delete-all-except-fav');
     setButtonBusy(btn, 'Deleting...');
     try {
-      const resp = await fetch('/tv/art/delete', {
+      const resp = await apiFetch('/tv/art/delete', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ content_ids: nonFavIds, tv_ip: tvIp, include_favorites: false }),
@@ -2981,7 +3009,7 @@
 
     sel.innerHTML = '<option value="">Loading...</option>';
     try {
-      const resp = await fetch('/tv/mattes?tv_ip=' + encodeURIComponent(tvIp));
+      const resp = await apiFetch('/tv/mattes?tv_ip=' + encodeURIComponent(tvIp));
       if (!resp.ok) throw new Error('Failed to load');
       const mattes = await resp.json();
       sel.innerHTML = '';
@@ -3032,7 +3060,7 @@
     btn.disabled = true;
 
     try {
-      const resp = await fetch('/tv/art/matte', {
+      const resp = await apiFetch('/tv/art/matte', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({

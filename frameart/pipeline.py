@@ -143,8 +143,10 @@ def _resolve_tv_profile(
     settings: Settings, tv_name: str | None, tv_ip: str | None,
 ) -> TVProfile | None:
     """Resolve a TV profile from name or IP."""
-    if tv_name and tv_name in settings.tvs:
-        return settings.tvs[tv_name]
+    if tv_name:
+        # An explicitly requested profile must never silently fall back to a
+        # different configured TV.
+        return settings.tvs.get(tv_name)
     if tv_ip:
         return TVProfile(ip=tv_ip)
     # If there's exactly one TV configured, use it

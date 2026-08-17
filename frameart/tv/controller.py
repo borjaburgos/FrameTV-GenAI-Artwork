@@ -231,16 +231,28 @@ TV_OP_TIMEOUT = 20  # seconds — cap for any single TV WebSocket operation
 
 def _run_with_timeout(func, timeout_sec: int = TV_OP_TIMEOUT):
     """Run a function in a thread with a timeout. Returns (result, error)."""
-    import concurrent.futures
+    import queue
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(func)
+    outcomes: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def _invoke() -> None:
         try:
-            return future.result(timeout=timeout_sec), None
-        except concurrent.futures.TimeoutError:
-            return None, "timed out"
-        except Exception as e:
-            return None, str(e)
+            outcomes.put((True, func()))
+        except Exception as exc:
+            outcomes.put((False, exc))
+
+    # Python cannot safely kill a blocked thread. A daemon thread gives callers
+    # a real response deadline without making process shutdown wait forever.
+    worker = threading.Thread(target=_invoke, daemon=True, name="frameart-tv-op")
+    worker.start()
+    worker.join(timeout_sec)
+    if worker.is_alive():
+        return None, "timed out"
+
+    succeeded, value = outcomes.get_nowait()
+    if succeeded:
+        return value, None
+    return None, str(value)
 
 
 def _run_tv_op(profile: TVProfile, func, description: str, timeout_sec: int = TV_OP_TIMEOUT):

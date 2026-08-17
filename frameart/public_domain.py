@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import os
 import re
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
 import httpx
+from PIL import Image, UnidentifiedImageError
 
 MET_API_BASE = "https://collectionapi.metmuseum.org/public/collection/v1"
 AIC_API_BASE = "https://api.artic.edu/api/v1"
 CMA_API_BASE = "https://openaccess-api.clevelandart.org/api"
 EUROPEANA_API_BASE = "https://api.europeana.eu/record/v2"
+MAX_CATALOG_IMAGE_BYTES = 50 * 1024 * 1024
+MAX_CATALOG_IMAGE_PIXELS = 50_000_000
 
 
 def _http_client() -> httpx.Client:
@@ -140,18 +144,28 @@ def _cma_image_urls(obj: dict[str, Any]) -> tuple[str | None, str | None]:
 
 
 def _cma_is_public_domain(obj: dict[str, Any]) -> bool:
-    open_access = obj.get("open_access")
-    if isinstance(open_access, bool) and open_access:
-        return True
-    if isinstance(open_access, int) and open_access == 1:
-        return True
-
     status = str(obj.get("share_license_status") or "").upper()
     if "CC0" in status:
         return True
 
     rights = str(obj.get("rights_type") or obj.get("copyright") or "").lower()
     return bool("public domain" in rights or "cc0" in rights)
+
+
+def _rights_is_public_domain(rights: str | None) -> bool:
+    """Accept only explicit public-domain/CC0 rights statements."""
+    if not rights:
+        return False
+    normalized = rights.strip().lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "creativecommons.org/publicdomain/mark",
+            "creativecommons.org/publicdomain/zero",
+            "public domain",
+            "cc0",
+        )
+    )
 
 
 def _cma_object_to_item(obj: dict[str, Any]) -> dict[str, Any] | None:
@@ -243,7 +257,7 @@ def _europeana_object_to_item(obj: dict[str, Any]) -> dict[str, Any] | None:
         "license": rights or "See source",
         "attribution": "Europeana",
         "source_url": source_url or "https://www.europeana.eu/",
-        "is_public_domain": True,
+        "is_public_domain": _rights_is_public_domain(rights),
     }
 
 
@@ -312,7 +326,7 @@ def search_artworks(source: str, query: str, limit: int = 20) -> list[dict[str, 
         if src == "met":
             search_resp = client.get(
                 f"{MET_API_BASE}/search",
-                params={"q": q, "hasImages": "true"},
+                params={"q": q, "hasImages": "true", "isPublicDomain": "true"},
             )
             search_resp.raise_for_status()
             object_ids = list(search_resp.json().get("objectIDs") or [])
@@ -323,7 +337,7 @@ def search_artworks(source: str, query: str, limit: int = 20) -> list[dict[str, 
                 except Exception:
                     continue
                 item = _met_object_to_item(obj)
-                if not item:
+                if not item or not item["is_public_domain"]:
                     continue
                 results.append(item)
                 if len(results) >= limit:
@@ -352,7 +366,7 @@ def search_artworks(source: str, query: str, limit: int = 20) -> list[dict[str, 
             resp.raise_for_status()
             data = resp.json().get("data") or []
             items = [_aic_object_to_item(obj) for obj in data]
-            return [item for item in items if item is not None][:limit]
+            return [item for item in items if item and item["is_public_domain"]][:limit]
 
         if src == "cma":
             resp = client.get(
@@ -366,7 +380,7 @@ def search_artworks(source: str, query: str, limit: int = 20) -> list[dict[str, 
             resp.raise_for_status()
             data = resp.json().get("data") or []
             items = [_cma_object_to_item(obj) for obj in data if isinstance(obj, dict)]
-            return [item for item in items if item is not None][:limit]
+            return [item for item in items if item and item["is_public_domain"]][:limit]
 
         resp = client.get(
             f"{EUROPEANA_API_BASE}/search.json",
@@ -380,7 +394,7 @@ def search_artworks(source: str, query: str, limit: int = 20) -> list[dict[str, 
         resp.raise_for_status()
         data = resp.json().get("items") or []
         items = [_europeana_object_to_item(obj) for obj in data if isinstance(obj, dict)]
-        return [item for item in items if item is not None][:limit]
+        return [item for item in items if item and item["is_public_domain"]][:limit]
 
 
 def get_artwork(source: str, artwork_id: str) -> dict[str, Any]:
@@ -405,8 +419,8 @@ def get_artwork(source: str, artwork_id: str) -> dict[str, Any]:
             obj = _europeana_fetch_object(client, artwork_id)
             item = _europeana_object_to_item(obj)
 
-    if not item:
-        raise ValueError("Artwork is unavailable.")
+    if not item or not item["is_public_domain"]:
+        raise ValueError("Artwork is unavailable or not verified as public domain.")
     return item
 
 
@@ -422,6 +436,7 @@ def download_artwork_image(
     safe_name = _safe_filename(f"{item['source']}_{item['artwork_id']}.jpg")
     dest_dir.mkdir(parents=True, exist_ok=True)
     out_path = dest_dir / safe_name
+    part_path = out_path.with_suffix(f"{out_path.suffix}.part")
 
     def _download_to_file(url: str) -> None:
         # Download image bytes with a longer read timeout than metadata calls.
@@ -443,14 +458,41 @@ def download_artwork_image(
                     client.stream("GET", url) as resp,
                 ):
                     resp.raise_for_status()
-                    with out_path.open("wb") as f:
+                    content_type = resp.headers.get("content-type", "").lower()
+                    if content_type and not content_type.startswith("image/"):
+                        raise ValueError(
+                            f"Catalog returned unsupported content type {content_type!r}"
+                        )
+
+                    downloaded = 0
+                    with part_path.open("wb") as f:
                         for chunk in resp.iter_bytes(chunk_size=1024 * 64):
                             if chunk:
+                                downloaded += len(chunk)
+                                if downloaded > MAX_CATALOG_IMAGE_BYTES:
+                                    raise ValueError("Catalog image exceeds the 50 MB limit")
                                 f.write(chunk)
+
+                    payload = part_path.read_bytes()
+                    try:
+                        with Image.open(BytesIO(payload)) as image:
+                            if image.width * image.height > MAX_CATALOG_IMAGE_PIXELS:
+                                raise ValueError(
+                                    "Catalog image exceeds the 50 megapixel limit"
+                                )
+                            image.verify()
+                    except (UnidentifiedImageError, OSError) as exc:
+                        raise ValueError("Catalog response is not a valid image") from exc
+
+                    part_path.replace(out_path)
                 return
             except httpx.RequestError as e:
                 last_error = e
+                part_path.unlink(missing_ok=True)
                 continue
+            except Exception:
+                part_path.unlink(missing_ok=True)
+                raise
         if last_error:
             raise last_error
 
@@ -465,4 +507,5 @@ def download_artwork_image(
         else:
             raise
 
+    part_path.unlink(missing_ok=True)
     return out_path, item

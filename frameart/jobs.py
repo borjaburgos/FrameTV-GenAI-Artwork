@@ -21,6 +21,11 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 MAX_COMPLETED_JOBS = 200
+MAX_ACTIVE_JOBS = 50
+
+
+class JobQueueFullError(RuntimeError):
+    """Raised when the bounded in-memory queue cannot accept more work."""
 
 
 class JobStatus(str, Enum):
@@ -58,11 +63,17 @@ class JobStore:
         Oldest finished jobs are evicted when this limit is exceeded.
     """
 
-    def __init__(self, max_workers: int = 2, max_completed: int = MAX_COMPLETED_JOBS) -> None:
+    def __init__(
+        self,
+        max_workers: int = 2,
+        max_completed: int = MAX_COMPLETED_JOBS,
+        max_active: int = MAX_ACTIVE_JOBS,
+    ) -> None:
         self._jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._max_completed = max_completed
+        self._max_active = max_active
 
     def submit(
         self,
@@ -79,9 +90,23 @@ class JobStore:
         kwargs = kwargs or {}
         job = Job(id=job_id, request=request_summary or {})
         with self._lock:
+            active = sum(
+                existing.status in (JobStatus.pending, JobStatus.running)
+                for existing in self._jobs.values()
+            )
+            if active >= self._max_active:
+                raise JobQueueFullError(
+                    f"Job queue is full ({self._max_active} active jobs); retry later"
+                )
+            if job_id in self._jobs:
+                raise ValueError(f"Job {job_id!r} already exists")
             self._jobs[job_id] = job
-
-        self._executor.submit(self._run, job, func, args, kwargs)
+        try:
+            self._executor.submit(self._run, job, func, args, kwargs)
+        except Exception:
+            with self._lock:
+                self._jobs.pop(job_id, None)
+            raise
         logger.info("Submitted job %s", job_id)
         return job
 
