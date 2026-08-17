@@ -386,11 +386,13 @@
   .tv-card .tv-info { }
   .tv-card .tv-name { font-weight: 600; }
   .tv-card .tv-detail { font-size: .85rem; color: var(--muted); margin-top: .2rem; }
+  .tv-card .tv-actions { display: flex; align-items: center; gap: .55rem; flex-wrap: wrap; }
   .badge { display: inline-block; padding: .15rem .5rem; border-radius: 4px; font-size: .75rem;
            font-weight: 600; }
   .badge-frame { background: rgba(102,204,136,.15); color: var(--accent); }
   .badge-samsung { background: rgba(68,170,255,.15); color: var(--accent2); }
   .badge-config { background: rgba(168,179,200,.15); color: var(--muted); }
+  .badge-manual { background: rgba(255,194,102,.15); color: #ffc266; }
 
   .empty { text-align: center; color: var(--muted); padding: 3rem 1rem; }
 
@@ -849,9 +851,15 @@
   <div class="page-eyebrow">TVs</div>
   <div class="section-heading">
     <h2>TVs</h2>
-    <button class="btn btn-secondary" id="btn-discover">Scan Network</button>
+    <div class="btn-group">
+      <button class="btn btn-secondary" id="btn-add-tv">Add by IP</button>
+      <button class="btn btn-secondary" id="btn-discover">Scan Network</button>
+    </div>
   </div>
   <p class="page-intro">Manage connected TVs and control the art already stored on each device.</p>
+  <div class="status-bar" id="tv-discovery-status" role="status">
+    <div class="value" id="tv-discovery-status-text"></div>
+  </div>
   <div id="tv-list"></div>
   <div class="empty" id="tv-empty">Loading configured TVs...</div>
 
@@ -910,6 +918,28 @@
     </div>
   </div>
 </div>
+</div>
+
+<!-- Add a session-only TV by private IP -->
+<div class="modal-overlay" id="add-tv-modal" role="dialog" aria-modal="true" aria-labelledby="add-tv-title">
+  <div class="modal-dialog">
+    <h3 id="add-tv-title">Add TV by IP</h3>
+    <p style="font-size:.85rem; color:var(--muted); margin-bottom:.8rem;">
+      Use this when network discovery is unavailable. This TV will remain available for the
+      current browser session; persistent management is configured in <code>config.yaml</code>.
+    </p>
+    <label for="manual-tv-name">Name</label>
+    <input id="manual-tv-name" maxlength="100" placeholder="Living Room Frame">
+    <label for="manual-tv-ip">Private IPv4 address</label>
+    <input id="manual-tv-ip" inputmode="decimal" maxlength="15" placeholder="192.168.1.100">
+    <div class="status-bar error" id="manual-tv-error" role="alert">
+      <div class="value" id="manual-tv-error-text"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary btn-small" id="btn-add-tv-cancel">Cancel</button>
+      <button class="btn btn-small" id="btn-add-tv-apply">Add TV</button>
+    </div>
+  </div>
 </div>
 
 <!-- Preview modal (for gallery images) -->
@@ -1138,6 +1168,15 @@
     return response;
   }
 
+  async function parseJSONResponse(response, fallbackMessage) {
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      const detail = payload && typeof payload.detail === 'string' ? payload.detail : null;
+      throw new Error(detail || fallbackMessage || ('Server returned ' + response.status));
+    }
+    return payload;
+  }
+
   function animateStaggeredChildren(container, selector) {
     if (!container) return;
     const nodes = container.querySelectorAll(selector);
@@ -1299,6 +1338,15 @@
     renderTVList();
   }
 
+  function removeSessionTV(index) {
+    const tv = knownTVs[index];
+    if (!tv || tv.source === 'config') return;
+    knownTVs.splice(index, 1);
+    refreshTVSelects();
+    renderTVList();
+    showToast('Removed ' + tv.name + ' from this session.', 'done');
+  }
+
   function refreshTVSelects() {
     // Update all TV <select> elements throughout the UI
     const selectors = [
@@ -1355,7 +1403,7 @@
     }
     // Show the TV art section once we have TVs
     const artSection = document.getElementById('tv-art-section');
-    if (knownTVs.length > 0) artSection.style.display = 'block';
+    artSection.style.display = knownTVs.length > 0 ? 'block' : 'none';
   }
 
   function renderTVList() {
@@ -1363,27 +1411,36 @@
     const empty = document.getElementById('tv-empty');
     if (!knownTVs.length) {
       list.innerHTML = '';
-      empty.textContent = 'No TVs found. Click "Scan Network" or configure TVs in config.yaml.';
+      empty.textContent = 'No TVs found. Click "Scan Network", use "Add by IP", or configure config.yaml.';
       empty.style.display = 'block';
       renderSettingsTVSummary();
       return;
     }
     empty.style.display = 'none';
-    list.innerHTML = knownTVs.map(t => {
+    list.innerHTML = knownTVs.map((t, index) => {
       let badgeClass = 'badge-config';
       let badgeText = 'Configured';
       if (t.source === 'discovered') {
         badgeClass = t.frame_tv ? 'badge-frame' : 'badge-samsung';
         badgeText = t.frame_tv ? 'Frame TV' : 'Samsung TV';
+      } else if (t.source === 'manual') {
+        badgeClass = 'badge-manual';
+        badgeText = 'Manual · session';
       }
-      const detail = t.model ? (t.model + ' &middot; ' + t.ip) : t.ip;
+      const detail = t.model ? (esc(t.model) + ' &middot; ' + esc(t.ip)) : esc(t.ip);
+      const removeButton = t.source === 'config' ? '' :
+        '<button class="btn btn-ghost btn-small" data-remove-tv-index="' +
+        index + '">Remove</button>';
       return `
         <div class="tv-card">
           <div class="tv-info">
             <div class="tv-name">${esc(t.name)}</div>
             <div class="tv-detail">${detail}</div>
           </div>
-          <span class="badge ${badgeClass}">${badgeText}</span>
+          <div class="tv-actions">
+            <span class="badge ${badgeClass}">${badgeText}</span>
+            ${removeButton}
+          </div>
         </div>`;
     }).join('');
     animateStaggeredChildren(list, '.tv-card');
@@ -1394,6 +1451,12 @@
     const countEl = document.getElementById('settings-tv-count');
     if (countEl) countEl.textContent = String(knownTVs.length);
   }
+
+  document.getElementById('tv-list').addEventListener('click', (event) => {
+    const button = event.target.closest('[data-remove-tv-index]');
+    if (!button) return;
+    removeSessionTV(Number(button.dataset.removeTvIndex));
+  });
 
   // =========================================================================
   // Navigation (top-level pages + create modes)
@@ -2093,6 +2156,7 @@
     'upload-modal',
     'batch-upload-modal',
     'remix-modal',
+    'add-tv-modal',
     'shortcuts-modal',
   ];
   let lastFocusedBeforeModal = null;
@@ -2641,30 +2705,111 @@
   // =========================================================================
   // TV Discovery
   // =========================================================================
+  const tvDiscoveryStatus = document.getElementById('tv-discovery-status');
+  const tvDiscoveryStatusText = document.getElementById('tv-discovery-status-text');
+
+  function showTVDiscoveryStatus(message, kind) {
+    tvDiscoveryStatus.className = 'status-bar visible' + (kind ? ' ' + kind : '');
+    tvDiscoveryStatusText.textContent = message;
+  }
+
+  function normalizePrivateIPv4(value) {
+    const parts = value.trim().split('.');
+    if (parts.length !== 4 || parts.some((part) => !/^\d{1,3}$/.test(part))) return null;
+    const octets = parts.map(Number);
+    if (octets.some((part) => part < 0 || part > 255)) return null;
+    const [first, second] = octets;
+    const isPrivate = first === 10 ||
+      (first === 172 && second >= 16 && second <= 31) ||
+      (first === 192 && second === 168);
+    return isPrivate ? octets.join('.') : null;
+  }
+
+  function showManualTVError(message) {
+    const status = document.getElementById('manual-tv-error');
+    document.getElementById('manual-tv-error-text').textContent = message || '';
+    status.classList.toggle('visible', Boolean(message));
+  }
+
+  document.getElementById('btn-add-tv').addEventListener('click', () => {
+    showManualTVError('');
+    document.getElementById('manual-tv-name').value = '';
+    document.getElementById('manual-tv-ip').value = '';
+    openModal('add-tv-modal', '#manual-tv-name');
+  });
+
+  document.getElementById('btn-add-tv-cancel').addEventListener('click', () => {
+    closeModal('add-tv-modal');
+  });
+
+  function addManualTV() {
+    const nameInput = document.getElementById('manual-tv-name');
+    const ipInput = document.getElementById('manual-tv-ip');
+    const ip = normalizePrivateIPv4(ipInput.value);
+    if (!ip) {
+      showManualTVError('Enter an RFC1918 private IPv4 address, such as 192.168.1.100.');
+      ipInput.focus();
+      return;
+    }
+    if (knownTVs.some((tv) => tv.ip === ip)) {
+      showManualTVError('That TV is already in the list.');
+      ipInput.focus();
+      return;
+    }
+
+    const name = nameInput.value.trim() || ('Frame TV ' + ip);
+    addTVs([{ ip, name, model: null, frame_tv: true }], 'manual');
+    closeModal('add-tv-modal');
+    showToast('Added ' + name + ' for this session.', 'done');
+  }
+
+  document.getElementById('btn-add-tv-apply').addEventListener('click', addManualTV);
+  document.getElementById('manual-tv-ip').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      addManualTV();
+    }
+  });
+
   const btnDiscover = document.getElementById('btn-discover');
   btnDiscover.addEventListener('click', async () => {
-    const list = document.getElementById('tv-list');
     const empty = document.getElementById('tv-empty');
     setButtonBusy(btnDiscover, 'Scanning...');
-    list.innerHTML = '<div class="empty">Scanning...</div>';
-    empty.style.display = 'none';
+    showTVDiscoveryStatus('Scanning the local network for Samsung TVs...', '');
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 45000);
 
     try {
-      const resp = await apiFetch('/tv/discover?timeout=4');
-      const tvs = await resp.json();
-      clearButtonBusy(btnDiscover);
+      const resp = await apiFetch('/tv/discover?timeout=4', { signal: controller.signal });
+      const tvs = await parseJSONResponse(resp, 'TV discovery request failed.');
+      if (!Array.isArray(tvs)) throw new Error('The server returned an invalid discovery response.');
       if (!tvs.length && !knownTVs.length) {
-        list.innerHTML = '';
         empty.textContent = 'No Samsung TVs found on network.';
         empty.style.display = 'block';
+        showTVDiscoveryStatus(
+          'No TVs responded. If FrameArt runs in Docker, use frameart-api-lan, or add the TV by IP.',
+          '',
+        );
         return;
       }
       addTVs(tvs, 'discovered');
+      showTVDiscoveryStatus(
+        tvs.length ? ('Found ' + tvs.length + ' TV(s).') : 'Scan complete; no new TVs found.',
+        'done',
+      );
       showToast(tvs.length ? ('Found ' + tvs.length + ' TV(s).') : 'Scan complete.', 'done');
     } catch (e) {
+      let message = e && e.message ? e.message : 'Unknown discovery error.';
+      if (e && e.name === 'AbortError') {
+        message = 'Discovery timed out after 45 seconds. Add the TV by IP or check LAN access.';
+      } else if (/failed to fetch|networkerror/i.test(message)) {
+        message = 'Could not reach the FrameArt API. Confirm the server is running and reload this page.';
+      }
+      showTVDiscoveryStatus('Discovery failed: ' + message, 'error');
+      showToast('TV discovery failed: ' + message, 'error');
+    } finally {
+      window.clearTimeout(timer);
       clearButtonBusy(btnDiscover);
-      list.innerHTML = '<div class="empty">Discovery failed: ' + e.message + '</div>';
-      showToast('TV discovery failed: ' + e.message, 'error');
     }
   });
 

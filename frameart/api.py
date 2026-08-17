@@ -1005,9 +1005,13 @@ def tv_discover(
     frame_only: bool = Query(False, description="Only return Frame TVs."),
 ):
     """Auto-discover Samsung TVs on the local network via SSDP."""
-    from frameart.tv.discovery import discover
+    from frameart.tv.discovery import SSDPDiscoveryError, discover
 
-    tvs = discover(timeout=timeout, frame_only=frame_only)
+    try:
+        tvs = discover(timeout=timeout, frame_only=frame_only)
+    except SSDPDiscoveryError as exc:
+        logger.warning("TV discovery unavailable: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return [
         DiscoveredTVResponse(ip=tv.ip, name=tv.name, model=tv.model, frame_tv=tv.frame_tv)
         for tv in tvs

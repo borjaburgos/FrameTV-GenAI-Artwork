@@ -35,6 +35,10 @@ _SEARCH_TARGETS = [
 _LOCATION_RE = re.compile(r"https?://(\d+\.\d+\.\d+\.\d+)")
 
 
+class SSDPDiscoveryError(RuntimeError):
+    """Raised when the host cannot perform local SSDP discovery."""
+
+
 def _build_msearch(search_target: str) -> bytes:
     """Build an SSDP M-SEARCH packet for a given search target."""
     return (
@@ -64,19 +68,20 @@ def _ssdp_search(timeout: float = SSDP_MX + 1) -> list[str]:
     binds the socket so the OS routes responses back, and sets a
     multicast TTL so packets reach the local network segment.
     """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    # Bind so the OS assigns a source port and routes responses back to us
-    sock.bind(("", 0))
-    # Multicast TTL — 2 is enough for any LAN topology
-    sock.setsockopt(
-        socket.IPPROTO_IP,
-        socket.IP_MULTICAST_TTL,
-        struct.pack("b", 2),
-    )
-
+    sock: socket.socket | None = None
     ips: set[str] = set()
     try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Bind so the OS assigns a source port and routes responses back to us
+        sock.bind(("", 0))
+        # Multicast TTL — 2 is enough for any LAN topology
+        sock.setsockopt(
+            socket.IPPROTO_IP,
+            socket.IP_MULTICAST_TTL,
+            struct.pack("b", 2),
+        )
+
         # Send M-SEARCH packets for each search target, repeated for reliability
         for st in _SEARCH_TARGETS:
             packet = _build_msearch(st)
@@ -101,8 +106,15 @@ def _ssdp_search(timeout: float = SSDP_MX + 1) -> list[str]:
                     ips.add(addr[0])
             except TimeoutError:
                 break
+    except OSError as exc:
+        raise SSDPDiscoveryError(
+            "Local SSDP discovery is unavailable. If FrameArt runs in Docker, "
+            "use the frameart-api-lan service; otherwise add the TV by its private IP. "
+            f"Network error: {exc}"
+        ) from exc
     finally:
-        sock.close()
+        if sock is not None:
+            sock.close()
 
     logger.info("SSDP found %d device(s): %s", len(ips), ", ".join(sorted(ips)))
     return sorted(ips)

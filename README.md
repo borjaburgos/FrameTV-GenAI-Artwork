@@ -465,15 +465,17 @@ Optional key for Europeana (a demo key is used by default):
 #### docker-compose (recommended)
 
 ```bash
-# Edit docker-compose.yml with your settings, then:
-docker compose up -d frameart-api
-docker compose logs frameart-api  # first start prints the generated admin token
+# Edit docker-compose.yml with your settings, then start the LAN-aware service:
+docker compose --profile lan up -d frameart-api-lan
+docker compose logs frameart-api-lan  # first start prints the generated admin token
 ```
 
-The `docker-compose.yml` includes two service profiles:
+The `docker-compose.yml` includes three services:
 
 - **`frameart`** — one-shot CLI commands
-- **`frameart-api`** — long-running HTTP API server on port 8000
+- **`frameart-api`** — HTTP API on port 8000 using Docker bridge networking
+- **`frameart-api-lan`** — recommended Linux API deployment with host networking for
+  Samsung TV discovery and control
 
 ```bash
 # CLI one-shot
@@ -481,16 +483,18 @@ docker compose run --rm frameart generate-and-apply \
     --prompt "a peaceful zen garden" \
     --tv-ip 192.168.1.100
 
-# API server (runs in background)
-docker compose up -d frameart-api
+# API server with SSDP discovery and Samsung TV control (runs in background)
+docker compose --profile lan up -d frameart-api-lan
 curl http://localhost:8000/health
 ```
 
-For Samsung TV control, you need host networking so the container can reach the TV's WebSocket port:
+The regular `frameart-api` service is useful when generation is all you need. Docker bridge
+networking does not reliably carry the SSDP multicast traffic used by **Scan Network**. On a
+Linux host, use `frameart-api-lan` whenever FrameArt needs to discover or control TVs. The LAN
+service binds directly to the host's port 8000 and therefore does not use a `ports` mapping.
 
-```yaml
-# In docker-compose.yml, uncomment:
-network_mode: host
+```bash
+docker compose --profile lan up -d frameart-api-lan
 ```
 
 #### Build and run directly
@@ -549,8 +553,18 @@ See [docs/LXC.md](docs/LXC.md) for running FrameArt in a Proxmox LXC container. 
 - Verify the TV is powered on (not in deep standby).
 - Ping the TV: `ping 192.168.1.100`
 - Check that ports 8001 (WS) and 8002 (WSS) are accessible.
-- If running in Docker, try `network_mode: host`.
+- If running in Docker on Linux, use
+  `docker compose --profile lan up -d frameart-api-lan`.
 - Visit `http://<TV_IP>:8001/api/v2/` in a browser — you should get a JSON response.
+
+### Scan Network fails or finds no TVs
+
+- Confirm FrameArt and the TV are on the same subnet and client isolation is disabled on Wi-Fi.
+- If running in Docker on Linux, use the `frameart-api-lan` service shown above. The regular
+  bridge-networked API cannot reliably receive LAN SSDP responses.
+- If multicast is blocked by the host or network, open **TVs → Add by IP** and enter the TV's
+  RFC1918 address. Manually added TVs last for the current browser session; persistent TV
+  configuration remains available through `config.yaml`.
 
 ### Upload fails with error -1 on 2018/2019 Frame TVs
 
