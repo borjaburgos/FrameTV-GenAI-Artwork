@@ -18,6 +18,7 @@
   let automationSchedules = [];
   let automationWebhooks = [];
   let automationStatus = null;
+  let liveScoreTrackers = [];
   let editingProviderName = null;
   let editingTVProfileId = null;
   const generationJobs = new Map();
@@ -456,6 +457,9 @@
     }
     if (pageName === 'automations') loadAutomations().catch((error) => {
       showToast(error?.message || 'Could not load automations.', 'error');
+    });
+    if (pageName === 'modes') loadLiveScores().catch((error) => {
+      showToast(error?.message || 'Could not load live modes.', 'error');
     });
     if (pageName === 'create' && getActiveCreateModeName() === 'ai') loadGenerationJobsFromAPI();
   }
@@ -1377,6 +1381,166 @@
   }
 
   // =========================================================================
+  // Live Score mode
+  // =========================================================================
+  function renderLiveScores() {
+    const groups = automationGroups || [];
+    document.getElementById('live-score-group').innerHTML = groups.map((group) =>
+      '<option value="' + esc(group.id) + '">' + esc(group.name) + '</option>'
+    ).join('');
+    document.getElementById('live-score-feed-tracker').innerHTML = liveScoreTrackers.map((tracker) =>
+      '<option value="' + esc(tracker.id) + '">' + esc(tracker.name) + '</option>'
+    ).join('');
+    const list = document.getElementById('live-score-list');
+    if (!liveScoreTrackers.length) {
+      list.innerHTML = '<div class="settings-item"><span>No live-score trackers yet.</span></div>';
+      return;
+    }
+    list.innerHTML = liveScoreTrackers.map((tracker) => {
+      const group = groups.find((item) => item.id === tracker.group_id);
+      const event = tracker.last_event || {};
+      const score = event.home_team
+        ? (event.home_team + ' ' + event.home_score + ' – ' + event.away_score + ' ' + event.away_team)
+        : 'Waiting for a matching live event';
+      const preview = tracker.last_rendered
+        ? '<img class="live-score-preview" src="/modes/live-score/' + esc(tracker.id) +
+          '/image?' + Date.now() + '" alt="Current scoreboard preview">'
+        : '';
+      return '<div class="settings-item"><div class="settings-item-main"><strong>' +
+        esc(tracker.name) + '</strong><span>' + esc(score) + '</span><span>' +
+        esc(tracker.provider) + ' · ' + esc(tracker.tracking_kind) + ': ' +
+        esc(tracker.tracking_value) + ' · ' + esc(group?.name || tracker.group_id) +
+        ' · ' + esc(tracker.last_status || 'new') +
+        (tracker.last_error ? ' · ' + esc(tracker.last_error) : '') + '</span>' + preview +
+        '</div><div class="settings-item-actions">' +
+        '<button class="btn btn-secondary btn-small" data-live-score-refresh="' +
+        esc(tracker.id) + '">Refresh</button>' +
+        '<button class="btn btn-secondary btn-small" data-live-score-toggle="' +
+        esc(tracker.id) + '" data-enabled="' + String(tracker.enabled) + '">' +
+        (tracker.enabled ? 'Pause' : 'Resume') + '</button>' +
+        '<button class="btn btn-danger btn-small" data-live-score-delete="' +
+        esc(tracker.id) + '">Delete</button></div></div>';
+    }).join('');
+  }
+
+  async function loadLiveScores(triggerButton) {
+    if (triggerButton) setButtonBusy(triggerButton, 'Refreshing...');
+    try {
+      const [trackerResponse, groupResponse] = await Promise.all([
+        apiFetch('/modes/live-score'),
+        apiFetch('/automation/groups'),
+      ]);
+      liveScoreTrackers = await parseJSONResponse(
+        trackerResponse,
+        'Could not load live-score trackers.',
+      );
+      automationGroups = await parseJSONResponse(groupResponse, 'Could not load TV groups.');
+      renderLiveScores();
+    } finally {
+      if (triggerButton) clearButtonBusy(triggerButton);
+    }
+  }
+
+  document.getElementById('btn-modes-refresh').addEventListener('click', (event) => {
+    loadLiveScores(event.currentTarget).catch((error) => showToast(error.message, 'error'));
+  });
+  document.getElementById('live-score-provider').addEventListener('change', (event) => {
+    const keyInput = document.getElementById('live-score-key');
+    keyInput.disabled = event.target.value === 'manual';
+    keyInput.placeholder = event.target.value === 'manual'
+      ? 'Not used for a manual feed'
+      : 'Required for TheSportsDB';
+  });
+  document.getElementById('btn-live-score-create').addEventListener('click', async (event) => {
+    const provider = document.getElementById('live-score-provider').value;
+    const body = {
+      name: document.getElementById('live-score-name').value.trim(),
+      provider,
+      tracking_kind: document.getElementById('live-score-kind').value,
+      tracking_value: document.getElementById('live-score-value').value.trim(),
+      group_id: document.getElementById('live-score-group').value,
+      poll_seconds: Number(document.getElementById('live-score-poll').value),
+      refresh_seconds: Number(document.getElementById('live-score-refresh').value),
+      theme: document.getElementById('live-score-theme').value,
+      enabled: true,
+    };
+    const apiKey = document.getElementById('live-score-key').value.trim();
+    if (apiKey) body.api_key = apiKey;
+    if (!body.name || !body.tracking_value || !body.group_id) {
+      showToast('Enter a name and target, and choose a TV group.', 'warn'); return;
+    }
+    setButtonBusy(event.currentTarget, 'Creating...');
+    try {
+      const response = await apiFetch('/modes/live-score', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+      });
+      await parseJSONResponse(response, 'Could not create live-score tracker.');
+      document.getElementById('live-score-name').value = '';
+      document.getElementById('live-score-key').value = '';
+      await loadLiveScores();
+      showToast('Live-score tracker created.', 'done');
+    } catch (error) { showToast(error.message, 'error'); }
+    finally { clearButtonBusy(event.currentTarget); }
+  });
+  document.getElementById('btn-live-score-feed').addEventListener('click', async (event) => {
+    const trackerId = document.getElementById('live-score-feed-tracker').value;
+    const progress = document.getElementById('live-score-feed-progress').value.trim() || 'Live';
+    const body = {
+      event_id: document.getElementById('live-score-feed-event').value.trim(),
+      league: document.getElementById('live-score-feed-league').value.trim(),
+      sport: document.getElementById('live-score-feed-sport').value.trim(),
+      home_team: document.getElementById('live-score-feed-home').value.trim(),
+      away_team: document.getElementById('live-score-feed-away').value.trim(),
+      home_score: document.getElementById('live-score-feed-home-score').value.trim() || '-',
+      away_score: document.getElementById('live-score-feed-away-score').value.trim() || '-',
+      status: progress,
+      progress,
+      highlights: document.getElementById('live-score-feed-highlights').value
+        .split('\n').map((item) => item.trim()).filter(Boolean),
+    };
+    if (!trackerId || !body.event_id || !body.league || !body.home_team || !body.away_team) {
+      showToast('Choose a tracker and complete event, league, and team names.', 'warn'); return;
+    }
+    setButtonBusy(event.currentTarget, 'Sending...');
+    try {
+      const response = await apiFetch('/modes/live-score/' + trackerId + '/feed', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+      });
+      const result = await parseJSONResponse(response, 'Could not apply score update.');
+      await loadLiveScores();
+      showToast('Score update ' + result.status + '.', result.status === 'error' ? 'error' : 'done');
+    } catch (error) { showToast(error.message, 'error'); }
+    finally { clearButtonBusy(event.currentTarget); }
+  });
+  document.getElementById('live-score-list').addEventListener('click', async (event) => {
+    const refresh = event.target.closest('[data-live-score-refresh]');
+    const toggle = event.target.closest('[data-live-score-toggle]');
+    const remove = event.target.closest('[data-live-score-delete]');
+    const button = refresh || toggle || remove;
+    if (!button) return;
+    setButtonBusy(button, refresh ? 'Refreshing...' : 'Saving...');
+    try {
+      if (refresh) {
+        const response = await apiFetch('/modes/live-score/' + refresh.dataset.liveScoreRefresh + '/refresh', {method: 'POST'});
+        const result = await parseJSONResponse(response, 'Score refresh failed.');
+        showToast('Live score ' + result.status + '.', result.status === 'error' ? 'error' : 'done');
+      } else if (toggle) {
+        const response = await apiFetch('/modes/live-score/' + toggle.dataset.liveScoreToggle + '/enabled', {
+          method: 'PUT', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({enabled: toggle.dataset.enabled !== 'true'}),
+        });
+        await parseJSONResponse(response, 'Could not update tracker.');
+      } else if (remove) {
+        if (!window.confirm('Delete this live-score tracker and its current TV image?')) return;
+        const response = await apiFetch('/modes/live-score/' + remove.dataset.liveScoreDelete, {method: 'DELETE'});
+        await parseJSONResponse(response, 'Could not delete tracker.');
+      }
+      await loadLiveScores();
+    } catch (error) { showToast(error.message, 'error'); }
+    finally { clearButtonBusy(button); }
+  });
+
+  // =========================================================================
   // TV groups, playlists, schedules, and integration hooks
   // =========================================================================
   function renderAutomationTVChoices() {
@@ -1553,7 +1717,10 @@
     setButtonBusy(event.currentTarget, 'Adding...');
     try {
       const created = await writeAutomation('/automation/webhooks', 'POST', {
-        name, url, events: ['schedule.completed', 'schedule.partial', 'schedule.failed', 'integration.test'],
+        name, url, events: [
+          'schedule.completed', 'schedule.partial', 'schedule.failed',
+          'live_score.displayed', 'live_score.partial', 'live_score.error', 'integration.test',
+        ],
       }, 'Could not add webhook.');
       window.alert('Save this webhook signing secret now; it will not be shown again:\n\n' + created.secret);
       document.getElementById('automation-webhook-name').value = '';

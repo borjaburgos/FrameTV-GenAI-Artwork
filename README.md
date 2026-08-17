@@ -18,6 +18,7 @@ FrameArt is a self-hosted tool that accepts a text description, generates an ima
 - **Managed artwork library**: Search, tags, named collections, bulk organization, and display history
 - **TV groups and playlists**: Fan out to named groups and rotate ordered library artwork
 - **Durable schedules and integrations**: Restart-safe intervals, signed webhooks, optional MQTT, and Home Assistant-compatible control endpoints
+- **Live Score mode**: League/team/game tracking, 4K scoreboard stills, highlight feeds, and bounded host/TV storage
 - **Public domain artwork support**: Search and apply art from major open-access museum collections
 - **Style presets**: abstract, oil_painting, watercolor, kid_drawing, and more
 - **Pluggable upscalers**: Built-in Pillow LANCZOS, local HTTP (Real-ESRGAN), or remote services
@@ -255,6 +256,16 @@ Loopback-only serving leaves authentication off by default. Non-loopback binds a
 | `GET/POST` | `/automation/webhooks` | Manage signed outbound event hooks |
 | `GET` | `/automation/status` | Scheduler, MQTT, and integration readiness |
 
+**Live Score mode**:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET/POST` | `/modes/live-score` | List or create live-score trackers |
+| `POST` | `/modes/live-score/{id}/refresh` | Poll/render a tracker immediately |
+| `POST` | `/modes/live-score/{id}/feed` | Submit a normalized score/highlight event |
+| `PUT` | `/modes/live-score/{id}/enabled` | Pause or resume tracking |
+| `GET` | `/modes/live-score/{id}/image` | Preview the current 4K scoreboard still |
+
 **Public domain catalog**:
 
 | Method | Path | Description |
@@ -486,6 +497,20 @@ Install `frameart[integrations]` to enable MQTT. Schedule events publish at
 `X-FrameArt-Event` and an HMAC-SHA256 `X-FrameArt-Signature`; the signing secret is
 shown only when the webhook is created. Home Assistant can call a schedule's `/run`
 endpoint with `Authorization: Bearer <FRAMEART_AUTOMATION_TOKEN>`.
+
+### Live Score data sources and retention
+
+The built-in [TheSportsDB v2 livescore API](https://www.thesportsdb.com/docs_api_guide)
+requires a premium API key. Trackers can filter its live feed by sport, league, exact team,
+or event ID. The `manual` provider accepts the normalized `/feed` payload, which makes it
+possible to connect another sports API or push goals, fouls, key plays, and other highlights
+from Home Assistant, Node-RED, or a small webhook translator.
+
+Polling can run every 30 seconds, minute, or five minutes, but actual freshness is determined
+by the upstream provider. FrameArt renders deterministic Pillow scoreboards instead of paying
+for a generative image on every update. Each tracker atomically overwrites one host image. On
+the TV, FrameArt uploads and switches to the new still before deleting the previous content ID;
+failed deletions are retained in a small retry list rather than allowing unbounded state.
 
 ### Multiple TVs
 
@@ -752,6 +777,7 @@ frameart/
   library.py          # Tags, collections, and TV display history
   automation.py       # TV groups, playlists, scheduler, webhooks, and MQTT
   backup.py           # Consistent private backups and recoverable restore
+  live_score.py       # Sports feeds, 4K scoreboard rendering, bounded display loop
   pipeline.py         # Core orchestration: generate -> postprocess -> upload -> switch
   config.py           # Configuration management (YAML + env vars + CLI flags)
   postprocess.py      # 16:9 crop + 4K resize logic

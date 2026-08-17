@@ -217,3 +217,44 @@ test('creates TV groups, playlists, and durable schedules', async ({ page, reque
     await rm(jobDir, { recursive: true, force: true });
   }
 });
+
+test('creates, pauses, and deletes a live-score mode', async ({ page, request }) => {
+  await request.post('/settings/tvs', {
+    data: {
+      profile_id: 'e2e_score_tv',
+      ip: '192.168.50.27',
+      port: 8002,
+      client_name: 'FrameArt E2E',
+      ssl: true,
+    },
+  });
+  const groupResponse = await request.post('/automation/groups', {
+    data: { name: 'E2E Score Group', tv_profile_ids: ['e2e_score_tv'] },
+  });
+  const group = await groupResponse.json();
+
+  try {
+    await page.goto('/');
+    await page.locator('.tabs').getByRole('button', { name: 'Modes' }).click();
+    await expect(page.getByRole('heading', { name: 'Live Display Modes' })).toBeVisible();
+    await page.getByLabel('Tracker name').fill('E2E Live Score');
+    await page.getByLabel('Score provider').selectOption('manual');
+    await page.getByLabel('Track by').selectOption('game');
+    await page.getByLabel('League, team, game, or sport').fill('e2e-game');
+    await page.locator('#live-score-group').selectOption(group.id);
+    await page.getByRole('button', { name: 'Create Live Score' }).click();
+
+    const tracker = page.locator('#live-score-list .settings-item').filter({
+      hasText: 'E2E Live Score',
+    });
+    await expect(tracker).toContainText('manual');
+    await tracker.getByRole('button', { name: 'Pause' }).click();
+    await expect(tracker.getByRole('button', { name: 'Resume' })).toBeVisible();
+    page.once('dialog', (dialog) => dialog.accept());
+    await tracker.getByRole('button', { name: 'Delete' }).click();
+    await expect(tracker).toHaveCount(0);
+  } finally {
+    await request.delete('/automation/groups/' + group.id);
+    await request.delete('/settings/tvs/e2e_score_tv');
+  }
+});
