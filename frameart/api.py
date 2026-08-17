@@ -54,6 +54,7 @@ import time
 import uuid
 from collections import defaultdict, deque
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from io import BytesIO
 from ipaddress import ip_address
@@ -71,6 +72,12 @@ from pydantic import AfterValidator, BaseModel, Field, SecretStr, field_validato
 
 import frameart.public_domain as public_domain
 from frameart import __version__
+from frameart.automation import (
+    AutomationScheduler,
+    AutomationStore,
+    IntegrationPublisher,
+    display_artifact,
+)
 from frameart.config import STYLE_PRESETS, ProviderConfig, Settings, TVProfile, load_settings
 from frameart.jobs import JobQueueFullError
 from frameart.library import LibraryStore
@@ -109,7 +116,7 @@ _PUBLIC_PATHS = {
 }
 _PUBLIC_PREFIXES = ("/static/",)
 _ADMIN_PATHS = {"/jobs/delete", "/tv/art/delete", "/tv/art/matte"}
-_ADMIN_PREFIXES = ("/settings",)
+_ADMIN_PREFIXES = ("/settings", "/automation")
 _rate_limit_events: dict[str, deque[float]] = defaultdict(deque)
 _rate_limit_lock = threading.Lock()
 
@@ -134,10 +141,24 @@ PrivateTVIPv4 = Annotated[str, AfterValidator(_private_tv_ip)]
 ContentId = Annotated[str, Field(pattern=_IDENTIFIER_RE)]
 JobId = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")]
 
+_automation_scheduler = AutomationScheduler(load_settings)
+
+
+@asynccontextmanager
+async def _app_lifespan(_app: FastAPI):
+    """Run the durable automation loop for every ASGI deployment."""
+    _automation_scheduler.start()
+    try:
+        yield
+    finally:
+        _automation_scheduler.stop()
+
+
 app = FastAPI(
     title="FrameArt",
     version=__version__,
     description="Generate AI artwork and display it on Samsung Frame TVs.",
+    lifespan=_app_lifespan,
 )
 
 
@@ -172,6 +193,14 @@ def _token_scopes(settings, token: str | None) -> set[str]:
 
 
 def _required_scope(request: Request) -> str:
+    if request.url.path == "/automation/status" and request.method == "GET":
+        return "read"
+    if (
+        request.method == "POST"
+        and request.url.path.startswith("/automation/")
+        and (request.url.path.endswith("/run") or request.url.path.endswith("/display"))
+    ):
+        return "control"
     if request.url.path.startswith(_ADMIN_PREFIXES):
         return "admin"
     if request.method in {"GET", "HEAD", "OPTIONS"}:
@@ -619,6 +648,108 @@ class CollectionItemsRequest(BaseModel):
     job_ids: list[JobId] = Field(..., min_length=1, max_length=100)
 
 
+AutomationId = Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")]
+
+
+class TVGroupCreateRequest(BaseModel):
+    """Create a named fan-out target from persistent TV profiles."""
+
+    name: str = Field(..., min_length=1, max_length=100)
+    tv_profile_ids: list[ProfileId] = Field(..., min_length=1, max_length=32)
+
+    @field_validator("name")
+    @classmethod
+    def strip_group_name(cls, value: str) -> str:
+        return _strip_nonempty(value)
+
+
+class AutomationPlaylistCreateRequest(BaseModel):
+    """Create an ordered rotation from library artwork jobs."""
+
+    name: str = Field(..., min_length=1, max_length=100)
+    job_ids: list[JobId] = Field(..., min_length=1, max_length=500)
+
+    @field_validator("name")
+    @classmethod
+    def strip_playlist_name(cls, value: str) -> str:
+        return _strip_nonempty(value)
+
+
+class AutomationScheduleCreateRequest(BaseModel):
+    """Create a durable interval schedule for one playlist and TV group."""
+
+    name: str = Field(..., min_length=1, max_length=100)
+    playlist_id: AutomationId
+    group_id: AutomationId
+    interval_seconds: int = Field(..., ge=30, le=2_592_000)
+    matte: str = Field("none", min_length=1, max_length=100, pattern=_IDENTIFIER_RE)
+    enabled: bool = True
+
+    @field_validator("name")
+    @classmethod
+    def strip_schedule_name(cls, value: str) -> str:
+        return _strip_nonempty(value)
+
+
+class AutomationScheduleEnabledRequest(BaseModel):
+    """Pause or resume an automation schedule."""
+
+    enabled: bool
+
+
+class GroupDisplayRequest(BaseModel):
+    """Immediately display one library artifact across a TV group."""
+
+    job_id: JobId
+    matte: str = Field("none", min_length=1, max_length=100, pattern=_IDENTIFIER_RE)
+
+
+class WebhookCreateRequest(BaseModel):
+    """Register a signed outbound integration webhook."""
+
+    name: str = Field(..., min_length=1, max_length=100)
+    url: str = Field(..., min_length=8, max_length=2048)
+    events: list[str] = Field(default_factory=lambda: ["schedule.completed"], max_length=10)
+
+    @field_validator("name")
+    @classmethod
+    def strip_webhook_name(cls, value: str) -> str:
+        return _strip_nonempty(value)
+
+    @field_validator("url")
+    @classmethod
+    def validate_webhook_url(cls, value: str) -> str:
+        parsed = urlsplit(value.strip())
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.username
+            or parsed.password
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "url must be an absolute http(s) URL without credentials or a fragment"
+            )
+        return value.strip()
+
+    @field_validator("events")
+    @classmethod
+    def validate_webhook_events(cls, value: list[str]) -> list[str]:
+        supported = {
+            "schedule.completed",
+            "schedule.partial",
+            "schedule.failed",
+            "integration.test",
+        }
+        normalized = list(dict.fromkeys(event.strip() for event in value if event.strip()))
+        unsupported = sorted(set(normalized) - supported)
+        if not normalized or unsupported:
+            raise ValueError(
+                "events must contain supported schedule or integration events"
+            )
+        return normalized
+
+
 CollectionId = Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")]
 
 
@@ -679,6 +810,11 @@ def _settings():
 def _library_store(settings=None) -> LibraryStore:
     settings = settings or _settings()
     return LibraryStore(settings.data_dir)
+
+
+def _automation_store(settings=None) -> AutomationStore:
+    settings = settings or _settings()
+    return AutomationStore(settings.data_dir)
 
 
 _SENSITIVE_SETTING_TERMS = ("api_key", "password", "secret", "token")
@@ -2372,6 +2508,202 @@ def get_library_history(
     limit: int = Query(100, ge=1, le=500, description="Maximum display events."),
 ):
     return _library_store().list_history(limit)
+
+
+# ---------------------------------------------------------------------------
+# Routes — TV groups, playlists, schedules, and integrations
+# ---------------------------------------------------------------------------
+
+
+@app.get("/automation/groups")
+def list_tv_groups():
+    return _automation_store().list_groups()
+
+
+@app.post("/automation/groups", status_code=201)
+def create_tv_group(req: TVGroupCreateRequest):
+    settings = _settings()
+    profile_ids = list(dict.fromkeys(req.tv_profile_ids))
+    missing = sorted(set(profile_ids) - set(settings.tvs))
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown persistent TV profile(s): {', '.join(missing)}.",
+        )
+    try:
+        return _automation_store(settings).create_group(req.name, profile_ids)
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="A TV group with that name exists.") from exc
+
+
+@app.delete("/automation/groups/{group_id}")
+def delete_tv_group(group_id: AutomationId):
+    if not _automation_store().delete_group(group_id):
+        raise HTTPException(status_code=404, detail="TV group was not found.")
+    return {"deleted": group_id}
+
+
+@app.post("/automation/groups/{group_id}/display")
+def display_job_on_tv_group(group_id: AutomationId, req: GroupDisplayRequest):
+    settings = _settings()
+    group = _automation_store(settings).get_group(group_id)
+    if not group:
+        raise HTTPException(status_code=404, detail="TV group was not found.")
+    try:
+        _find_job_image_path(settings, req.job_id)
+    except HTTPException as exc:
+        raise HTTPException(status_code=404, detail="Artwork job was not found.") from exc
+    results: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for profile_id in group["tv_profile_ids"]:
+        try:
+            results.append(display_artifact(settings, req.job_id, profile_id, req.matte))
+        except Exception as exc:
+            errors.append(f"{profile_id}: {exc}")
+    return {
+        "status": "completed" if results and not errors else ("partial" if results else "failed"),
+        "job_id": req.job_id,
+        "group_id": group_id,
+        "results": results,
+        "errors": errors,
+    }
+
+
+@app.get("/automation/playlists")
+def list_automation_playlists():
+    return _automation_store().list_playlists()
+
+
+@app.post("/automation/playlists", status_code=201)
+def create_automation_playlist(req: AutomationPlaylistCreateRequest):
+    settings = _settings()
+    job_ids = list(dict.fromkeys(req.job_ids))
+    missing: list[str] = []
+    for job_id in job_ids:
+        try:
+            _find_job_image_path(settings, job_id)
+        except HTTPException:
+            missing.append(job_id)
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Artwork job(s) not found: {', '.join(missing)}.",
+        )
+    try:
+        return _automation_store(settings).create_playlist(req.name, job_ids)
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="A playlist with that name exists.") from exc
+
+
+@app.delete("/automation/playlists/{playlist_id}")
+def delete_automation_playlist(playlist_id: AutomationId):
+    if not _automation_store().delete_playlist(playlist_id):
+        raise HTTPException(status_code=404, detail="Playlist was not found.")
+    return {"deleted": playlist_id}
+
+
+@app.get("/automation/schedules")
+def list_automation_schedules():
+    return _automation_store().list_schedules()
+
+
+@app.post("/automation/schedules", status_code=201)
+def create_automation_schedule(req: AutomationScheduleCreateRequest):
+    store = _automation_store()
+    if store.get_playlist(req.playlist_id) is None:
+        raise HTTPException(status_code=422, detail="Playlist was not found.")
+    if store.get_group(req.group_id) is None:
+        raise HTTPException(status_code=422, detail="TV group was not found.")
+    try:
+        return store.create_schedule(
+            name=req.name,
+            playlist_id=req.playlist_id,
+            group_id=req.group_id,
+            interval_seconds=req.interval_seconds,
+            matte=req.matte,
+            enabled=req.enabled,
+        )
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="A schedule with that name exists.") from exc
+
+
+@app.put("/automation/schedules/{schedule_id}/enabled")
+def set_automation_schedule_enabled(
+    schedule_id: AutomationId,
+    req: AutomationScheduleEnabledRequest,
+):
+    store = _automation_store()
+    if not store.set_schedule_enabled(schedule_id, req.enabled):
+        raise HTTPException(status_code=404, detail="Schedule was not found.")
+    return store.get_schedule(schedule_id)
+
+
+@app.post("/automation/schedules/{schedule_id}/run")
+def run_automation_schedule(schedule_id: AutomationId):
+    try:
+        return _automation_scheduler.run_schedule(schedule_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Schedule was not found.") from exc
+    except (FileNotFoundError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.delete("/automation/schedules/{schedule_id}")
+def delete_automation_schedule(schedule_id: AutomationId):
+    if not _automation_store().delete_schedule(schedule_id):
+        raise HTTPException(status_code=404, detail="Schedule was not found.")
+    return {"deleted": schedule_id}
+
+
+@app.get("/automation/webhooks")
+def list_automation_webhooks():
+    return _automation_store().list_webhooks()
+
+
+@app.post("/automation/webhooks", status_code=201)
+def create_automation_webhook(req: WebhookCreateRequest):
+    try:
+        return _automation_store().create_webhook(req.name, req.url, req.events)
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="A webhook with that name exists.") from exc
+
+
+@app.delete("/automation/webhooks/{webhook_id}")
+def delete_automation_webhook(webhook_id: AutomationId):
+    if not _automation_store().delete_webhook(webhook_id):
+        raise HTTPException(status_code=404, detail="Webhook was not found.")
+    return {"deleted": webhook_id}
+
+
+@app.post("/automation/webhooks/test")
+def test_automation_webhooks():
+    return {
+        "event": "integration.test",
+        "deliveries": IntegrationPublisher(_automation_store()).publish(
+            "integration.test", {"message": "FrameArt webhook test"}
+        ),
+    }
+
+
+@app.get("/automation/status")
+def automation_status():
+    settings = _settings()
+    store = _automation_store(settings)
+    return {
+        "scheduler_running": bool(
+            _automation_scheduler._thread and _automation_scheduler._thread.is_alive()
+        ),
+        "groups": len(store.list_groups()),
+        "playlists": len(store.list_playlists()),
+        "schedules": len(store.list_schedules()),
+        "webhooks": len(store.list_webhooks()),
+        "mqtt": IntegrationPublisher.mqtt_status(),
+        "home_assistant": {
+            "rest_api": "/automation/schedules/{schedule_id}/run",
+            "authentication": "Bearer automation/admin token",
+            "note": "Automation management routes require an admin token.",
+        },
+    }
 
 
 @app.post("/jobs/delete", response_model=DeleteJobsResponse)

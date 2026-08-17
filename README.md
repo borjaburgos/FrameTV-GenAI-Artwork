@@ -16,6 +16,8 @@ FrameArt is a self-hosted tool that accepts a text description, generates an ima
 - **Persistent async job queue**: Restart-safe SQLite status, results, and bounded history
 - **Web UI**: Built-in browser interface with provider/model dropdowns and concurrent async job tracking
 - **Managed artwork library**: Search, tags, named collections, bulk organization, and display history
+- **TV groups and playlists**: Fan out to named groups and rotate ordered library artwork
+- **Durable schedules and integrations**: Restart-safe intervals, signed webhooks, optional MQTT, and Home Assistant-compatible control endpoints
 - **Public domain artwork support**: Search and apply art from major open-access museum collections
 - **Style presets**: abstract, oil_painting, watercolor, kid_drawing, and more
 - **Pluggable upscalers**: Built-in Pillow LANCZOS, local HTTP (Real-ESRGAN), or remote services
@@ -249,6 +251,19 @@ Loopback-only serving leaves authentication off by default. Non-loopback binds a
 | `POST/DELETE` | `/library/collections/{id}/items` | Add or remove collection items |
 | `GET` | `/library/history` | List recent TV display history |
 
+**Automations**:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET/POST` | `/automation/groups` | List or create named persistent-TV groups |
+| `POST` | `/automation/groups/{id}/display` | Display one library job across a group |
+| `GET/POST` | `/automation/playlists` | List or create ordered library playlists |
+| `GET/POST` | `/automation/schedules` | List or create restart-safe interval schedules |
+| `POST` | `/automation/schedules/{id}/run` | Run one schedule immediately |
+| `PUT` | `/automation/schedules/{id}/enabled` | Pause or resume a schedule |
+| `GET/POST` | `/automation/webhooks` | Manage signed outbound event hooks |
+| `GET` | `/automation/status` | Scheduler, MQTT, and integration readiness |
+
 **Public domain catalog**:
 
 | Method | Path | Description |
@@ -470,6 +485,16 @@ See [`config.example.yaml`](config.example.yaml) for all options.
 | `FRAMEART_ADMIN_TOKEN` | Full-access API token; generated on first authenticated start when omitted |
 | `FRAMEART_AUTOMATION_TOKEN` | Optional read/control token without destructive admin access |
 | `FRAMEART_API_RATE_LIMIT_PER_MINUTE` | Per-client mutation limit (default: `60`) |
+| `FRAMEART_MQTT_BROKER` | Optional MQTT hostname for schedule events |
+| `FRAMEART_MQTT_PORT` | MQTT port (default: `1883`) |
+| `FRAMEART_MQTT_USERNAME` / `FRAMEART_MQTT_PASSWORD` | Optional MQTT credentials |
+| `FRAMEART_MQTT_TOPIC_PREFIX` | MQTT topic prefix (default: `frameart`) |
+
+Install `frameart[integrations]` to enable MQTT. Schedule events publish at
+`<prefix>/events/schedule.<status>`. Outbound HTTP webhooks include
+`X-FrameArt-Event` and an HMAC-SHA256 `X-FrameArt-Signature`; the signing secret is
+shown only when the webhook is created. Home Assistant can call a schedule's `/run`
+endpoint with `Authorization: Bearer <FRAMEART_AUTOMATION_TOKEN>`.
 
 ### Multiple TVs
 
@@ -682,6 +707,7 @@ frameart/
   api.py              # FastAPI HTTP server (sync + async endpoints)
   jobs.py             # Async executor + restart-safe SQLite status history
   library.py          # Tags, collections, and TV display history
+  automation.py       # TV groups, playlists, scheduler, webhooks, and MQTT
   pipeline.py         # Core orchestration: generate -> postprocess -> upload -> switch
   config.py           # Configuration management (YAML + env vars + CLI flags)
   postprocess.py      # 16:9 crop + 4K resize logic
@@ -711,15 +737,13 @@ frameart/
 
 ## Known Limitations
 
-- **No HTTPS on the API server.** Same recommendation: use a reverse proxy to terminate TLS.
+- **No HTTPS on the API server.** Use a reverse proxy to terminate TLS.
 - **Running jobs cannot resume mid-generation after a restart.** Their records survive and are marked failed with an interruption reason; completed results and bounded history remain available.
 - **API rate limiting is per process.** This is appropriate for the supported single-worker local deployment; use a reverse proxy for distributed/global limits.
 
 ### Potential Future Work
 
-- Webhook/callback on job completion
-- Scheduling (cron-like "change art every morning")
-- Multi-TV fan-out (upload to all TVs at once)
+- Calendar/cron schedule rules in addition to durable intervals
 - Additional image providers (Anthropic, Stability AI)
 
 ---

@@ -13,6 +13,11 @@
   let managedSettingsBackups = [];
   let managedCollections = [];
   let loadedGalleryJobs = {};
+  let automationGroups = [];
+  let automationPlaylists = [];
+  let automationSchedules = [];
+  let automationWebhooks = [];
+  let automationStatus = null;
   let editingProviderName = null;
   let editingTVProfileId = null;
   const generationJobs = new Map();
@@ -449,6 +454,9 @@
         showToast(error?.message || 'Could not load library metadata.', 'error');
       });
     }
+    if (pageName === 'automations') loadAutomations().catch((error) => {
+      showToast(error?.message || 'Could not load automations.', 'error');
+    });
     if (pageName === 'create' && getActiveCreateModeName() === 'ai') loadGenerationJobsFromAPI();
   }
 
@@ -1368,6 +1376,225 @@
     status.classList.toggle('visible', Boolean(message));
   }
 
+  // =========================================================================
+  // TV groups, playlists, schedules, and integration hooks
+  // =========================================================================
+  function renderAutomationTVChoices() {
+    const container = document.getElementById('automation-group-tvs');
+    if (!container) return;
+    if (!managedTVSettings.length) {
+      container.innerHTML = '<span class="empty">Add a persistent TV in Settings first.</span>';
+      return;
+    }
+    container.innerHTML = managedTVSettings.map((tv) =>
+      '<label><input type="checkbox" value="' + esc(tv.profile_id) + '">' +
+      '<span>' + esc(tv.profile_id) + ' · ' + esc(tv.ip) + '</span></label>'
+    ).join('');
+  }
+
+  function renderAutomationState() {
+    const groupList = document.getElementById('automation-group-list');
+    groupList.innerHTML = automationGroups.length ? automationGroups.map((group) =>
+      '<div class="settings-item"><div class="settings-item-main"><strong>' + esc(group.name) +
+      '</strong><span>' + esc(group.tv_profile_ids.join(', ')) + '</span></div>' +
+      '<div class="settings-item-actions"><button class="btn btn-danger btn-small" ' +
+      'data-automation-delete="group" data-id="' + esc(group.id) + '">Delete</button></div></div>'
+    ).join('') : '<div class="settings-item"><span>No TV groups yet.</span></div>';
+
+    const playlistList = document.getElementById('automation-playlist-list');
+    playlistList.innerHTML = automationPlaylists.length ? automationPlaylists.map((playlist) =>
+      '<div class="settings-item"><div class="settings-item-main"><strong>' + esc(playlist.name) +
+      '</strong><span>' + playlist.job_ids.length + ' artwork(s)</span></div>' +
+      '<div class="settings-item-actions"><button class="btn btn-danger btn-small" ' +
+      'data-automation-delete="playlist" data-id="' + esc(playlist.id) + '">Delete</button></div></div>'
+    ).join('') : '<div class="settings-item"><span>No playlists yet.</span></div>';
+
+    const playlistSelect = document.getElementById('automation-schedule-playlist');
+    playlistSelect.innerHTML = automationPlaylists.map((item) =>
+      '<option value="' + esc(item.id) + '">' + esc(item.name) + '</option>'
+    ).join('');
+    const groupSelect = document.getElementById('automation-schedule-group');
+    groupSelect.innerHTML = automationGroups.map((item) =>
+      '<option value="' + esc(item.id) + '">' + esc(item.name) + '</option>'
+    ).join('');
+
+    const scheduleList = document.getElementById('automation-schedule-list');
+    scheduleList.innerHTML = automationSchedules.length ? automationSchedules.map((schedule) => {
+      const playlist = automationPlaylists.find((item) => item.id === schedule.playlist_id);
+      const group = automationGroups.find((item) => item.id === schedule.group_id);
+      const last = schedule.last_status
+        ? ('Last: ' + schedule.last_status + (schedule.last_error ? ' · ' + schedule.last_error : ''))
+        : 'Not run yet';
+      return '<div class="settings-item"><div class="settings-item-main"><strong>' +
+        esc(schedule.name) + '</strong><span>' + esc(playlist?.name || schedule.playlist_id) +
+        ' → ' + esc(group?.name || schedule.group_id) + ' · every ' +
+        esc(String(schedule.interval_seconds)) + 's · ' + esc(last) + '</span></div>' +
+        '<div class="settings-item-actions"><button class="btn btn-secondary btn-small" ' +
+        'data-automation-run="' + esc(schedule.id) + '">Run Now</button>' +
+        '<button class="btn btn-secondary btn-small" data-automation-toggle="' +
+        esc(schedule.id) + '" data-enabled="' + String(schedule.enabled) + '">' +
+        (schedule.enabled ? 'Pause' : 'Resume') + '</button>' +
+        '<button class="btn btn-danger btn-small" data-automation-delete="schedule" data-id="' +
+        esc(schedule.id) + '">Delete</button></div></div>';
+    }).join('') : '<div class="settings-item"><span>No schedules yet.</span></div>';
+
+    const webhookList = document.getElementById('automation-webhook-list');
+    webhookList.innerHTML = automationWebhooks.length ? automationWebhooks.map((webhook) =>
+      '<div class="settings-item"><div class="settings-item-main"><strong>' + esc(webhook.name) +
+      '</strong><span>' + esc(webhook.url) + ' · ' + esc(webhook.events.join(', ')) + '</span></div>' +
+      '<div class="settings-item-actions"><button class="btn btn-danger btn-small" ' +
+      'data-automation-delete="webhook" data-id="' + esc(webhook.id) + '">Delete</button></div></div>'
+    ).join('') : '<div class="settings-item"><span>No outbound webhooks.</span></div>';
+
+    const mqtt = automationStatus?.mqtt || {};
+    document.getElementById('automation-integration-status').innerHTML =
+      '<div class="settings-item"><div class="settings-item-main"><strong>Scheduler</strong><span>' +
+      (automationStatus?.scheduler_running ? 'Running' : 'Stopped') + '</span></div></div>' +
+      '<div class="settings-item"><div class="settings-item-main"><strong>MQTT</strong><span>' +
+      (mqtt.configured
+        ? ('Configured for ' + esc(mqtt.broker || 'broker') +
+          (mqtt.dependency_installed ? '' : ' · install frameart[integrations]'))
+        : 'Set FRAMEART_MQTT_BROKER to publish schedule events') +
+      '</span></div></div>';
+  }
+
+  async function loadAutomations(triggerButton) {
+    if (triggerButton) setButtonBusy(triggerButton, 'Refreshing...');
+    try {
+      const responses = await Promise.all([
+        apiFetch('/automation/groups'),
+        apiFetch('/automation/playlists'),
+        apiFetch('/automation/schedules'),
+        apiFetch('/automation/webhooks'),
+        apiFetch('/automation/status'),
+        apiFetch('/jobs?limit=200'),
+      ]);
+      const payloads = await Promise.all(responses.map((response) =>
+        parseJSONResponse(response, 'Could not load automation data.')
+      ));
+      [automationGroups, automationPlaylists, automationSchedules, automationWebhooks,
+        automationStatus] = payloads;
+      const jobs = payloads[5] || [];
+      document.getElementById('automation-playlist-jobs').innerHTML = jobs.map((job) =>
+        '<option value="' + esc(job.job_id) + '">' + esc(job.prompt || job.job_id) +
+        ' · ' + esc(job.job_id) + '</option>'
+      ).join('');
+      renderAutomationTVChoices();
+      renderAutomationState();
+    } finally {
+      if (triggerButton) clearButtonBusy(triggerButton);
+    }
+  }
+
+  async function writeAutomation(url, method, body, fallback) {
+    const response = await apiFetch(url, {
+      method,
+      headers: body ? {'Content-Type': 'application/json'} : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    return parseJSONResponse(response, fallback);
+  }
+
+  document.getElementById('btn-automation-refresh').addEventListener('click', (event) => {
+    loadAutomations(event.currentTarget).catch((error) => showToast(error.message, 'error'));
+  });
+  document.getElementById('btn-automation-group-create').addEventListener('click', async (event) => {
+    const name = document.getElementById('automation-group-name').value.trim();
+    const ids = [...document.querySelectorAll('#automation-group-tvs input:checked')]
+      .map((input) => input.value);
+    if (!name || !ids.length) { showToast('Enter a group name and select at least one TV.', 'warn'); return; }
+    setButtonBusy(event.currentTarget, 'Creating...');
+    try {
+      await writeAutomation('/automation/groups', 'POST', {name, tv_profile_ids: ids}, 'Could not create group.');
+      document.getElementById('automation-group-name').value = '';
+      await loadAutomations();
+      showToast('TV group created.', 'done');
+    } catch (error) { showToast(error.message, 'error'); }
+    finally { clearButtonBusy(event.currentTarget); }
+  });
+  document.getElementById('btn-automation-playlist-create').addEventListener('click', async (event) => {
+    const name = document.getElementById('automation-playlist-name').value.trim();
+    const jobIds = [...document.getElementById('automation-playlist-jobs').selectedOptions]
+      .map((option) => option.value);
+    if (!name || !jobIds.length) { showToast('Enter a playlist name and select artwork.', 'warn'); return; }
+    setButtonBusy(event.currentTarget, 'Creating...');
+    try {
+      await writeAutomation('/automation/playlists', 'POST', {name, job_ids: jobIds}, 'Could not create playlist.');
+      document.getElementById('automation-playlist-name').value = '';
+      await loadAutomations();
+      showToast('Playlist created.', 'done');
+    } catch (error) { showToast(error.message, 'error'); }
+    finally { clearButtonBusy(event.currentTarget); }
+  });
+  document.getElementById('btn-automation-schedule-create').addEventListener('click', async (event) => {
+    const body = {
+      name: document.getElementById('automation-schedule-name').value.trim(),
+      playlist_id: document.getElementById('automation-schedule-playlist').value,
+      group_id: document.getElementById('automation-schedule-group').value,
+      interval_seconds: Number(document.getElementById('automation-schedule-interval').value),
+      enabled: true,
+    };
+    if (!body.name || !body.playlist_id || !body.group_id) {
+      showToast('Enter a name and create a playlist and TV group first.', 'warn'); return;
+    }
+    setButtonBusy(event.currentTarget, 'Creating...');
+    try {
+      await writeAutomation('/automation/schedules', 'POST', body, 'Could not create schedule.');
+      document.getElementById('automation-schedule-name').value = '';
+      await loadAutomations();
+      showToast('Schedule created.', 'done');
+    } catch (error) { showToast(error.message, 'error'); }
+    finally { clearButtonBusy(event.currentTarget); }
+  });
+  document.getElementById('btn-automation-webhook-create').addEventListener('click', async (event) => {
+    const name = document.getElementById('automation-webhook-name').value.trim();
+    const url = document.getElementById('automation-webhook-url').value.trim();
+    if (!name || !url) { showToast('Enter a webhook name and URL.', 'warn'); return; }
+    setButtonBusy(event.currentTarget, 'Adding...');
+    try {
+      const created = await writeAutomation('/automation/webhooks', 'POST', {
+        name, url, events: ['schedule.completed', 'schedule.partial', 'schedule.failed', 'integration.test'],
+      }, 'Could not add webhook.');
+      window.alert('Save this webhook signing secret now; it will not be shown again:\n\n' + created.secret);
+      document.getElementById('automation-webhook-name').value = '';
+      document.getElementById('automation-webhook-url').value = '';
+      await loadAutomations();
+    } catch (error) { showToast(error.message, 'error'); }
+    finally { clearButtonBusy(event.currentTarget); }
+  });
+  document.getElementById('btn-automation-webhook-test').addEventListener('click', async (event) => {
+    setButtonBusy(event.currentTarget, 'Sending...');
+    try {
+      const result = await writeAutomation('/automation/webhooks/test', 'POST', null, 'Webhook test failed.');
+      const failed = result.deliveries.filter((item) => !item.ok).length;
+      showToast(failed ? (failed + ' webhook delivery(s) failed.') : 'Webhook test delivered.', failed ? 'error' : 'done');
+    } catch (error) { showToast(error.message, 'error'); }
+    finally { clearButtonBusy(event.currentTarget); }
+  });
+  document.getElementById('panel-automations').addEventListener('click', async (event) => {
+    const run = event.target.closest('[data-automation-run]');
+    const toggle = event.target.closest('[data-automation-toggle]');
+    const remove = event.target.closest('[data-automation-delete]');
+    if (!run && !toggle && !remove) return;
+    const button = run || toggle || remove;
+    setButtonBusy(button, run ? 'Running...' : 'Saving...');
+    try {
+      if (run) {
+        const result = await writeAutomation('/automation/schedules/' + run.dataset.automationRun + '/run', 'POST', null, 'Schedule run failed.');
+        showToast('Schedule ' + result.status + ' for ' + result.job_id + '.', result.status === 'completed' ? 'done' : 'warn');
+      } else if (toggle) {
+        await writeAutomation('/automation/schedules/' + toggle.dataset.automationToggle + '/enabled', 'PUT', {
+          enabled: toggle.dataset.enabled !== 'true',
+        }, 'Could not update schedule.');
+      } else {
+        const paths = {group: 'groups', playlist: 'playlists', schedule: 'schedules', webhook: 'webhooks'};
+        await writeAutomation('/automation/' + paths[remove.dataset.automationDelete] + '/' + remove.dataset.id, 'DELETE', null, 'Could not delete automation.');
+      }
+      await loadAutomations();
+    } catch (error) { showToast(error.message, 'error'); }
+    finally { clearButtonBusy(button); }
+  });
+
   async function reloadRuntimeProviders() {
     const response = await apiFetch('/providers');
     refreshProviderSelects(await parseJSONResponse(response, 'Could not reload providers.'));
@@ -1408,6 +1635,7 @@
       renderSettingsProviders();
       renderSettingsTVSummary();
       renderSettingsBackups();
+      renderAutomationTVChoices();
     } catch (error) {
       const message = error?.message || 'Settings could not be loaded.';
       document.getElementById('settings-provider-list').innerHTML =
