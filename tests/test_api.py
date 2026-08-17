@@ -74,6 +74,75 @@ class TestHealth:
         assert data["status"] == "ok"
         assert "version" in data
 
+    def test_readiness_checks_local_storage(self, managed_config_env):
+        resp = client.get("/health/ready")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert {check["name"] for check in data["checks"]} >= {
+            "data_directory",
+            "settings_store",
+            "disk_space",
+        }
+
+
+class TestDiagnosticsAndBackups:
+    def test_diagnostics_and_support_bundle_never_return_provider_key(
+        self,
+        managed_config_env,
+    ):
+        created = client.put(
+            "/settings/providers/openai",
+            json={"model": "gpt-image-1", "api_key": "never-return-this-key"},
+        )
+        assert created.status_code == 200
+
+        diagnostics = client.get("/settings/diagnostics")
+        assert diagnostics.status_code == 200
+        assert "never-return-this-key" not in diagnostics.text
+        assert diagnostics.json()["configuration"]["provider_key_sources"]["openai"] == "managed"
+
+        support = client.get("/settings/diagnostics/support-bundle")
+        assert support.status_code == 200
+        assert "attachment" in support.headers["content-disposition"]
+        assert "never-return-this-key" not in support.text
+
+    def test_export_import_and_restore_round_trip(self, managed_config_env):
+        update = client.put(
+            "/settings/providers/openai",
+            json={"model": "gpt-image-1", "api_key": "preserved-secret-key"},
+        )
+        assert update.status_code == 200
+        exported = client.get("/settings/export")
+        assert exported.status_code == 200
+        payload = exported.json()
+        assert "preserved-secret-key" not in exported.text
+
+        backup = client.post("/settings/backups")
+        assert backup.status_code == 201
+        backup_id = backup.json()["backup_id"]
+        assert client.get("/settings/backups").json()["backups"]
+
+        payload["settings"]["default_model"] = "imported-model"
+        imported = client.post("/settings/import", json=payload)
+        assert imported.status_code == 200
+        assert client.get("/settings/providers").json()["default_model"] == "imported-model"
+        assert client.get("/settings/providers").json()["providers"][0]["has_api_key"] is True
+
+        restored = client.post(f"/settings/backups/{backup_id}/restore")
+        assert restored.status_code == 200
+        assert client.get("/settings/providers").json()["default_model"] is None
+
+    def test_import_rejects_secret_fields(self, managed_config_env):
+        response = client.post(
+            "/settings/import",
+            json={
+                "schema_version": 1,
+                "settings": {"providers": {"openai": {"api_key": "not-allowed"}}},
+            },
+        )
+        assert response.status_code == 400
+
 
 class TestAuthentication:
     def test_admin_token_creates_browser_session(self, monkeypatch):

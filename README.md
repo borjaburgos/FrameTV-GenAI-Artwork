@@ -66,11 +66,15 @@ Web-managed settings are stored below FrameArt's `data_dir`:
 
 - `settings/managed.yaml` contains non-secret provider, default, and TV configuration.
 - `secrets/provider-keys.yaml` contains provider API keys with owner-only file permissions.
+- `backups/settings/` contains up to 20 owner-only recovery snapshots created automatically
+  before managed changes and on demand from the UI.
 
 Environment variables remain authoritative over web-managed values. When authentication is
 enabled, all `/settings/*` API operations require an admin token. TVs found through **Scan
 Network** or entered through **Add by IP** can be saved as persistent profiles from the TVs
-page.
+page. The **Diagnostics & Backups** card runs local readiness checks, downloads a redacted
+support bundle, exports/imports portable non-secret JSON settings, and restores server-side
+snapshots. Provider keys never leave the server through an export or support bundle.
 
 ## Pairing with Your Frame TV
 
@@ -252,6 +256,11 @@ Loopback-only serving leaves authentication off by default. Non-loopback binds a
 | `GET` | `/styles` | List available style presets |
 | `GET` | `/providers` | List configured providers and model options |
 | `GET` | `/health` | Liveness check |
+| `GET` | `/health/ready` | Storage and settings readiness check |
+| `GET` | `/settings/diagnostics` | Detailed admin-only local diagnostics |
+| `GET` | `/settings/export` | Download portable non-secret settings |
+| `POST` | `/settings/import` | Validate and import non-secret settings |
+| `GET/POST` | `/settings/backups` | List or create server-side snapshots |
 
 ### API Examples
 
@@ -692,7 +701,7 @@ frameart/
 - Webhook/callback on job completion
 - Scheduling (cron-like "change art every morning")
 - Multi-TV fan-out (upload to all TVs at once)
-- Additional image providers (Gemini, Anthropic, Stability AI)
+- Additional image providers (Anthropic, Stability AI)
 
 ---
 
@@ -707,7 +716,7 @@ FrameArt is built on top of excellent open-source projects, including:
 - [samsungtvws](https://github.com/xchwarze/samsung-tv-ws-api) (Samsung TV WebSocket API client)
 - [FastAPI](https://fastapi.tiangolo.com/)
 - [Uvicorn](https://www.uvicorn.org/)
-- [httpx](https://www.python-httpx.org/)
+- [HTTPX2](https://github.com/Omega359/httpx2)
 - [Pillow](https://python-pillow.org/)
 - [Pydantic](https://docs.pydantic.dev/)
 - [Click](https://click.palletsprojects.com/)

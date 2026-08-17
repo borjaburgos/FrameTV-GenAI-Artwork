@@ -30,7 +30,7 @@ ENV FRAMEART_DATA_DIR=/data/frameart
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+    CMD ["python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')"]
 
 ENTRYPOINT ["frameart"]
 CMD ["--help"]
