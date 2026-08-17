@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -427,7 +427,7 @@ def render_scoreboard(event: ScoreEvent, output_path: Path, *, theme: str = "dar
         clean = clean.replace("—", "-").replace("–", "-")
         draw.text((360, 1640 + index * 72), f"* {clean}", fill=text_color, font=highlight_font)
 
-    updated = datetime.now(UTC).strftime("Updated %H:%M UTC")
+    updated = datetime.now(timezone.utc).strftime("Updated %H:%M UTC")
     draw.text((300, 1900), updated, fill=muted, font=small_font)
     if event.start_time:
         start_box = draw.textbbox((0, 0), event.start_time, font=small_font)
