@@ -53,7 +53,7 @@ import time
 import uuid
 from collections import defaultdict, deque
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from io import BytesIO
 from ipaddress import ip_address
 from pathlib import Path
@@ -1390,7 +1390,7 @@ def get_diagnostics():
 def download_support_bundle():
     """Download redacted diagnostics without logs or secret values."""
     payload = _diagnostics_payload()
-    generated_at = datetime.now(UTC).replace(microsecond=0)
+    generated_at = datetime.now(timezone.utc).replace(microsecond=0)
     payload["generated_at"] = generated_at.isoformat()
     filename = f"frameart-support-{generated_at:%Y%m%dT%H%M%SZ}.json"
     return Response(
@@ -1406,7 +1406,7 @@ def export_managed_settings():
     settings = _settings()
     payload = {
         "schema_version": SETTINGS_SCHEMA_VERSION,
-        "exported_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+        "exported_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
         "settings": _redact_settings_value(read_managed_settings(settings.data_dir)),
     }
     return Response(
