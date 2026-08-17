@@ -63,6 +63,17 @@ def _record_display_history(settings: Settings, result: PipelineResult, source: 
         logger.warning("Could not persist display history for job %s: %s", result.job_id, exc)
 
 
+def _record_switch_failure(result: PipelineResult) -> None:
+    """Preserve an uploaded ID while making an unconfirmed display a hard failure."""
+    content_id = result.content_id or "unknown"
+    result.error = (
+        f"Upload succeeded with content ID {content_id}, but the TV did not confirm it was "
+        "displayed. Retry without uploading another copy: "
+        f"frameart tv display --tv <profile> --content-id {content_id}"
+    )
+    logger.error(result.error)
+
+
 def normalize_prompt(
     prompt: str,
     style: str | None = None,
@@ -306,9 +317,15 @@ def run_apply(
 
         # Switch
         t0 = time.monotonic()
-        switched = tv_ctrl.switch_art(profile, upload_result.content_id)
+        switched = tv_ctrl.switch_art(
+            profile,
+            upload_result.content_id,
+            wait_for_ready=True,
+        )
         timings["switch_ms"] = (time.monotonic() - t0) * 1000
         result.tv_switched = switched
+        if not switched:
+            _record_switch_failure(result)
 
         result.metadata = {
             "job_id": job_id,
@@ -316,6 +333,7 @@ def run_apply(
             "content_id": upload_result.content_id,
             "tv_ip": profile.ip,
             "tv_switched": switched,
+            "error": result.error,
             "matte": matte,
             "timings": timings,
         }
@@ -379,8 +397,14 @@ def run_import_and_apply(
 
         if not no_switch:
             t0 = time.monotonic()
-            result.tv_switched = tv_ctrl.switch_art(profile, upload_result.content_id)
+            result.tv_switched = tv_ctrl.switch_art(
+                profile,
+                upload_result.content_id,
+                wait_for_ready=True,
+            )
             timings["switch_ms"] = (time.monotonic() - t0) * 1000
+            if not result.tv_switched:
+                _record_switch_failure(result)
 
         result.metadata = {
             "job_id": job_id,
@@ -388,6 +412,7 @@ def run_import_and_apply(
             "content_id": upload_result.content_id,
             "tv_ip": profile.ip,
             "tv_switched": result.tv_switched,
+            "error": result.error,
             "matte": matte,
             "upscaler": upscaler.name,
             "source_metadata": source_metadata or {},
@@ -497,13 +522,20 @@ def run_edit_and_apply(
 
             if not no_switch:
                 t0 = time.monotonic()
-                result.tv_switched = tv_ctrl.switch_art(profile, upload_result.content_id)
+                result.tv_switched = tv_ctrl.switch_art(
+                    profile,
+                    upload_result.content_id,
+                    wait_for_ready=True,
+                )
                 timings["switch_ms"] = (time.monotonic() - t0) * 1000
+                if not result.tv_switched:
+                    _record_switch_failure(result)
 
             result.metadata.update({
                 "content_id": upload_result.content_id,
                 "tv_ip": profile.ip,
                 "tv_switched": result.tv_switched,
+                "error": result.error,
             })
 
         save_metadata(job_dir, result.metadata)
@@ -581,14 +613,21 @@ def run_generate_and_apply(
         logger.info("--no-switch: skipping art switch")
     else:
         t0 = time.monotonic()
-        result.tv_switched = tv_ctrl.switch_art(profile, upload_result.content_id)
+        result.tv_switched = tv_ctrl.switch_art(
+            profile,
+            upload_result.content_id,
+            wait_for_ready=True,
+        )
         result.timings["switch_ms"] = (time.monotonic() - t0) * 1000
+        if not result.tv_switched:
+            _record_switch_failure(result)
 
     # Update metadata with TV info
     result.metadata.update({
         "content_id": result.content_id,
         "tv_ip": profile.ip,
         "tv_switched": result.tv_switched,
+        "error": result.error,
         "matte": matte,
     })
     result.metadata["timings"] = result.timings

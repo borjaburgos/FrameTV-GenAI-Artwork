@@ -72,9 +72,8 @@ def _print_result(result) -> None:
     """Print a pipeline result summary to the console."""
     if result.error:
         click.secho(f"ERROR: {result.error}", fg="red", err=True)
-        return
-
-    click.secho(f"Job ID: {result.job_id}", fg="green")
+    else:
+        click.secho(f"Job ID: {result.job_id}", fg="green")
 
     if result.source_path:
         click.echo(f"  Source: {result.source_path}")
@@ -437,6 +436,45 @@ def tv_list_art(ctx, tv_name, tv_ip):
     except Exception as e:
         click.secho(f"Failed to list art: {e}", fg="red", err=True)
         sys.exit(1)
+
+
+@tv.command("display")
+@_debug_option
+@_verbose_option
+@click.option("--tv", "tv_name", type=str, default=None, help="TV profile name.")
+@click.option("--tv-ip", type=str, default=None, help="TV IP address.")
+@click.option(
+    "--content-id",
+    required=True,
+    help="Existing TV content ID to display (see 'frameart tv list-art').",
+)
+@click.pass_context
+def tv_display(ctx, tv_name, tv_ip, content_id):
+    """Display existing TV artwork without uploading another copy."""
+    _ensure_logging(ctx)
+    from frameart.config import TVProfile
+    from frameart.tv.controller import switch_art
+
+    settings = ctx.obj["settings"]
+
+    profile = None
+    if tv_name and tv_name in settings.tvs:
+        profile = settings.tvs[tv_name]
+    elif tv_ip:
+        profile = TVProfile(ip=tv_ip)
+    elif len(settings.tvs) == 1:
+        profile = next(iter(settings.tvs.values()))
+
+    if profile is None:
+        click.secho("No TV specified. Use --tv or --tv-ip.", fg="red", err=True)
+        sys.exit(1)
+
+    if switch_art(profile, content_id):
+        click.secho(f"Now displaying {content_id}.", fg="green")
+        return
+
+    click.secho(f"Failed to display {content_id}.", fg="red", err=True)
+    sys.exit(1)
 
 
 @tv.command("delete-art")
