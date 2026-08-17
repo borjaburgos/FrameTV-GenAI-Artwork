@@ -13,7 +13,7 @@ import tempfile
 import threading
 import uuid
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -194,7 +194,7 @@ def create_settings_backup(data_dir: Path, *, reason: str = "manual") -> dict[st
     """Create a restricted server-side snapshot of settings and provider keys."""
     with _STORE_LOCK:
         recover_management_state(data_dir)
-        created_at = datetime.now(UTC).replace(microsecond=0)
+        created_at = datetime.now(timezone.utc).replace(microsecond=0)
         backup_id = f"{created_at:%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}"
         settings = _read_yaml_mapping(managed_settings_path(data_dir))
         secrets_payload = _read_yaml_mapping(provider_secrets_path(data_dir))
