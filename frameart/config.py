@@ -121,6 +121,10 @@ class Settings(BaseSettings):
         env_nested_delimiter="__",
     )
 
+    # Version of the web-managed settings overlay. This is persisted so future
+    # releases can migrate management state explicitly.
+    schema_version: int = Field(1, ge=1)
+
     # Directories
     data_dir: Path = DEFAULT_DATA_DIR
 

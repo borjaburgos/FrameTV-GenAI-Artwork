@@ -949,7 +949,30 @@
     </div>
     <div class="settings-card">
       <h3>Storage</h3>
-      <p>Web-managed settings are an overlay under the FrameArt data directory. Environment variables remain authoritative and cannot be cleared from this UI.</p>
+      <p>Web-managed settings use a crash-recovery journal under the FrameArt data directory. Environment variables remain authoritative and cannot be cleared from this UI.</p>
+    </div>
+    <div class="settings-card settings-card-wide">
+      <div class="settings-card-header">
+        <div>
+          <h3>Diagnostics &amp; Backups</h3>
+          <p>Check local readiness, download a redacted support bundle, or recover managed settings.</p>
+        </div>
+        <button class="btn btn-secondary btn-small" id="btn-settings-diagnostics">Run Diagnostics</button>
+      </div>
+      <div class="settings-list" id="settings-diagnostics-list">
+        <div class="settings-item"><strong>Not run</strong><span>Diagnostics only inspect this FrameArt server.</span></div>
+      </div>
+      <div class="btn-group" style="margin-top:.8rem;">
+        <button class="btn btn-secondary btn-small" id="btn-settings-support">Support Bundle</button>
+        <button class="btn btn-secondary btn-small" id="btn-settings-export">Export Settings</button>
+        <button class="btn btn-secondary btn-small" id="btn-settings-import">Import Settings</button>
+        <button class="btn btn-small" id="btn-settings-backup">Create Backup</button>
+        <input id="settings-import-file" type="file" accept="application/json,.json" hidden>
+      </div>
+      <p style="margin-top:.65rem;">Exports and support bundles never include provider keys. Server backups do include keys and remain owner-readable inside the data directory.</p>
+      <div class="settings-list" id="settings-backup-list">
+        <div class="settings-item"><strong>Loading backups...</strong><span></span></div>
+      </div>
     </div>
   </div>
 </div>
@@ -1211,6 +1234,7 @@
   let configuredProviders = [];
   let managedProviderSettings = null;
   let managedTVSettings = [];
+  let managedSettingsBackups = [];
   let editingProviderName = null;
   let editingTVProfileId = null;
   const generationJobs = new Map();
@@ -2397,29 +2421,195 @@
   async function loadManagementSettings(triggerButton) {
     if (triggerButton) setButtonBusy(triggerButton, 'Refreshing...');
     try {
-      const [providerResponse, tvResponse] = await Promise.all([
+      const [providerResponse, tvResponse, backupResponse] = await Promise.all([
         apiFetch('/settings/providers'),
         apiFetch('/settings/tvs'),
+        apiFetch('/settings/backups'),
       ]);
       managedProviderSettings = await parseJSONResponse(
         providerResponse,
         'Could not load provider settings.',
       );
       const tvPayload = await parseJSONResponse(tvResponse, 'Could not load TV settings.');
+      const backupPayload = await parseJSONResponse(
+        backupResponse,
+        'Could not load settings backups.',
+      );
       managedTVSettings = tvPayload.tvs || [];
+      managedSettingsBackups = backupPayload.backups || [];
       renderSettingsProviders();
       renderSettingsTVSummary();
+      renderSettingsBackups();
     } catch (error) {
       const message = error?.message || 'Settings could not be loaded.';
       document.getElementById('settings-provider-list').innerHTML =
         '<div class="settings-item"><strong>Unavailable</strong><span>' + esc(message) + '</span></div>';
       document.getElementById('settings-tv-list').innerHTML =
         '<div class="settings-item"><strong>Unavailable</strong><span>' + esc(message) + '</span></div>';
+      document.getElementById('settings-backup-list').innerHTML =
+        '<div class="settings-item"><strong>Unavailable</strong><span>' + esc(message) + '</span></div>';
       showToast('Settings management: ' + message, 'error');
     } finally {
       if (triggerButton) clearButtonBusy(triggerButton);
     }
   }
+
+  function renderSettingsBackups() {
+    const container = document.getElementById('settings-backup-list');
+    if (!managedSettingsBackups.length) {
+      container.innerHTML = '<div class="settings-item"><div class="settings-item-main">' +
+        '<strong>No backups yet</strong><span>Create one before a major configuration change.</span>' +
+        '</div></div>';
+      return;
+    }
+    container.innerHTML = managedSettingsBackups.map((backup, index) =>
+      '<div class="settings-item"><div class="settings-item-main">' +
+      '<strong>' + esc(backup.created_at || backup.backup_id) + '</strong>' +
+      '<span>' + esc(backup.reason || 'snapshot') + ' · ' + esc(backup.backup_id) + '</span>' +
+      '</div><div class="settings-item-actions">' +
+      '<button class="btn btn-secondary btn-small" data-backup-index="' + index + '">Restore</button>' +
+      '</div></div>'
+    ).join('');
+  }
+
+  async function downloadAdminFile(url, fallbackName) {
+    const response = await apiFetch(url);
+    if (!response.ok) throw new Error(await readApiError(response, 'Download failed.'));
+    const disposition = response.headers.get('content-disposition') || '';
+    const match = disposition.match(/filename="?([^";]+)"?/i);
+    const blob = await response.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = objectUrl;
+    anchor.download = match?.[1] || fallbackName;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(objectUrl);
+  }
+
+  async function runSettingsDiagnostics(button) {
+    setButtonBusy(button, 'Checking...');
+    try {
+      const response = await apiFetch('/settings/diagnostics');
+      const diagnostics = await parseJSONResponse(response, 'Diagnostics failed.');
+      const checks = diagnostics.checks || [];
+      document.getElementById('settings-diagnostics-list').innerHTML = checks.map((check) =>
+        '<div class="settings-item"><div class="settings-item-main"><strong>' +
+        esc(check.name.replaceAll('_', ' ')) + '</strong><span>' + esc(check.status) +
+        '</span></div><span class="badge ' +
+        (check.status === 'error' ? 'badge-error' : 'badge-frame') + '">' +
+        esc(check.status) + '</span></div>'
+      ).join('');
+      showToast(
+        diagnostics.status === 'ok' ? 'Local diagnostics passed.' : 'Diagnostics found a problem.',
+        diagnostics.status === 'ok' ? 'done' : 'error',
+      );
+    } catch (error) {
+      document.getElementById('settings-diagnostics-list').innerHTML =
+        '<div class="settings-item"><strong>Diagnostics failed</strong><span>' +
+        esc(error?.message || 'Unknown error') + '</span></div>';
+      showToast(error?.message || 'Diagnostics failed.', 'error');
+    } finally {
+      clearButtonBusy(button);
+    }
+  }
+
+  document.getElementById('btn-settings-diagnostics').addEventListener('click', (event) => {
+    runSettingsDiagnostics(event.currentTarget);
+  });
+  document.getElementById('btn-settings-support').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    setButtonBusy(button, 'Preparing...');
+    try {
+      await downloadAdminFile('/settings/diagnostics/support-bundle', 'frameart-support.json');
+      showToast('Redacted support bundle downloaded.', 'done');
+    } catch (error) {
+      showToast(error?.message || 'Support bundle download failed.', 'error');
+    } finally {
+      clearButtonBusy(button);
+    }
+  });
+  document.getElementById('btn-settings-export').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    setButtonBusy(button, 'Exporting...');
+    try {
+      await downloadAdminFile('/settings/export', 'frameart-settings.json');
+      showToast('Non-secret settings exported.', 'done');
+    } catch (error) {
+      showToast(error?.message || 'Settings export failed.', 'error');
+    } finally {
+      clearButtonBusy(button);
+    }
+  });
+  document.getElementById('btn-settings-backup').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    setButtonBusy(button, 'Creating...');
+    try {
+      const response = await apiFetch('/settings/backups', { method: 'POST' });
+      const backup = await parseJSONResponse(response, 'Could not create backup.');
+      managedSettingsBackups = [backup, ...managedSettingsBackups].slice(0, 20);
+      renderSettingsBackups();
+      showToast('Settings backup created.', 'done');
+    } catch (error) {
+      showToast(error?.message || 'Could not create backup.', 'error');
+    } finally {
+      clearButtonBusy(button);
+    }
+  });
+  document.getElementById('settings-backup-list').addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-backup-index]');
+    if (!button) return;
+    const backup = managedSettingsBackups[Number(button.dataset.backupIndex)];
+    if (!backup || !window.confirm(
+      'Restore settings backup ' + backup.backup_id + '? Current settings will be backed up first.',
+    )) return;
+    setButtonBusy(button, 'Restoring...');
+    try {
+      const response = await apiFetch(
+        '/settings/backups/' + encodeURIComponent(backup.backup_id) + '/restore',
+        { method: 'POST' },
+      );
+      await parseJSONResponse(response, 'Could not restore backup.');
+      await loadManagementSettings();
+      await Promise.all([reloadRuntimeProviders(), reloadConfiguredTVs()]);
+      showToast('Settings backup restored.', 'done');
+    } catch (error) {
+      showToast(error?.message || 'Could not restore backup.', 'error');
+    } finally {
+      clearButtonBusy(button);
+    }
+  });
+  document.getElementById('btn-settings-import').addEventListener('click', () => {
+    document.getElementById('settings-import-file').click();
+  });
+  document.getElementById('settings-import-file').addEventListener('change', async (event) => {
+    const input = event.currentTarget;
+    const file = input.files?.[0];
+    if (!file) return;
+    try {
+      const payload = JSON.parse(await file.text());
+      if (!payload || typeof payload !== 'object' || typeof payload.settings !== 'object') {
+        throw new Error('Select a FrameArt settings export JSON file.');
+      }
+      if (!window.confirm(
+        'Import these non-secret settings? Provider keys are preserved and a backup is created first.',
+      )) return;
+      const response = await apiFetch('/settings/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      await parseJSONResponse(response, 'Settings import failed.');
+      await loadManagementSettings();
+      await Promise.all([reloadRuntimeProviders(), reloadConfiguredTVs()]);
+      showToast('Settings imported.', 'done');
+    } catch (error) {
+      showToast(error?.message || 'Settings import failed.', 'error');
+    } finally {
+      input.value = '';
+    }
+  });
 
   function openProviderSettingsEditor(provider) {
     editingProviderName = provider?.name || null;

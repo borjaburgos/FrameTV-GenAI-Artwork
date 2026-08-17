@@ -39,16 +39,21 @@ Misc:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import platform
 import re
 import secrets
 import shutil
+import sys
+import tempfile
 import threading
 import time
 import uuid
 from collections import defaultdict, deque
 from collections.abc import Callable
+from datetime import UTC, datetime
 from io import BytesIO
 from ipaddress import ip_address
 from pathlib import Path
@@ -56,6 +61,7 @@ from typing import Annotated, Any
 from urllib.parse import urlsplit
 
 import httpx2 as httpx
+import yaml
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from PIL import Image, UnidentifiedImageError
@@ -63,10 +69,22 @@ from pydantic import AfterValidator, BaseModel, Field, SecretStr, field_validato
 
 import frameart.public_domain as public_domain
 from frameart import __version__
-from frameart.config import STYLE_PRESETS, ProviderConfig, TVProfile, load_settings
+from frameart.config import STYLE_PRESETS, ProviderConfig, Settings, TVProfile, load_settings
 from frameart.jobs import JobQueueFullError
 from frameart.providers.registry import available_providers
-from frameart.settings_store import read_provider_secrets, update_management_state
+from frameart.settings_store import (
+    SETTINGS_SCHEMA_VERSION,
+    create_settings_backup,
+    list_settings_backups,
+    managed_settings_path,
+    management_transaction_path,
+    provider_secrets_path,
+    read_managed_settings,
+    read_provider_secrets,
+    replace_management_state,
+    restore_settings_backup,
+    update_management_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +97,7 @@ _IDENTIFIER_RE = r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
 _PUBLIC_PATHS = {
     "/",
     "/health",
+    "/health/ready",
     "/auth/session",
     "/docs",
     "/docs/oauth2-redirect",
@@ -371,6 +390,21 @@ class HealthResponse(BaseModel):
     version: str = __version__
 
 
+class ReadinessCheck(BaseModel):
+    """A non-sensitive readiness probe result."""
+
+    name: str
+    status: str
+
+
+class ReadinessResponse(BaseModel):
+    """Readiness response suitable for a container orchestrator."""
+
+    status: str
+    version: str = __version__
+    checks: list[ReadinessCheck] = Field(default_factory=list)
+
+
 class AuthSessionRequest(BaseModel):
     """Token exchange used by the browser UI."""
 
@@ -523,6 +557,27 @@ class ConnectionTestResponse(BaseModel):
     detail: str
 
 
+class SettingsBackupResponse(BaseModel):
+    """Settings snapshot metadata that never contains secret values."""
+
+    backup_id: str
+    created_at: str
+    reason: str
+
+
+class SettingsBackupsResponse(BaseModel):
+    """Available settings snapshots."""
+
+    backups: list[SettingsBackupResponse] = Field(default_factory=list)
+
+
+class SettingsImportRequest(BaseModel):
+    """Portable, non-secret managed settings export."""
+
+    schema_version: int = Field(SETTINGS_SCHEMA_VERSION, ge=1)
+    settings: dict[str, Any]
+
+
 class JobSummary(BaseModel):
     """Summary of a single job for listing."""
 
@@ -584,6 +639,183 @@ class PublicDomainApplyRequest(BaseModel):
 def _settings():
     """Load settings for the current request."""
     return load_settings()
+
+
+_SENSITIVE_SETTING_TERMS = ("api_key", "password", "secret", "token")
+_IMPORTABLE_SETTING_FIELDS = {
+    "api_rate_limit_per_minute",
+    "auto_aspect_hint",
+    "default_model",
+    "default_provider",
+    "default_style",
+    "default_upscaler",
+    "log_file",
+    "log_level",
+    "providers",
+    "schema_version",
+    "tvs",
+    "upscalers",
+}
+
+
+def _redact_settings_value(value: Any) -> Any:
+    """Recursively omit likely secret fields from diagnostics and exports."""
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            key_lower = key_text.lower()
+            if any(term in key_lower for term in _SENSITIVE_SETTING_TERMS):
+                continue
+            if key_lower == "base_url" and isinstance(item, str):
+                parsed = urlsplit(item)
+                if parsed.username or parsed.password:
+                    redacted[key_text] = "[redacted URL credentials]"
+                    continue
+            redacted[key_text] = _redact_settings_value(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_settings_value(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, SecretStr):
+        return "[redacted]"
+    return value
+
+
+def _contains_sensitive_setting(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(
+            any(term in str(key).lower() for term in _SENSITIVE_SETTING_TERMS)
+            or _contains_sensitive_setting(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return any(_contains_sensitive_setting(item) for item in value)
+    return False
+
+
+def _validated_import_settings(current: Settings, payload: dict[str, Any]) -> dict[str, Any]:
+    unknown = sorted(set(payload) - _IMPORTABLE_SETTING_FIELDS)
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported managed setting(s): {', '.join(unknown)}.",
+        )
+    if _contains_sensitive_setting(payload):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Portable settings imports cannot contain API keys, passwords, "
+                "secrets, or tokens."
+            ),
+        )
+    candidate_payload = current.model_dump()
+    candidate_payload.update(payload)
+    try:
+        candidate = Settings.model_validate(candidate_payload)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Settings validation failed: {exc}") from exc
+    validated = candidate.model_dump(
+        mode="json",
+        include=set(payload),
+        exclude={"admin_token", "automation_token", "data_dir"},
+    )
+    return _redact_settings_value(validated)
+
+
+def _probe_readiness(settings) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """Run local-only readiness probes and return checks plus detailed context."""
+    checks: list[dict[str, str]] = []
+    details: dict[str, Any] = {}
+    data_dir = Path(settings.data_dir)
+
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(prefix=".frameart-readiness-", dir=data_dir):
+            pass
+        checks.append({"name": "data_directory", "status": "ok"})
+    except OSError as exc:
+        checks.append({"name": "data_directory", "status": "error"})
+        details["data_directory_error"] = f"{type(exc).__name__}: {exc}"
+
+    try:
+        read_managed_settings(data_dir)
+        read_provider_secrets(data_dir)
+        checks.append({"name": "settings_store", "status": "ok"})
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        checks.append({"name": "settings_store", "status": "error"})
+        details["settings_store_error"] = f"{type(exc).__name__}: {exc}"
+
+    try:
+        usage = shutil.disk_usage(data_dir)
+        details["storage"] = {
+            "total_bytes": usage.total,
+            "used_bytes": usage.used,
+            "free_bytes": usage.free,
+        }
+        disk_status = "ok" if usage.free >= 256 * 1024 * 1024 else "warning"
+        checks.append({"name": "disk_space", "status": disk_status})
+    except OSError as exc:
+        checks.append({"name": "disk_space", "status": "error"})
+        details["disk_space_error"] = f"{type(exc).__name__}: {exc}"
+
+    default_provider = settings.default_provider
+    default_config = settings.providers.get(default_provider)
+    if default_provider in {"openai", "google", "gemini"}:
+        providers_ready = bool(
+            (default_config and default_config.api_key)
+            or _provider_environment_key(default_provider)
+        )
+    else:
+        providers_ready = bool(default_config or default_provider == "ollama")
+    checks.append(
+        {"name": "provider_configuration", "status": "ok" if providers_ready else "warning"}
+    )
+    checks.append(
+        {"name": "tv_configuration", "status": "ok" if settings.tvs else "warning"}
+    )
+    return checks, details
+
+
+def _diagnostics_payload() -> dict[str, Any]:
+    settings = _settings()
+    journal_pending = management_transaction_path(settings.data_dir).is_file()
+    checks, details = _probe_readiness(settings)
+    managed = _redact_settings_value(read_managed_settings(settings.data_dir))
+    managed_keys = read_provider_secrets(settings.data_dir)
+    provider_sources = {
+        name: (
+            "managed"
+            if name in managed_keys
+            else ("environment" if _provider_environment_key(name) else "config-or-none")
+        )
+        for name in sorted(set(settings.providers) | {settings.default_provider})
+    }
+    status = "error" if any(check["status"] == "error" for check in checks) else "ok"
+    return {
+        "status": status,
+        "version": __version__,
+        "checks": checks,
+        "runtime": {
+            "python": platform.python_version(),
+            "implementation": platform.python_implementation(),
+            "platform": platform.platform(),
+            "executable": Path(sys.executable).name,
+        },
+        "configuration": {
+            "managed_schema_version": managed.get("schema_version", SETTINGS_SCHEMA_VERSION),
+            "provider_key_sources": provider_sources,
+            "provider_count": len(settings.providers),
+            "tv_count": len(settings.tvs),
+            "auth_enabled": settings.auth_enabled,
+            "recovered_pending_transaction": journal_pending,
+            "managed_settings_present": managed_settings_path(settings.data_dir).is_file(),
+            "provider_secrets_present": provider_secrets_path(settings.data_dir).is_file(),
+        },
+        "managed_settings": managed,
+        **details,
+    }
 
 
 def _provider_environment_key(name: str) -> str | None:
@@ -991,6 +1223,19 @@ def health():
     return HealthResponse()
 
 
+@app.get("/health/ready", response_model=ReadinessResponse)
+def readiness(response: Response):
+    """Check whether required local storage and settings are usable."""
+    checks, _details = _probe_readiness(_settings())
+    has_error = any(check["status"] == "error" for check in checks)
+    if has_error:
+        response.status_code = 503
+    return ReadinessResponse(
+        status="error" if has_error else "ok",
+        checks=[ReadinessCheck(**check) for check in checks],
+    )
+
+
 @app.post("/auth/session")
 def create_auth_session(req: AuthSessionRequest, response: Response):
     """Exchange an API token for an HttpOnly browser session cookie."""
@@ -1133,6 +1378,97 @@ def list_providers():
 def get_managed_providers():
     """Return editable provider settings without exposing API keys."""
     return _managed_providers_response()
+
+
+@app.get("/settings/diagnostics")
+def get_diagnostics():
+    """Return administrator-facing local deployment diagnostics."""
+    return _diagnostics_payload()
+
+
+@app.get("/settings/diagnostics/support-bundle")
+def download_support_bundle():
+    """Download redacted diagnostics without logs or secret values."""
+    payload = _diagnostics_payload()
+    generated_at = datetime.now(UTC).replace(microsecond=0)
+    payload["generated_at"] = generated_at.isoformat()
+    filename = f"frameart-support-{generated_at:%Y%m%dT%H%M%SZ}.json"
+    return Response(
+        content=json.dumps(payload, indent=2, sort_keys=True),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/settings/export")
+def export_managed_settings():
+    """Download portable managed settings with all secret fields omitted."""
+    settings = _settings()
+    payload = {
+        "schema_version": SETTINGS_SCHEMA_VERSION,
+        "exported_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+        "settings": _redact_settings_value(read_managed_settings(settings.data_dir)),
+    }
+    return Response(
+        content=json.dumps(payload, indent=2, sort_keys=True),
+        media_type="application/json",
+        headers={"Content-Disposition": 'attachment; filename="frameart-settings.json"'},
+    )
+
+
+@app.post("/settings/import")
+def import_managed_settings(req: SettingsImportRequest):
+    """Validate and replace the non-secret managed overlay, preserving provider keys."""
+    if req.schema_version > SETTINGS_SCHEMA_VERSION:
+        raise HTTPException(
+            status_code=409,
+            detail="This settings export was created by a newer FrameArt schema.",
+        )
+    settings = _settings()
+    imported = dict(req.settings)
+    imported["schema_version"] = SETTINGS_SCHEMA_VERSION
+    validated = _validated_import_settings(settings, imported)
+    replace_management_state(
+        settings.data_dir,
+        validated,
+        read_provider_secrets(settings.data_dir),
+        backup_reason="before-import",
+    )
+    return {
+        "ok": True,
+        "schema_version": SETTINGS_SCHEMA_VERSION,
+        "imported_fields": sorted(validated),
+    }
+
+
+@app.get("/settings/backups", response_model=SettingsBackupsResponse)
+def get_settings_backups():
+    """List bounded server-side settings snapshots."""
+    settings = _settings()
+    return SettingsBackupsResponse(backups=list_settings_backups(settings.data_dir))
+
+
+@app.post("/settings/backups", response_model=SettingsBackupResponse, status_code=201)
+def create_managed_settings_backup():
+    """Create an owner-only snapshot including provider keys."""
+    settings = _settings()
+    return SettingsBackupResponse(**create_settings_backup(settings.data_dir))
+
+
+@app.post(
+    "/settings/backups/{backup_id}/restore",
+    response_model=SettingsBackupResponse,
+)
+def restore_managed_settings_backup(backup_id: str):
+    """Restore a settings snapshot after preserving the current state."""
+    settings = _settings()
+    try:
+        restored = restore_settings_backup(settings.data_dir, backup_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="Settings backup was not found.") from exc
+    return SettingsBackupResponse(**restored)
 
 
 @app.post("/settings/providers", response_model=ManagedProvidersResponse, status_code=201)
