@@ -83,7 +83,11 @@ def enforce_aspect_ratio(img: Image.Image) -> tuple[Image.Image, str | None]:
 
 def _line_luma_stats(rgb_line: Image.Image) -> tuple[float, float]:
     """Return (mean_luma, std_luma) for a 1px-tall or 1px-wide RGB image."""
-    pixels = list(rgb_line.getdata())
+    # Pillow 12.1 renamed getdata() while retaining the old method as a
+    # deprecated compatibility alias. Keep support for the project's Pillow
+    # 10+ floor without emitting warnings on current releases.
+    flattened = getattr(rgb_line, "get_flattened_data", rgb_line.getdata)
+    pixels = list(flattened())
     lumas = [0.299 * r + 0.587 * g + 0.114 * b for r, g, b in pixels]
     return mean(lumas), pstdev(lumas) if len(lumas) > 1 else 0.0
 
