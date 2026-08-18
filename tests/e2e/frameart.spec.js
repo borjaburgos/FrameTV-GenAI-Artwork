@@ -240,6 +240,68 @@ test('library actions safely handle hostile prompt text', async ({ page }) => {
   }
 });
 
+test('matte selectors normalize Samsung objects and ignore malformed entries', async ({ page, request }) => {
+  const jobId = 'e2e-matte-options';
+  const jobDir = path.join(
+    process.cwd(), '.e2e-data', 'artifacts', '2026', '01', '04', jobId,
+  );
+  await mkdir(jobDir, { recursive: true });
+  await writeFile(
+    path.join(jobDir, 'final.png'),
+    Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII=',
+      'base64',
+    ),
+  );
+  await writeFile(
+    path.join(jobDir, 'meta.json'),
+    JSON.stringify({ job_id: jobId, prompt_original: 'Matte option test', provider: 'openai' }),
+  );
+  await request.post('/settings/tvs', {
+    data: {
+      profile_id: 'e2e_matte_tv',
+      ip: '192.168.50.27',
+      port: 8002,
+      client_name: 'FrameArt E2E',
+      ssl: true,
+    },
+  });
+  let mattePayload = [
+    { matte_type: 'shadowbox' },
+    { matte_id: 'modern_black' },
+    { matteType: 'flexible' },
+    'none',
+    { matte_type: { nested: 'invalid' } },
+    {},
+    null,
+  ];
+  await page.route('**/tv/mattes?**', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify(mattePayload),
+    });
+  });
+
+  try {
+    await page.goto('/');
+    await page.locator('.tabs').getByRole('button', { name: 'Library' }).click();
+    await page.locator(`[data-upload-job-id="${jobId}"]`).click();
+
+    const options = await page.locator('#upload-matte-select option').allTextContents();
+    expect(options).toEqual(['shadowbox', 'modern_black', 'flexible', 'none']);
+    expect(options).not.toContain('[object Object]');
+
+    await page.locator('#btn-upload-cancel').click();
+    mattePayload = [{ matte_type: { nested: 'invalid' } }, {}, null];
+    await page.locator(`[data-upload-job-id="${jobId}"]`).click();
+    await expect(page.locator('#upload-matte-select')).toHaveValue('none');
+    await expect(page.locator('#upload-matte-select option')).toHaveText(['none']);
+  } finally {
+    await request.delete('/settings/tvs/e2e_matte_tv');
+    await rm(jobDir, { recursive: true, force: true });
+  }
+});
+
 test('TV gallery distinguishes loaded, missing, and unavailable thumbnails', async ({ page, request }) => {
   await request.post('/settings/tvs', {
     data: {

@@ -3232,6 +3232,23 @@
     loadMattesForSelect('matte-select', tvIp);
   };
 
+  function matteEntryId(entry) {
+    if (typeof entry === 'string') return entry.trim();
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return '';
+    for (const key of ['matte_id', 'matte_type', 'matteId', 'matteType']) {
+      if (typeof entry[key] === 'string' && entry[key].trim()) return entry[key].trim();
+    }
+    return '';
+  }
+
+  function setMatteFallbackOptions(select) {
+    select.innerHTML = '';
+    const option = document.createElement('option');
+    option.value = 'none';
+    option.textContent = 'none';
+    select.appendChild(option);
+  }
+
   async function loadMattesForSelect(selectId, tvIp) {
     const sel = document.getElementById(selectId);
     if (!tvIp) return;
@@ -3242,13 +3259,14 @@
       if (!resp.ok) throw new Error('Failed to load');
       const mattes = await resp.json();
       sel.innerHTML = '';
-      if (!mattes.length) {
-        sel.innerHTML = '<option value="none">none</option>' +
-                        '<option value="shadowbox_polar">shadowbox_polar</option>';
+      const matteIds = Array.isArray(mattes)
+        ? [...new Set(mattes.map(matteEntryId).filter(Boolean))]
+        : [];
+      if (!matteIds.length) {
+        setMatteFallbackOptions(sel);
         return;
       }
-      for (const m of mattes) {
-        const id = m.matte_id || m;
+      for (const id of matteIds) {
         const opt = document.createElement('option');
         opt.value = id;
         opt.textContent = id;
@@ -3263,9 +3281,7 @@
       );
       if (remembered && [...sel.options].some(o => o.value === remembered)) sel.value = remembered;
     } catch {
-      sel.innerHTML = '<option value="none">none</option>' +
-                      '<option value="shadowbox_polar">shadowbox_polar</option>' +
-                      '<option value="shadowbox_noir">shadowbox_noir</option>';
+      setMatteFallbackOptions(sel);
       const remembered = localStorage.getItem(
         selectId === 'public-matte-select' ? storageKeys.mattePublic :
         selectId === 'own-upload-matte-select' ? storageKeys.matteOwnUpload :
