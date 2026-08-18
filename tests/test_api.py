@@ -46,6 +46,14 @@ def _jpeg_bytes() -> bytes:
     return output.getvalue()
 
 
+def _mpo_bytes() -> bytes:
+    output = BytesIO()
+    primary = Image.new("RGB", (4, 4), "red")
+    secondary = Image.new("RGB", (4, 4), "blue")
+    primary.save(output, format="MPO", save_all=True, append_images=[secondary])
+    return output.getvalue()
+
+
 @pytest.fixture
 def managed_config_env(tmp_path, monkeypatch):
     """Isolate web-managed configuration beneath a temporary data directory."""
@@ -612,6 +620,42 @@ class TestUploadAndApply:
         assert data["content_id"] == "MY_ART_001"
         mock_run.assert_called_once()
         assert mock_run.call_args.kwargs["tv_ip"] == "192.168.1.50"
+
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_import_and_apply")
+    def test_accepts_mpo_with_uppercase_jpg_extension(self, mock_run, mock_settings, tmp_path):
+        settings = MagicMock()
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        inspected_upload: dict[str, object] = {}
+
+        def inspect_upload(_settings, image_path, **_kwargs):
+            inspected_upload["suffix"] = Path(image_path).suffix
+            with Image.open(image_path) as uploaded:
+                inspected_upload["format"] = uploaded.format
+                inspected_upload["frames"] = getattr(uploaded, "n_frames", 1)
+            return _fake_result()
+
+        mock_run.side_effect = inspect_upload
+
+        resp = client.post(
+            "/upload-and-apply",
+            data={"tv_ip": "192.168.1.50", "matte": "none"},
+            files={"image": ("sample.JPG", _mpo_bytes(), "image/jpeg")},
+        )
+
+        assert resp.status_code == 200
+        assert inspected_upload == {"suffix": ".jpg", "format": "JPEG", "frames": 1}
+
+    def test_rejects_mpo_with_png_content_type(self):
+        resp = client.post(
+            "/upload-and-apply",
+            data={"tv_ip": "192.168.1.50"},
+            files={"image": ("sample.JPG", _mpo_bytes(), "image/png")},
+        )
+
+        assert resp.status_code == 400
+        assert "Content type does not match image data" in resp.json()["detail"]
 
     @patch("frameart.api._settings")
     def test_rejects_unsupported_file_extension(self, mock_settings, tmp_path):

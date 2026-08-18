@@ -67,7 +67,7 @@ import yaml
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import AfterValidator, BaseModel, Field, SecretStr, field_validator
 
 import frameart.public_domain as public_domain
@@ -112,6 +112,7 @@ logger = logging.getLogger(__name__)
 
 _ALLOWED_UPLOAD_EXTS = {".jpg", ".jpeg", ".png"}
 _ALLOWED_UPLOAD_MIME = {"image/jpeg", "image/jpg", "image/png"}
+_UPLOAD_FORMAT_SUFFIXES = {"JPEG": ".jpg", "MPO": ".jpg", "PNG": ".png"}
 _MAX_UPLOAD_BYTES = 30 * 1024 * 1024
 _MAX_UPLOAD_PIXELS = 50_000_000
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
@@ -1463,10 +1464,10 @@ def _read_validated_upload(image: UploadFile) -> tuple[str, str, bytes]:
     except (UnidentifiedImageError, OSError) as exc:
         raise HTTPException(status_code=400, detail="Uploaded file is not a valid image.") from exc
 
-    if image_format not in {"JPEG", "PNG"}:
+    if image_format not in _UPLOAD_FORMAT_SUFFIXES:
         raise HTTPException(status_code=400, detail="Unsupported image format. Use JPG or PNG.")
 
-    actual_suffix = ".jpg" if image_format == "JPEG" else ".png"
+    actual_suffix = _UPLOAD_FORMAT_SUFFIXES[image_format]
     if supplied_suffix and (
         (supplied_suffix in {".jpg", ".jpeg"} and actual_suffix != ".jpg")
         or (supplied_suffix == ".png" and actual_suffix != ".png")
@@ -1477,6 +1478,20 @@ def _read_validated_upload(image: UploadFile) -> tuple[str, str, bytes]:
         or (mime_type == "image/png" and actual_suffix != ".png")
     ):
         raise HTTPException(status_code=400, detail="Content type does not match image data.")
+
+    if image_format == "MPO":
+        try:
+            with Image.open(BytesIO(payload)) as decoded:
+                decoded.seek(0)
+                primary_frame = ImageOps.exif_transpose(decoded).convert("RGB")
+                normalized = BytesIO()
+                primary_frame.save(normalized, format="JPEG", quality=95)
+                payload = normalized.getvalue()
+        except (EOFError, OSError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded MPO image does not contain a valid primary frame.",
+            ) from exc
 
     return filename, actual_suffix, payload
 
