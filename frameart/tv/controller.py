@@ -909,12 +909,42 @@ def get_art_thumbnails(
     )
 
 
-def get_matte_list(profile: TVProfile) -> list[dict[str, Any]]:
+def _normalize_matte_types(value: Any) -> list[dict[str, str]]:
+    """Normalize matte entries returned by different Samsung API generations."""
+    if not isinstance(value, list):
+        return []
+
+    normalized: list[dict[str, str]] = []
+    seen: set[str] = set()
+    keys = ("matte_id", "matte_type", "matteId", "matteType")
+    for entry in value:
+        candidate: Any = entry
+        if isinstance(entry, dict):
+            candidate = next(
+                (
+                    entry[key]
+                    for key in keys
+                    if isinstance(entry.get(key), str) and entry[key].strip()
+                ),
+                None,
+            )
+        if not isinstance(candidate, str):
+            continue
+        matte_id = candidate.strip()
+        if not matte_id or len(matte_id) > 100 or matte_id in seen:
+            continue
+        seen.add(matte_id)
+        normalized.append({"matte_id": matte_id})
+    return normalized
+
+
+def get_matte_list(profile: TVProfile) -> list[dict[str, str]]:
     """Query the TV for its supported matte types.
 
-    Returns a list of dicts, each with at least a ``matte_id`` key.
+    Returns a list of dicts with a stable string ``matte_id`` key.
     The samsungtvws v3.x library handles both ``matte_type_list`` (modern)
-    and ``matte_list`` (API 0.97) response keys internally.
+    and ``matte_list`` (API 0.97) response keys internally, but individual
+    entries vary between ``matte_type`` and ``matte_id`` across versions.
     """
     result = _run_art_call(
         profile,
@@ -924,9 +954,9 @@ def get_matte_list(profile: TVProfile) -> list[dict[str, Any]]:
     )
     # v3.x returns {"matte_types": [...], "matte_colors": [...]}
     if isinstance(result, dict):
-        return result.get("matte_types", [])
+        return _normalize_matte_types(result.get("matte_types", []))
     # Fallback for unexpected return types
-    return result
+    return _normalize_matte_types(result)
 
 
 def delete_art(profile: TVProfile, content_ids: list[str]) -> bool:

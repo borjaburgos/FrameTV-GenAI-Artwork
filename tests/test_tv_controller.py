@@ -17,6 +17,7 @@ from frameart.tv.controller import (
     _run_with_timeout,
     _tv_operation_gate,
     get_art_thumbnails,
+    get_matte_list,
     switch_art,
     wait_for_art,
 )
@@ -249,6 +250,33 @@ def test_thumbnail_batch_normalizes_tv_filenames(mock_call):
         "MY_F0001": b"one",
         "MY_F0002": b"two",
     }
+    assert mock_call.call_args.kwargs["priority"] == "read"
+
+
+@patch("frameart.tv.controller._run_art_call")
+def test_matte_list_normalizes_firmware_shapes_and_ignores_malformed_entries(mock_call):
+    profile = TVProfile(ip="192.168.1.206")
+    mock_call.return_value = {
+        "matte_types": [
+            {"matte_type": "shadowbox"},
+            {"matte_id": "modern_black"},
+            {"matteType": "flexible"},
+            {"matteId": "none"},
+            "triptych",
+            {"matte_type": "shadowbox"},
+            {"matte_type": {"nested": "invalid"}},
+            {},
+            None,
+        ]
+    }
+
+    assert get_matte_list(profile) == [
+        {"matte_id": "shadowbox"},
+        {"matte_id": "modern_black"},
+        {"matte_id": "flexible"},
+        {"matte_id": "none"},
+        {"matte_id": "triptych"},
+    ]
     assert mock_call.call_args.kwargs["priority"] == "read"
 
 
