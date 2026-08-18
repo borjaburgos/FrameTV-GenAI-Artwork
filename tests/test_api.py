@@ -1105,8 +1105,10 @@ class TestManagedTVs:
                 "client_name": "FrameArt Living Room",
                 "ssl": True,
                 "token_configured": False,
+                "conflicts_with": [],
             }
         ]
+        assert created.json()["warnings"] == []
 
         updated = client.put(
             "/settings/tvs/living_room",
@@ -1123,7 +1125,104 @@ class TestManagedTVs:
 
         deleted = client.delete("/settings/tvs/living_room")
         assert deleted.status_code == 200
-        assert deleted.json() == {"tvs": []}
+        assert deleted.json() == {"tvs": [], "warnings": []}
+
+    def test_rejects_physical_and_normalized_profile_duplicates(self, managed_config_env):
+        created = client.post(
+            "/settings/tvs",
+            json={"profile_id": "Master_Bedroom", "ip": "192.168.50.25"},
+        )
+        assert created.status_code == 201
+
+        same_tv = client.post(
+            "/settings/tvs",
+            json={"profile_id": "bedroom", "ip": "192.168.50.25"},
+        )
+        assert same_tv.status_code == 409
+        assert same_tv.json()["detail"] == {
+            "code": "tv_profile_conflict",
+            "message": "This TV is already configured as 'Master_Bedroom'.",
+            "existing_profile_id": "Master_Bedroom",
+            "reasons": ["physical_tv"],
+        }
+
+        normalized_name = client.post(
+            "/settings/tvs",
+            json={"profile_id": "master-bedroom", "ip": "192.168.50.26"},
+        )
+        assert normalized_name.status_code == 409
+        assert normalized_name.json()["detail"]["reasons"] == ["profile_id"]
+
+    def test_explicit_update_can_rename_profile_and_automation_reference(
+        self,
+        managed_config_env,
+    ):
+        from frameart.automation import AutomationStore
+
+        client.post(
+            "/settings/tvs",
+            json={"profile_id": "living_room", "ip": "192.168.50.25"},
+        )
+        store = AutomationStore(managed_config_env)
+        group = store.create_group("Main", ["living_room"])
+
+        updated = client.put(
+            "/settings/tvs/living_room",
+            json={
+                "profile_id": "Living-Room",
+                "ip": "192.168.50.25",
+                "client_name": "FrameArt",
+            },
+        )
+
+        assert updated.status_code == 200
+        assert [tv["profile_id"] for tv in updated.json()["tvs"]] == ["Living-Room"]
+        assert store.get_group(group["id"])["tv_profile_ids"] == ["Living-Room"]
+
+    def test_existing_duplicates_are_warned_and_consolidated_without_deleting_token(
+        self,
+        managed_config_env,
+    ):
+        from frameart.automation import AutomationStore
+        from frameart.settings_store import update_management_state
+
+        token_path = managed_config_env / "secrets" / "192_168_50_25.token"
+        token_path.parent.mkdir()
+        token_path.write_text("pairing-token")
+
+        def seed_duplicates(managed, _keys):
+            managed["tvs"] = {
+                "Master_Bedroom": {
+                    "ip": "192.168.50.25",
+                    "token_file": str(token_path),
+                },
+                "master-bedroom": {
+                    "ip": "192.168.50.25",
+                    "token_file": str(token_path),
+                },
+            }
+
+        update_management_state(managed_config_env, seed_duplicates)
+        store = AutomationStore(managed_config_env)
+        group = store.create_group(
+            "Bedrooms",
+            ["Master_Bedroom", "master-bedroom"],
+        )
+
+        listed = client.get("/settings/tvs")
+        assert listed.status_code == 200
+        assert listed.json()["warnings"]
+        assert listed.json()["tvs"][0]["conflicts_with"] == ["master-bedroom"]
+
+        consolidated = client.post("/settings/tvs/Master_Bedroom/consolidate")
+
+        assert consolidated.status_code == 200
+        assert [tv["profile_id"] for tv in consolidated.json()["tvs"]] == [
+            "Master_Bedroom"
+        ]
+        assert consolidated.json()["warnings"] == []
+        assert token_path.read_text() == "pairing-token"
+        assert store.get_group(group["id"])["tv_profile_ids"] == ["Master_Bedroom"]
 
     def test_rejects_public_tv_ip(self, managed_config_env):
         resp = client.post(
@@ -1314,6 +1413,66 @@ class TestTVArtThumbnail:
         assert resp.status_code == 200
         assert resp.content == b"cached-jpeg"
         assert resp.headers["x-frameart-cache"] == "stale"
+
+
+# ---------------------------------------------------------------------------
+# POST /tv/art/thumbnails/warm
+# ---------------------------------------------------------------------------
+
+class TestTVArtThumbnailWarm:
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.get_art_thumbnails")
+    def test_batch_warms_cache_for_individual_image_requests(
+        self,
+        mock_thumbnails,
+        mock_settings,
+        tmp_path,
+    ):
+        settings = MagicMock()
+        settings.tvs = {}
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        mock_thumbnails.return_value = {
+            "MY_F0001": b"first-jpeg",
+            "MY_F0002": b"second-jpeg",
+        }
+
+        resp = client.post(
+            "/tv/art/thumbnails/warm",
+            json={
+                "tv_ip": "192.168.1.100",
+                "content_ids": ["MY_F0001", "MY_F0002", "MY_F0003"],
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "cached": [],
+            "warmed": ["MY_F0001", "MY_F0002"],
+            "missing": ["MY_F0003"],
+        }
+        assert client.get(
+            "/tv/art/thumbnail?tv_ip=192.168.1.100&content_id=MY_F0001"
+        ).content == b"first-jpeg"
+        mock_thumbnails.assert_called_once()
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.get_art_thumbnails")
+    def test_batch_timeout_returns_504(self, mock_thumbnails, mock_settings, tmp_path):
+        from frameart.tv.controller import TVOperationTimeoutError
+
+        settings = MagicMock()
+        settings.tvs = {}
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        mock_thumbnails.side_effect = TVOperationTimeoutError("timed out")
+
+        resp = client.post(
+            "/tv/art/thumbnails/warm",
+            json={"tv_ip": "192.168.1.100", "content_ids": ["MY_F0001"]},
+        )
+
+        assert resp.status_code == 504
 
 
 # ---------------------------------------------------------------------------

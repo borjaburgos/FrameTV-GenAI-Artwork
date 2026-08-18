@@ -121,6 +121,33 @@ class AutomationStore:
             )
         return item
 
+    def replace_tv_profile_ids(self, replacements: dict[str, str]) -> int:
+        """Rewrite renamed or consolidated TV profile IDs in every group."""
+        normalized = {
+            source: target
+            for source, target in replacements.items()
+            if source and target and source != target
+        }
+        if not normalized:
+            return 0
+
+        updated = 0
+        with self._connect() as connection:
+            rows = connection.execute("SELECT id, tv_profile_ids FROM tv_groups").fetchall()
+            for row in rows:
+                current = json.loads(row["tv_profile_ids"])
+                replacement = list(
+                    dict.fromkeys(normalized.get(profile_id, profile_id) for profile_id in current)
+                )
+                if replacement == current:
+                    continue
+                connection.execute(
+                    "UPDATE tv_groups SET tv_profile_ids = ? WHERE id = ?",
+                    (json.dumps(replacement), row["id"]),
+                )
+                updated += 1
+        return updated
+
     def delete_group(self, group_id: str) -> bool:
         with self._connect() as connection:
             cursor = connection.execute("DELETE FROM tv_groups WHERE id = ?", (group_id,))

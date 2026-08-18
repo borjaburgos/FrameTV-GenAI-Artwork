@@ -64,6 +64,34 @@ test('adds and removes a persistent TV profile', async ({ page }) => {
   await expect(tv).toHaveCount(0);
 });
 
+test('identifies an existing physical TV and intentionally renames it', async ({ page, request }) => {
+  await request.post('/settings/tvs', {
+    data: {
+      profile_id: 'e2e_existing_tv',
+      ip: '192.168.50.26',
+      port: 8002,
+      client_name: 'Existing TV',
+      ssl: true,
+    },
+  });
+
+  try {
+    await openSettings(page);
+    await page.getByRole('button', { name: 'Add TV' }).click();
+    const dialog = page.getByRole('dialog', { name: 'Add TV' });
+    await dialog.getByLabel('Profile ID').fill('e2e_renamed_tv');
+    await dialog.getByLabel('Private IPv4 address').fill('192.168.50.26');
+    page.once('dialog', (confirmation) => confirmation.accept());
+    await dialog.getByRole('button', { name: 'Save TV' }).click();
+
+    await expect(page.locator('#settings-tv-list')).toContainText('e2e_renamed_tv');
+    await expect(page.locator('#settings-tv-list')).not.toContainText('e2e_existing_tv');
+  } finally {
+    await request.delete('/settings/tvs/e2e_existing_tv');
+    await request.delete('/settings/tvs/e2e_renamed_tv');
+  }
+});
+
 test('shows discovered TVs and provides a persistent save action', async ({ page }) => {
   await page.route('**/tv/discover?**', async (route) => {
     await route.fulfill({
@@ -230,6 +258,16 @@ test('TV gallery distinguishes loaded, missing, and unavailable thumbnails', asy
         { content_id: 'MY_MISSING', is_favourite: false, local_job_id: null },
         { content_id: 'MY_BUSY', is_favourite: false, local_job_id: null },
       ]),
+    });
+  });
+  await page.route('**/tv/art/thumbnails/warm', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        cached: [],
+        warmed: ['MY_LOADED', 'MY_BUSY'],
+        missing: ['MY_MISSING'],
+      }),
     });
   });
   await page.route('**/tv/art/thumbnail?**', async (route) => {

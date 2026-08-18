@@ -12,9 +12,11 @@ import pytest
 from frameart.config import TVProfile
 from frameart.tv.controller import (
     TVOperationBusyError,
+    TVOperationTimeoutError,
     _run_tv_op,
     _run_with_timeout,
     _tv_operation_gate,
+    get_art_thumbnails,
     switch_art,
     wait_for_art,
 )
@@ -126,6 +128,128 @@ def test_mutation_waiter_runs_before_queued_read():
     mutation.join(1)
 
     assert order == ["mutation", "read"]
+
+
+def test_timed_out_read_is_quarantined_without_blocking_or_releasing_mutation():
+    profile = TVProfile(ip="192.168.1.203")
+    read_started = threading.Event()
+    release_read = threading.Event()
+    mutation_started = threading.Event()
+    release_mutation = threading.Event()
+    cancelled = threading.Event()
+
+    def blocked_read():
+        read_started.set()
+        assert release_read.wait(1)
+
+    with pytest.raises(TVOperationTimeoutError):
+        _run_tv_op(
+            profile,
+            blocked_read,
+            "blocked read",
+            timeout_sec=0.03,
+            priority="read",
+            cancel=cancelled.set,
+        )
+
+    assert read_started.is_set()
+    assert cancelled.is_set()
+
+    def mutation():
+        mutation_started.set()
+        assert release_mutation.wait(1)
+
+    active_mutation = threading.Thread(
+        target=lambda: _run_tv_op(
+            profile,
+            mutation,
+            "mutation after stale read",
+            timeout_sec=1,
+        )
+    )
+    active_mutation.start()
+    assert mutation_started.wait(0.2)
+
+    # The timed-out worker finishes late while the new mutation owns the gate.
+    # Its cleanup must not release the mutation's newer lease.
+    release_read.set()
+    deadline = time.monotonic() + 0.5
+    gate = _tv_operation_gate(profile)
+    while gate._quarantined_reads and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert not gate._quarantined_reads
+
+    with pytest.raises(TVOperationBusyError):
+        _run_tv_op(
+            profile,
+            lambda: None,
+            "competing mutation",
+            timeout_sec=0.03,
+        )
+
+    release_mutation.set()
+    active_mutation.join(1)
+    assert not active_mutation.is_alive()
+
+
+def test_quarantined_read_rejects_additional_reads_without_starting_workers():
+    profile = TVProfile(ip="192.168.1.204")
+    release_read = threading.Event()
+    calls: list[str] = []
+
+    with pytest.raises(TVOperationTimeoutError):
+        _run_tv_op(
+            profile,
+            release_read.wait,
+            "blocked read",
+            timeout_sec=0.02,
+            priority="read",
+        )
+
+    for index in range(10):
+        with pytest.raises(TVOperationBusyError):
+            _run_tv_op(
+                profile,
+                lambda index=index: calls.append(str(index)),
+                f"extra read {index}",
+                timeout_sec=0.02,
+                priority="read",
+            )
+
+    assert calls == []
+    release_read.set()
+    deadline = time.monotonic() + 0.5
+    gate = _tv_operation_gate(profile)
+    while gate._quarantined_reads and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert not gate._quarantined_reads
+
+
+@patch("frameart.tv.controller._run_art_call")
+def test_thumbnail_batch_normalizes_tv_filenames(mock_call):
+    profile = TVProfile(ip="192.168.1.205")
+
+    def run_callback(_profile, callback, _description, **_kwargs):
+        art = type(
+            "Art",
+            (),
+            {
+                "get_thumbnail_list": lambda self, _ids: {
+                    "MY_F0001.jpg": bytearray(b"one"),
+                    "MY_F0002": b"two",
+                    "unexpected.jpg": b"ignored",
+                }
+            },
+        )()
+        return callback(art)
+
+    mock_call.side_effect = run_callback
+
+    assert get_art_thumbnails(profile, ["MY_F0001", "MY_F0002"]) == {
+        "MY_F0001": b"one",
+        "MY_F0002": b"two",
+    }
+    assert mock_call.call_args.kwargs["priority"] == "read"
 
 
 @patch("frameart.tv.controller._run_art_call")
