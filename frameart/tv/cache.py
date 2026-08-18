@@ -24,6 +24,7 @@ THUMBNAIL_FETCH_SLOTS_PER_TV = 2
 
 _KEY_LOCKS: dict[str, threading.Lock] = {}
 _THUMBNAIL_SLOTS: dict[str, threading.BoundedSemaphore] = {}
+_DATABASE_INIT_LOCKS: dict[str, threading.Lock] = {}
 _REGISTRY_GUARD = threading.Lock()
 
 
@@ -54,6 +55,16 @@ def _thumbnail_slots(tv_key: str) -> threading.BoundedSemaphore:
             slots = threading.BoundedSemaphore(THUMBNAIL_FETCH_SLOTS_PER_TV)
             _THUMBNAIL_SLOTS[tv_key] = slots
         return slots
+
+
+def _database_init_lock(database_path: Path) -> threading.Lock:
+    key = str(database_path.absolute())
+    with _REGISTRY_GUARD:
+        lock = _DATABASE_INIT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _DATABASE_INIT_LOCKS[key] = lock
+        return lock
 
 
 @contextmanager
@@ -92,35 +103,36 @@ class TVCacheStore:
         self.max_thumbnail_entries = max(1, max_thumbnail_entries)
         self.max_thumbnail_bytes = max(1, max_thumbnail_bytes)
         self.thumbnail_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with self._connect() as connection:
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS tv_matte_cache (
-                    tv_key TEXT PRIMARY KEY,
-                    value_json TEXT NOT NULL,
-                    updated_at REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS tv_thumbnail_cache (
-                    tv_key TEXT NOT NULL,
-                    content_id TEXT NOT NULL,
-                    filename TEXT NOT NULL,
-                    media_type TEXT NOT NULL,
-                    size_bytes INTEGER NOT NULL,
-                    updated_at REAL NOT NULL,
-                    PRIMARY KEY (tv_key, content_id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_tv_thumbnail_cache_updated
-                    ON tv_thumbnail_cache(updated_at);
-                """
-            )
-        os.chmod(self.database_path, 0o600)
+        with _database_init_lock(self.database_path):
+            with self._connect() as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS tv_matte_cache (
+                        tv_key TEXT PRIMARY KEY,
+                        value_json TEXT NOT NULL,
+                        updated_at REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS tv_thumbnail_cache (
+                        tv_key TEXT NOT NULL,
+                        content_id TEXT NOT NULL,
+                        filename TEXT NOT NULL,
+                        media_type TEXT NOT NULL,
+                        size_bytes INTEGER NOT NULL,
+                        updated_at REAL NOT NULL,
+                        PRIMARY KEY (tv_key, content_id)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_tv_thumbnail_cache_updated
+                        ON tv_thumbnail_cache(updated_at);
+                    """
+                )
+            os.chmod(self.database_path, 0o600)
 
     def _connect(self) -> sqlite3.Connection:
         self.database_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         connection = sqlite3.connect(self.database_path, timeout=10)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA busy_timeout=10000")
+        connection.execute("PRAGMA journal_mode=WAL")
         return connection
 
     def get_mattes(self, tv_key: str) -> CacheEntry | None:

@@ -71,10 +71,12 @@ class _TVOperationGate:
 
     def __init__(self) -> None:
         self._condition = threading.Condition()
-        self._active = False
+        self._active_lease: int | None = None
+        self._next_lease = 1
+        self._quarantined_reads: set[int] = set()
         self._waiting_mutations = 0
 
-    def acquire(self, timeout_sec: float, priority: str) -> bool:
+    def acquire(self, timeout_sec: float, priority: str) -> int | None:
         deadline = time.monotonic() + max(0.0, timeout_sec)
         mutation = priority == "mutation"
         acquired = False
@@ -82,24 +84,51 @@ class _TVOperationGate:
             if mutation:
                 self._waiting_mutations += 1
             try:
-                while self._active or (not mutation and self._waiting_mutations > 0):
+                # A read that exceeded its deadline may still have a blocked
+                # library thread. Refuse more reads until that thread exits so
+                # repeated refreshes cannot create an unbounded pile of them.
+                if not mutation and self._quarantined_reads:
+                    return None
+
+                while self._active_lease is not None or (
+                    not mutation and self._waiting_mutations > 0
+                ):
+                    if not mutation and self._quarantined_reads:
+                        return None
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        return False
+                        return None
                     self._condition.wait(remaining)
-                self._active = True
+
+                if not mutation and self._quarantined_reads:
+                    return None
+
+                lease = self._next_lease
+                self._next_lease += 1
+                self._active_lease = lease
                 acquired = True
-                return True
+                return lease
             finally:
                 if mutation:
                     self._waiting_mutations -= 1
                 if not acquired:
                     self._condition.notify_all()
 
-    def release(self) -> None:
+    def release(self, lease: int) -> None:
         with self._condition:
-            self._active = False
+            if lease in self._quarantined_reads:
+                self._quarantined_reads.remove(lease)
+            elif self._active_lease == lease:
+                self._active_lease = None
             self._condition.notify_all()
+
+    def quarantine_read(self, lease: int) -> None:
+        """Release a timed-out read without letting late cleanup release its successor."""
+        with self._condition:
+            if self._active_lease == lease:
+                self._active_lease = None
+                self._quarantined_reads.add(lease)
+                self._condition.notify_all()
 
 
 _TV_OP_GATES: dict[str, _TVOperationGate] = {}
@@ -187,10 +216,17 @@ def _connect_art(profile: TVProfile) -> SamsungTVArt:
     )
 
 
-def _retry(func, description: str) -> Any:
+def _retry(
+    func,
+    description: str,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> Any:
     """Execute a function with retry and exponential backoff."""
     last_error = None
     for attempt in range(MAX_RETRIES):
+        if cancel_event is not None and cancel_event.is_set():
+            raise TVOperationTimeoutError(f"{description}: cancelled after timeout")
         try:
             return func()
         except Exception as e:
@@ -205,7 +241,13 @@ def _retry(func, description: str) -> Any:
                     "%s failed (attempt %d/%d): %s — retrying in %ds",
                     description, attempt + 1, MAX_RETRIES, e, wait,
                 )
-                time.sleep(wait)
+                if cancel_event is not None:
+                    if cancel_event.wait(wait):
+                        raise TVOperationTimeoutError(
+                            f"{description}: cancelled after timeout"
+                        ) from e
+                else:
+                    time.sleep(wait)
             else:
                 logger.error(
                     "%s failed after %d attempts: %s",
@@ -299,6 +341,7 @@ def _run_tv_op(
     timeout_sec: float = TV_OP_TIMEOUT,
     *,
     priority: str = "mutation",
+    cancel=None,
 ):
     """Run a TV operation through a cancellable, priority-aware device gate.
 
@@ -312,27 +355,39 @@ def _run_tv_op(
 
     started_at = time.monotonic()
     gate = _tv_operation_gate(profile)
-    if not gate.acquire(timeout_sec, priority):
+    lease = gate.acquire(timeout_sec, priority)
+    if lease is None:
         raise TVOperationBusyError(
             f"{description}: TV busy; operation expired before it could start"
         )
 
     remaining = timeout_sec - (time.monotonic() - started_at)
     if remaining <= 0:
-        gate.release()
+        gate.release(lease)
         raise TVOperationBusyError(
             f"{description}: TV busy; operation expired before it could start"
         )
 
+    cancel_event = threading.Event()
+
     def _inner():
         try:
-            return _retry(func, description)
+            return _retry(func, description, cancel_event=cancel_event)
         finally:
-            gate.release()
+            gate.release(lease)
 
     result, err = _run_with_timeout(_inner, timeout_sec=remaining)
     if err:
         if err == "timed out":
+            cancel_event.set()
+            if priority == "read":
+                # A stale read must not permanently block uploads or display
+                # changes. Its lease is quarantined so late cleanup cannot
+                # release a newer mutation's lease.
+                gate.quarantine_read(lease)
+            if cancel is not None:
+                with contextlib.suppress(Exception):
+                    cancel()
             raise TVOperationTimeoutError(f"{description}: timed out")
         raise TVOperationError(f"{description}: {err}")
     return result
@@ -363,28 +418,10 @@ def get_status(profile: TVProfile) -> TVStatus:
     art_mode_on = False
     current_artwork = None
 
-    def _query_art_mode():
-        art = None
-        try:
-            art = _connect_art(profile)
-            return art.get_artmode()
-        finally:
-            with contextlib.suppress(Exception):
-                art.close()
-
-    def _query_current():
-        art = None
-        try:
-            art = _connect_art(profile)
-            return art.get_current()
-        finally:
-            with contextlib.suppress(Exception):
-                art.close()
-
     try:
-        result = _run_tv_op(
+        result = _run_art_call(
             profile,
-            _query_art_mode,
+            lambda art: art.get_artmode(),
             "Get art mode status",
             priority="read",
         )
@@ -393,9 +430,9 @@ def get_status(profile: TVProfile) -> TVStatus:
         logger.warning("Could not get art mode status: %s", exc)
 
     try:
-        result = _run_tv_op(
+        result = _run_art_call(
             profile,
-            _query_current,
+            lambda art: art.get_current(),
             "Get current artwork",
             priority="read",
         )
@@ -505,18 +542,7 @@ def upload_image(
         upload_type, len(upload_bytes) / 1024, ft, effective_matte,
     )
 
-    art: SamsungTVArt | None = None
-
-    def _do_upload() -> str:
-        nonlocal art
-        # Close any leftover connection from a previous attempt so we
-        # don't pile up stale WebSocket clients on the TV.
-        if art is not None:
-            with contextlib.suppress(Exception):
-                art.close()
-
-        art = _connect_art(profile)
-
+    def _do_upload(art: SamsungTVArt) -> str:
         logger.debug(
             "Upload details: host=%s port=%d size=%d bytes file_type=%s "
             "matte=%s token_file=%s",
@@ -533,7 +559,12 @@ def upload_image(
         return content_id
 
     try:
-        content_id = _run_tv_op(profile, _do_upload, "Upload image", timeout_sec=60)
+        content_id = _run_art_call(
+            profile,
+            _do_upload,
+            "Upload image",
+            timeout_sec=60,
+        )
         logger.info("Uploaded image, content_id=%s", content_id)
         return UploadResult(content_id=content_id, success=True)
     except Exception as e:
@@ -554,10 +585,6 @@ def upload_image(
                 "  - Ensure the TV screen is on (not in standby)"
             )
         return UploadResult(content_id="", success=False, error=error_msg)
-    finally:
-        if art is not None:
-            with contextlib.suppress(Exception):
-                art.close()
 
 
 # --- Art management -----------------------------------------------------------
@@ -573,12 +600,68 @@ def _run_art_call(
 ):
     """Run one art-service call with its own connection and deadline."""
 
+    state_lock = threading.Lock()
+    cancelled = threading.Event()
+    active_art: list[SamsungTVArt | None] = [None]
+    active_sockets: set[Any] = set()
+
+    def _abort_art(art: SamsungTVArt | None) -> None:
+        connection = getattr(art, "connection", None)
+        abort = getattr(connection, "abort", None)
+        if callable(abort):
+            with contextlib.suppress(Exception):
+                abort()
+
+    def _cancel() -> None:
+        cancelled.set()
+        with state_lock:
+            art = active_art[0]
+            sockets = list(active_sockets)
+        _abort_art(art)
+        for sock in sockets:
+            with contextlib.suppress(Exception):
+                sock.close()
+
     def _call():
         art = None
         try:
+            if cancelled.is_set():
+                raise TVOperationTimeoutError(f"{description}: cancelled after timeout")
             art = _connect_art(profile)
+
+            # samsungtvws may move thumbnail bytes over a secondary D2D
+            # socket. Track it as well as the WebSocket so cancellation can
+            # wake either blocking receive path.
+            open_d2d = getattr(art, "_open_d2d_socket", None)
+            if callable(open_d2d):
+                def _open_tracked_socket(*args, **kwargs):
+                    sock = open_d2d(*args, **kwargs)
+                    with state_lock:
+                        if cancelled.is_set():
+                            with contextlib.suppress(Exception):
+                                sock.close()
+                            raise TVOperationTimeoutError(
+                                f"{description}: cancelled after timeout"
+                            )
+                        active_sockets.add(sock)
+                    return sock
+
+                art._open_d2d_socket = _open_tracked_socket
+
+            with state_lock:
+                active_art[0] = art
+                should_abort = cancelled.is_set()
+            if should_abort:
+                _abort_art(art)
+                raise TVOperationTimeoutError(
+                    f"{description}: cancelled after timeout"
+                )
             return func(art)
         finally:
+            with state_lock:
+                if active_art[0] is art:
+                    active_art[0] = None
+                active_sockets.clear()
             if art is not None:
                 with contextlib.suppress(Exception):
                     art.close()
@@ -589,6 +672,7 @@ def _run_art_call(
         description,
         timeout_sec=timeout_sec,
         priority=priority,
+        cancel=_cancel,
     )
 
 
@@ -732,16 +816,12 @@ def switch_art(
 
 def list_art(profile: TVProfile) -> list[dict[str, Any]]:
     """List all artworks available on the TV (raw, includes duplicates across categories)."""
-    def _do_list() -> list[dict[str, Any]]:
-        art = None
-        try:
-            art = _connect_art(profile)
-            return art.available()
-        finally:
-            with contextlib.suppress(Exception):
-                art.close()
-
-    return _run_tv_op(profile, _do_list, "List art", priority="read")
+    return _run_art_call(
+        profile,
+        lambda art: art.available(),
+        "List art",
+        priority="read",
+    )
 
 
 def list_art_deduplicated(profile: TVProfile) -> list[dict[str, Any]]:
@@ -775,22 +855,56 @@ def get_art_thumbnail(profile: TVProfile, content_id: str) -> bytes | None:
 
     Returns ``None`` if the TV does not provide a thumbnail for the content.
     """
-    def _do_thumbnail() -> bytes | None:
-        art = None
-        try:
-            art = _connect_art(profile)
-            data = art.get_thumbnail(content_id)
-            if isinstance(data, (bytes, bytearray)):
-                return bytes(data)
-            return None
-        finally:
-            with contextlib.suppress(Exception):
-                art.close()
+    def _do_thumbnail(art: SamsungTVArt) -> bytes | None:
+        data = art.get_thumbnail(content_id)
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data)
+        return None
 
-    return _run_tv_op(
+    return _run_art_call(
         profile,
         _do_thumbnail,
         f"Fetch thumbnail for {content_id}",
+        priority="read",
+    )
+
+
+def get_art_thumbnails(
+    profile: TVProfile,
+    content_ids: list[str],
+) -> dict[str, bytes]:
+    """Fetch several thumbnails with the TV's single-request batch transport.
+
+    Older Frame models support ``get_thumbnail_list`` even when repeated
+    ``get_thumbnail`` calls stall. Besides being a compatibility path, this
+    keeps a cold gallery to one bounded TV operation instead of one operation
+    per artwork.
+    """
+    requested = list(dict.fromkeys(content_ids))
+    if not requested:
+        return {}
+
+    requested_set = set(requested)
+
+    def _do_thumbnails(art: SamsungTVArt) -> dict[str, bytes]:
+        raw = art.get_thumbnail_list(requested)
+        if not isinstance(raw, dict):
+            return {}
+
+        thumbnails: dict[str, bytes] = {}
+        for filename, data in raw.items():
+            if not isinstance(data, (bytes, bytearray)):
+                continue
+            raw_name = str(filename)
+            content_id = raw_name if raw_name in requested_set else Path(raw_name).stem
+            if content_id in requested_set:
+                thumbnails[content_id] = bytes(data)
+        return thumbnails
+
+    return _run_art_call(
+        profile,
+        _do_thumbnails,
+        f"Fetch {len(requested)} thumbnails",
         priority="read",
     )
 
@@ -802,16 +916,12 @@ def get_matte_list(profile: TVProfile) -> list[dict[str, Any]]:
     The samsungtvws v3.x library handles both ``matte_type_list`` (modern)
     and ``matte_list`` (API 0.97) response keys internally.
     """
-    def _do_get_mattes():
-        art = None
-        try:
-            art = _connect_art(profile)
-            return art.get_matte_list()
-        finally:
-            with contextlib.suppress(Exception):
-                art.close()
-
-    result = _run_tv_op(profile, _do_get_mattes, "Get matte list", priority="read")
+    result = _run_art_call(
+        profile,
+        lambda art: art.get_matte_list(),
+        "Get matte list",
+        priority="read",
+    )
     # v3.x returns {"matte_types": [...], "matte_colors": [...]}
     if isinstance(result, dict):
         return result.get("matte_types", [])

@@ -380,6 +380,22 @@ class TVArtItem(BaseModel):
     local_job_id: str | None = None
 
 
+class TVThumbnailWarmRequest(BaseModel):
+    """Warm persistent thumbnail cache entries in one TV batch request."""
+
+    content_ids: list[ContentId] = Field(..., min_length=1, max_length=100)
+    tv: str | None = Field(None, max_length=100, description="TV profile name from config.")
+    tv_ip: PrivateTVIPv4 | None = Field(None, description="Private TV IP address.")
+
+
+class TVThumbnailWarmResponse(BaseModel):
+    """Result of warming a group of TV thumbnails."""
+
+    cached: list[str] = Field(default_factory=list)
+    warmed: list[str] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
+
+
 class DeleteArtRequest(BaseModel):
     """Request body for deleting artworks from the TV."""
 
@@ -559,6 +575,7 @@ class DefaultsSettingsRequest(BaseModel):
 class TVSettingsRequest(BaseModel):
     """Editable TV profile settings."""
 
+    profile_id: ProfileId | None = None
     ip: PrivateTVIPv4
     port: int = Field(8002, ge=1, le=65535)
     client_name: str = Field("FrameArt", min_length=1, max_length=100)
@@ -588,12 +605,14 @@ class ManagedTVResponse(BaseModel):
     client_name: str
     ssl: bool
     token_configured: bool = False
+    conflicts_with: list[str] = Field(default_factory=list)
 
 
 class ManagedTVsResponse(BaseModel):
     """Persisted TV profiles."""
 
     tvs: list[ManagedTVResponse] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
 
 
 class ConnectionTestResponse(BaseModel):
@@ -877,6 +896,42 @@ def _cached_tv_thumbnail(settings, profile: TVProfile, content_id: str, *, refre
         if thumbnail is None:
             return None, "missing"
         return cache.set_thumbnail(key, content_id, thumbnail), "miss"
+
+
+def _warm_tv_thumbnails(
+    settings,
+    profile: TVProfile,
+    content_ids: list[str],
+) -> TVThumbnailWarmResponse:
+    """Fill cold thumbnail entries through one bounded legacy-compatible call."""
+    from frameart.tv.controller import get_art_thumbnails
+
+    requested = list(dict.fromkeys(content_ids))
+    cache = _tv_cache_store(settings)
+    key = tv_cache_key(profile)
+
+    with coalesced_cache_fill("thumbnail-batch", key):
+        cached = [content_id for content_id in requested if cache.get_thumbnail(key, content_id)]
+        cold = [content_id for content_id in requested if content_id not in set(cached)]
+        if not cold:
+            return TVThumbnailWarmResponse(cached=cached)
+
+        with thumbnail_fetch_slot(key) as admitted:
+            if not admitted:
+                raise TVOperationBusyError("Thumbnail fetch queue is full")
+            fetched = get_art_thumbnails(profile, cold)
+
+        warmed: list[str] = []
+        for content_id in cold:
+            data = fetched.get(content_id)
+            if data and cache.set_thumbnail(key, content_id, data) is not None:
+                warmed.append(content_id)
+
+    return TVThumbnailWarmResponse(
+        cached=cached,
+        warmed=warmed,
+        missing=[content_id for content_id in cold if content_id not in set(warmed)],
+    )
 
 
 def _cached_tv_mattes(settings, profile: TVProfile, *, refresh: bool = False):
@@ -1204,8 +1259,69 @@ def _managed_providers_response(settings=None) -> ManagedProvidersResponse:
     )
 
 
+def _normalized_tv_profile_id(profile_id: str) -> str:
+    """Normalize cosmetic case and separator variants for conflict checks."""
+    return re.sub(r"[-_]+", "", profile_id.casefold())
+
+
+def _tv_profile_conflicts(
+    settings,
+    profile_id: str,
+    ip: str,
+    *,
+    exclude: set[str] | None = None,
+) -> list[tuple[str, list[str]]]:
+    excluded = exclude or set()
+    normalized = _normalized_tv_profile_id(profile_id)
+    conflicts: list[tuple[str, list[str]]] = []
+    for existing_id, existing in settings.tvs.items():
+        if existing_id in excluded:
+            continue
+        reasons: list[str] = []
+        if existing.ip == ip:
+            reasons.append("physical_tv")
+        if _normalized_tv_profile_id(existing_id) == normalized:
+            reasons.append("profile_id")
+        if reasons:
+            conflicts.append((existing_id, reasons))
+    return conflicts
+
+
+def _raise_tv_profile_conflict(conflicts: list[tuple[str, list[str]]]) -> None:
+    existing_id, reasons = conflicts[0]
+    if "physical_tv" in reasons:
+        message = f"This TV is already configured as {existing_id!r}."
+    else:
+        message = f"A matching TV profile already exists as {existing_id!r}."
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "tv_profile_conflict",
+            "message": message,
+            "existing_profile_id": existing_id,
+            "reasons": reasons,
+        },
+    )
+
+
 def _managed_tvs_response(settings=None) -> ManagedTVsResponse:
     settings = settings or _settings()
+    conflict_map: dict[str, set[str]] = defaultdict(set)
+    warnings: list[str] = []
+    items = sorted(settings.tvs.items())
+    for index, (left_id, left) in enumerate(items):
+        for right_id, right in items[index + 1:]:
+            if (
+                left.ip == right.ip
+                or _normalized_tv_profile_id(left_id)
+                == _normalized_tv_profile_id(right_id)
+            ):
+                conflict_map[left_id].add(right_id)
+                conflict_map[right_id].add(left_id)
+                warnings.append(
+                    f"TV profiles {left_id!r} and {right_id!r} may represent the same TV."
+                )
+
     return ManagedTVsResponse(
         tvs=[
             ManagedTVResponse(
@@ -1217,9 +1333,11 @@ def _managed_tvs_response(settings=None) -> ManagedTVsResponse:
                 token_configured=bool(
                     profile.token_file and Path(profile.token_file).is_file()
                 ),
+                conflicts_with=sorted(conflict_map[name]),
             )
-            for name, profile in sorted(settings.tvs.items())
-        ]
+            for name, profile in items
+        ],
+        warnings=warnings,
     )
 
 
@@ -1905,11 +2023,9 @@ def get_managed_tvs():
 def create_managed_tv(req: TVCreateRequest):
     """Create a persisted TV profile."""
     settings = _settings()
-    if req.profile_id in settings.tvs:
-        raise HTTPException(
-            status_code=409,
-            detail=f"TV profile {req.profile_id!r} already exists.",
-        )
+    conflicts = _tv_profile_conflicts(settings, req.profile_id, req.ip)
+    if conflicts:
+        _raise_tv_profile_conflict(conflicts)
     token_file = settings.data_dir / "secrets" / f"{req.ip.replace('.', '_')}.token"
     profile = TVProfile(
         ip=req.ip,
@@ -1929,11 +2045,20 @@ def create_managed_tv(req: TVCreateRequest):
 
 @app.put("/settings/tvs/{profile_id}", response_model=ManagedTVsResponse)
 def update_managed_tv(profile_id: ProfileId, req: TVSettingsRequest):
-    """Replace editable fields for a persisted TV profile."""
+    """Replace editable fields and optionally rename a persisted TV profile."""
     settings = _settings()
     existing = settings.tvs.get(profile_id)
     if existing is None:
         raise HTTPException(status_code=404, detail=f"TV profile {profile_id!r} was not found.")
+    target_profile_id = req.profile_id or profile_id
+    conflicts = _tv_profile_conflicts(
+        settings,
+        target_profile_id,
+        req.ip,
+        exclude={profile_id},
+    )
+    if conflicts:
+        _raise_tv_profile_conflict(conflicts)
     if req.ip == existing.ip and existing.token_file:
         token_file = existing.token_file
     else:
@@ -1948,9 +2073,15 @@ def update_managed_tv(profile_id: ProfileId, req: TVSettingsRequest):
 
     def update(managed, _provider_keys):
         tvs = _ensure_managed_tvs(managed, settings)
-        tvs[profile_id] = _tv_payload(profile)
+        if target_profile_id != profile_id:
+            tvs.pop(profile_id, None)
+        tvs[target_profile_id] = _tv_payload(profile)
 
     _persist_management(settings, update)
+    if target_profile_id != profile_id:
+        AutomationStore(settings.data_dir).replace_tv_profile_ids(
+            {profile_id: target_profile_id}
+        )
     return _managed_tvs_response(load_settings())
 
 
@@ -1966,6 +2097,38 @@ def delete_managed_tv(profile_id: ProfileId):
         tvs.pop(profile_id, None)
 
     _persist_management(settings, update)
+    return _managed_tvs_response(load_settings())
+
+
+@app.post(
+    "/settings/tvs/{profile_id}/consolidate",
+    response_model=ManagedTVsResponse,
+)
+def consolidate_managed_tv(profile_id: ProfileId):
+    """Keep one TV profile and remove its conflicting aliases without deleting tokens."""
+    settings = _settings()
+    keeper = settings.tvs.get(profile_id)
+    if keeper is None:
+        raise HTTPException(status_code=404, detail=f"TV profile {profile_id!r} was not found.")
+    conflicts = _tv_profile_conflicts(
+        settings,
+        profile_id,
+        keeper.ip,
+        exclude={profile_id},
+    )
+    duplicate_ids = [duplicate_id for duplicate_id, _reasons in conflicts]
+    if not duplicate_ids:
+        raise HTTPException(status_code=409, detail="No duplicate TV profiles were found.")
+
+    def update(managed, _provider_keys):
+        tvs = _ensure_managed_tvs(managed, settings)
+        for duplicate_id in duplicate_ids:
+            tvs.pop(duplicate_id, None)
+
+    _persist_management(settings, update)
+    AutomationStore(settings.data_dir).replace_tv_profile_ids(
+        {duplicate_id: profile_id for duplicate_id in duplicate_ids}
+    )
     return _managed_tvs_response(load_settings())
 
 
@@ -2300,6 +2463,17 @@ def tv_art_thumbnail(
         media_type=entry.value["media_type"],
         headers={"X-FrameArt-Cache": cache_status},
     )
+
+
+@app.post("/tv/art/thumbnails/warm", response_model=TVThumbnailWarmResponse)
+def tv_art_thumbnails_warm(req: TVThumbnailWarmRequest):
+    """Warm a cold gallery through one batch request to the TV art service."""
+    settings = _settings()
+    profile = _resolve_tv_profile(req.tv, req.tv_ip)
+    try:
+        return _warm_tv_thumbnails(settings, profile, list(req.content_ids))
+    except Exception as exc:
+        _raise_tv_cache_http_error(exc, "TV thumbnail batch request")
 
 
 @app.post("/tv/art/delete", response_model=DeleteArtResponse)

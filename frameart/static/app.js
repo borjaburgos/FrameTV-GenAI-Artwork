@@ -86,7 +86,9 @@
   async function parseJSONResponse(response, fallbackMessage) {
     const payload = await response.json().catch(() => null);
     if (!response.ok) {
-      const detail = payload && typeof payload.detail === 'string' ? payload.detail : null;
+      const detail = typeof payload?.detail === 'string'
+        ? payload.detail
+        : (typeof payload?.detail?.message === 'string' ? payload.detail.message : null);
       throw new Error(detail || fallbackMessage || ('Server returned ' + response.status));
     }
     return payload;
@@ -406,13 +408,21 @@
     }
     container.innerHTML = managedTVSettings.map((tv, index) => {
       const tokenState = tv.token_configured ? 'Paired' : 'Not paired';
+      const conflicts = tv.conflicts_with || [];
+      const conflictText = conflicts.length
+        ? (' · ⚠ Duplicate of ' + conflicts.join(', '))
+        : '';
+      const consolidateButton = conflicts.length
+        ? ('<button class="btn btn-secondary btn-small" data-settings-tv-action="consolidate" data-settings-tv-index="' + index + '">Consolidate</button>')
+        : '';
       return '<div class="settings-item">' +
         '<div class="settings-item-main"><strong>' + esc(tv.profile_id) + '</strong>' +
-        '<span>' + esc(tv.ip) + ':' + tv.port + ' · ' + esc(tokenState) + '</span></div>' +
+        '<span>' + esc(tv.ip) + ':' + tv.port + ' · ' + esc(tokenState + conflictText) + '</span></div>' +
         '<div class="settings-item-actions">' +
         '<button class="btn btn-ghost btn-small" data-settings-tv-action="test" data-settings-tv-index="' + index + '">Test</button>' +
         '<button class="btn btn-ghost btn-small" data-settings-tv-action="pair" data-settings-tv-index="' + index + '">Pair</button>' +
         '<button class="btn btn-secondary btn-small" data-settings-tv-action="edit" data-settings-tv-index="' + index + '">Edit</button>' +
+        consolidateButton +
         '<button class="btn btn-danger btn-small" data-settings-tv-action="delete" data-settings-tv-index="' + index + '">Delete</button>' +
         '</div></div>';
     }).join('');
@@ -1996,7 +2006,7 @@
   function openTVSettingsEditor(tv, discoveredTV) {
     editingTVProfileId = tv?.profile_id || null;
     const profileId = document.getElementById('tv-settings-profile-id');
-    profileId.disabled = Boolean(editingTVProfileId);
+    profileId.disabled = false;
     profileId.value = editingTVProfileId || suggestedProfileId(discoveredTV?.name);
     document.getElementById('tv-settings-title').textContent =
       editingTVProfileId ? ('Edit ' + editingTVProfileId) : 'Add TV';
@@ -2026,7 +2036,7 @@
       client_name: document.getElementById('tv-settings-client-name').value.trim(),
       ssl: document.getElementById('tv-settings-ssl').checked,
     };
-    if (!editingTVProfileId) payload.profile_id = profileId;
+    payload.profile_id = profileId;
 
     setSettingsModalError('tv-settings', '');
     setButtonBusy(button, 'Saving...');
@@ -2034,11 +2044,31 @@
       const endpoint = editingTVProfileId
         ? ('/settings/tvs/' + encodeURIComponent(editingTVProfileId))
         : '/settings/tvs';
-      const response = await apiFetch(endpoint, {
+      let response = await apiFetch(endpoint, {
         method: editingTVProfileId ? 'PUT' : 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
+      if (response.status === 409 && !editingTVProfileId) {
+        const conflictPayload = await response.json().catch(() => null);
+        const conflict = conflictPayload?.detail;
+        if (conflict?.code === 'tv_profile_conflict' && conflict.existing_profile_id) {
+          const confirmed = window.confirm(
+            conflict.message + ' Update that profile and rename it to ' + profileId + '?',
+          );
+          if (!confirmed) throw new Error(conflict.message);
+          response = await apiFetch(
+            '/settings/tvs/' + encodeURIComponent(conflict.existing_profile_id),
+            {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+            },
+          );
+        } else {
+          throw new Error('A matching TV profile already exists.');
+        }
+      }
       const result = await parseJSONResponse(response, 'Could not save TV.');
       managedTVSettings = result.tvs || [];
       renderSettingsTVSummary();
@@ -2077,6 +2107,29 @@
         showToast('TV profile deleted.', 'done');
       } catch (error) {
         showToast(error?.message || 'Could not delete TV.', 'error');
+      } finally {
+        clearButtonBusy(button);
+      }
+      return;
+    }
+    if (action === 'consolidate') {
+      if (!window.confirm(
+        'Keep ' + tv.profile_id + ' and remove its duplicate aliases? Pairing tokens are retained.',
+      )) return;
+      setButtonBusy(button, 'Consolidating...');
+      try {
+        const response = await apiFetch(
+          '/settings/tvs/' + encodeURIComponent(tv.profile_id) + '/consolidate',
+          { method: 'POST' },
+        );
+        const result = await parseJSONResponse(response, 'Could not consolidate TV profiles.');
+        managedTVSettings = result.tvs || [];
+        renderSettingsTVSummary();
+        await reloadConfiguredTVs();
+        renderAutomationTVChoices();
+        showToast('Duplicate TV profiles consolidated.', 'done');
+      } catch (error) {
+        showToast(error?.message || 'Could not consolidate TV profiles.', 'error');
       } finally {
         clearButtonBusy(button);
       }
@@ -2833,6 +2886,48 @@
     Promise.all([worker(), worker()]).catch(() => {});
   }
 
+  async function warmTVThumbnailQueue(wrappers, tvIp) {
+    const pending = [...wrappers];
+    const available = [];
+
+    try {
+      for (let offset = 0; offset < pending.length; offset += 100) {
+        const chunk = pending.slice(offset, offset + 100);
+        const response = await apiFetch('/tv/art/thumbnails/warm', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            tv_ip: tvIp,
+            content_ids: chunk.map(wrapper => wrapper.dataset.contentId),
+          }),
+        });
+
+        // Some newer TVs do not implement the batch request. Preserve the
+        // individual path as a compatibility fallback when it fails cleanly.
+        if (!response.ok) {
+          loadTVThumbnailQueue(pending, tvIp);
+          return;
+        }
+
+        const result = await response.json();
+        const ready = new Set([...(result.cached || []), ...(result.warmed || [])]);
+        const missing = new Set(result.missing || []);
+        chunk.forEach((wrapper) => {
+          const contentId = wrapper.dataset.contentId;
+          if (ready.has(contentId)) available.push(wrapper);
+          else if (missing.has(contentId)) {
+            setTVThumbnailState(wrapper, 'missing', 'No thumbnail available');
+          } else {
+            setTVThumbnailState(wrapper, 'error', 'TV unavailable · Retry');
+          }
+        });
+      }
+      loadTVThumbnailQueue(available, tvIp);
+    } catch {
+      loadTVThumbnailQueue(pending, tvIp);
+    }
+  }
+
   async function loadTVArt() {
     const tvIp = document.getElementById('tv-art-select').value;
     const grid = document.getElementById('tv-art-grid');
@@ -2925,7 +3020,7 @@
           coldThumbnails.push(wrapper);
         }
       });
-      loadTVThumbnailQueue(coldThumbnails, tvIp);
+      warmTVThumbnailQueue(coldThumbnails, tvIp);
 
       grid.querySelectorAll('.tv-art-select-item').forEach(el => {
         el.addEventListener('change', (e) => {
