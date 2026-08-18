@@ -34,10 +34,6 @@ DEFAULT_TIMEOUT = 10  # seconds for websocket operations
 _JPEG_QUALITY = 95
 _MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB safety threshold
 
-_TV_OP_LOCKS: dict[str, threading.Lock] = {}
-_TV_OP_LOCKS_GUARD = threading.Lock()
-
-
 @dataclass
 class TVStatus:
     """Current status of a Samsung Frame TV."""
@@ -56,6 +52,58 @@ class UploadResult:
     content_id: str
     success: bool
     error: str | None = None
+
+
+class TVOperationError(RuntimeError):
+    """Base error for bounded TV operation failures."""
+
+
+class TVOperationBusyError(TVOperationError):
+    """Raised when an operation expires before it can start."""
+
+
+class TVOperationTimeoutError(TVOperationError):
+    """Raised when an active TV operation exceeds its response deadline."""
+
+
+class _TVOperationGate:
+    """A cancellable per-TV gate that prioritizes mutations over reads."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._active = False
+        self._waiting_mutations = 0
+
+    def acquire(self, timeout_sec: float, priority: str) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        mutation = priority == "mutation"
+        acquired = False
+        with self._condition:
+            if mutation:
+                self._waiting_mutations += 1
+            try:
+                while self._active or (not mutation and self._waiting_mutations > 0):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self._condition.wait(remaining)
+                self._active = True
+                acquired = True
+                return True
+            finally:
+                if mutation:
+                    self._waiting_mutations -= 1
+                if not acquired:
+                    self._condition.notify_all()
+
+    def release(self) -> None:
+        with self._condition:
+            self._active = False
+            self._condition.notify_all()
+
+
+_TV_OP_GATES: dict[str, _TVOperationGate] = {}
+_TV_OP_GATES_GUARD = threading.Lock()
 
 
 def _ensure_token_dir(token_file: str) -> None:
@@ -166,28 +214,15 @@ def _retry(func, description: str) -> Any:
     raise RuntimeError(f"{description} failed after {MAX_RETRIES} attempts: {last_error}")
 
 
-def _tv_operation_lock(profile: TVProfile) -> threading.Lock:
-    """Return a per-TV lock to serialize websocket art operations."""
+def _tv_operation_gate(profile: TVProfile) -> _TVOperationGate:
+    """Return the cancellable, priority-aware gate for one TV."""
     key = f"{profile.ip}:{profile.port}"
-    with _TV_OP_LOCKS_GUARD:
-        lock = _TV_OP_LOCKS.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _TV_OP_LOCKS[key] = lock
-        return lock
-
-
-def _run_serialized(profile: TVProfile, func, description: str) -> Any:
-    """Run a TV operation under a per-device lock."""
-    lock = _tv_operation_lock(profile)
-    logger.debug(
-        "Acquiring TV operation lock for %s:%d (%s)",
-        profile.ip,
-        profile.port,
-        description,
-    )
-    with lock:
-        return func()
+    with _TV_OP_GATES_GUARD:
+        gate = _TV_OP_GATES.get(key)
+        if gate is None:
+            gate = _TVOperationGate()
+            _TV_OP_GATES[key] = gate
+        return gate
 
 
 def pair(profile: TVProfile) -> bool:
@@ -231,7 +266,7 @@ ART_READINESS_TIMEOUT = 3.0
 ART_READINESS_POLL_INTERVAL = 0.25
 
 
-def _run_with_timeout(func, timeout_sec: int = TV_OP_TIMEOUT):
+def _run_with_timeout(func, timeout_sec: float = TV_OP_TIMEOUT):
     """Run a function in a thread with a timeout. Returns (result, error)."""
     import queue
 
@@ -257,21 +292,49 @@ def _run_with_timeout(func, timeout_sec: int = TV_OP_TIMEOUT):
     return None, str(value)
 
 
-def _run_tv_op(profile: TVProfile, func, description: str, timeout_sec: int = TV_OP_TIMEOUT):
-    """Run a TV WebSocket operation with serialization, retry, and timeout.
+def _run_tv_op(
+    profile: TVProfile,
+    func,
+    description: str,
+    timeout_sec: float = TV_OP_TIMEOUT,
+    *,
+    priority: str = "mutation",
+):
+    """Run a TV operation through a cancellable, priority-aware device gate.
 
-    Raises RuntimeError if the operation fails or times out.
+    Waiting happens in the caller thread. An expired waiter therefore never
+    creates a background worker and can never contact the TV later. Once an
+    operation starts, the gate stays occupied until its worker actually exits,
+    even if the caller's response deadline expires.
     """
-    def _inner():
-        return _run_serialized(
-            profile,
-            lambda: _retry(func, description),
-            description,
+    if priority not in {"read", "mutation"}:
+        raise ValueError("priority must be 'read' or 'mutation'")
+
+    started_at = time.monotonic()
+    gate = _tv_operation_gate(profile)
+    if not gate.acquire(timeout_sec, priority):
+        raise TVOperationBusyError(
+            f"{description}: TV busy; operation expired before it could start"
         )
 
-    result, err = _run_with_timeout(_inner, timeout_sec=timeout_sec)
+    remaining = timeout_sec - (time.monotonic() - started_at)
+    if remaining <= 0:
+        gate.release()
+        raise TVOperationBusyError(
+            f"{description}: TV busy; operation expired before it could start"
+        )
+
+    def _inner():
+        try:
+            return _retry(func, description)
+        finally:
+            gate.release()
+
+    result, err = _run_with_timeout(_inner, timeout_sec=remaining)
     if err:
-        raise RuntimeError(f"{description}: {err}")
+        if err == "timed out":
+            raise TVOperationTimeoutError(f"{description}: timed out")
+        raise TVOperationError(f"{description}: {err}")
     return result
 
 
@@ -318,24 +381,30 @@ def get_status(profile: TVProfile) -> TVStatus:
             with contextlib.suppress(Exception):
                 art.close()
 
-    result, err = _run_with_timeout(
-        lambda: _run_serialized(profile, _query_art_mode, "Get art mode status"),
-    )
-    if err:
-        logger.warning("Could not get art mode status: %s", err)
-    else:
-        art_mode_on = bool(result)
+    try:
+        result = _run_tv_op(
+            profile,
+            _query_art_mode,
+            "Get art mode status",
+            priority="read",
+        )
+        art_mode_on = _art_mode_is_on(result)
+    except TVOperationError as exc:
+        logger.warning("Could not get art mode status: %s", exc)
 
-    result, err = _run_with_timeout(
-        lambda: _run_serialized(profile, _query_current, "Get current artwork"),
-    )
-    if err:
-        logger.warning("Could not get current artwork: %s", err)
-    else:
+    try:
+        result = _run_tv_op(
+            profile,
+            _query_current,
+            "Get current artwork",
+            priority="read",
+        )
         if isinstance(result, dict):
             current_artwork = result.get("content_id")
         elif isinstance(result, str):
             current_artwork = result
+    except TVOperationError as exc:
+        logger.warning("Could not get current artwork: %s", exc)
 
     return TVStatus(
         reachable=True,
@@ -500,6 +569,7 @@ def _run_art_call(
     description: str,
     *,
     timeout_sec: float = TV_OP_TIMEOUT,
+    priority: str = "mutation",
 ):
     """Run one art-service call with its own connection and deadline."""
 
@@ -513,7 +583,13 @@ def _run_art_call(
                 with contextlib.suppress(Exception):
                     art.close()
 
-    return _run_tv_op(profile, _call, description, timeout_sec=timeout_sec)
+    return _run_tv_op(
+        profile,
+        _call,
+        description,
+        timeout_sec=timeout_sec,
+        priority=priority,
+    )
 
 
 def _art_mode_is_on(value: Any) -> bool:
@@ -665,7 +741,7 @@ def list_art(profile: TVProfile) -> list[dict[str, Any]]:
             with contextlib.suppress(Exception):
                 art.close()
 
-    return _run_tv_op(profile, _do_list, "List art")
+    return _run_tv_op(profile, _do_list, "List art", priority="read")
 
 
 def list_art_deduplicated(profile: TVProfile) -> list[dict[str, Any]]:
@@ -711,11 +787,12 @@ def get_art_thumbnail(profile: TVProfile, content_id: str) -> bytes | None:
             with contextlib.suppress(Exception):
                 art.close()
 
-    try:
-        return _run_tv_op(profile, _do_thumbnail, f"Fetch thumbnail for {content_id}")
-    except Exception as e:
-        logger.warning("Failed to fetch thumbnail for %s: %s", content_id, e)
-        return None
+    return _run_tv_op(
+        profile,
+        _do_thumbnail,
+        f"Fetch thumbnail for {content_id}",
+        priority="read",
+    )
 
 
 def get_matte_list(profile: TVProfile) -> list[dict[str, Any]]:
@@ -734,7 +811,7 @@ def get_matte_list(profile: TVProfile) -> list[dict[str, Any]]:
             with contextlib.suppress(Exception):
                 art.close()
 
-    result = _run_tv_op(profile, _do_get_mattes, "Get matte list")
+    result = _run_tv_op(profile, _do_get_mattes, "Get matte list", priority="read")
     # v3.x returns {"matte_types": [...], "matte_colors": [...]}
     if isinstance(result, dict):
         return result.get("matte_types", [])

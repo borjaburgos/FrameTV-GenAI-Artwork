@@ -551,6 +551,15 @@ def tv_delete_art(ctx, tv_name, tv_ip, include_favorites, content_ids):
     click.echo(f"Deleting {len(ids)} artwork(s) from TV: {', '.join(ids)}")
 
     if delete_art(profile, ids):
+        try:
+            from frameart.tv.cache import TVCacheStore, tv_cache_key
+
+            TVCacheStore(settings.data_dir).delete_thumbnails(tv_cache_key(profile), ids)
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "Could not invalidate deleted TV thumbnails: %s",
+                exc,
+            )
         click.secho(f"Deleted {len(ids)} artwork(s).", fg="green")
     else:
         click.secho("Failed to delete artwork(s).", fg="red", err=True)

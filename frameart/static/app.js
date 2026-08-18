@@ -1155,7 +1155,7 @@
         return `
         <div class="gallery-item">
           <img src="/jobs/${esc(j.job_id)}/image" alt="${promptShort}" loading="lazy"
-               onclick="showPreview('${esc(j.job_id)}')"
+               data-preview-job-id="${esc(j.job_id)}"
                onerror="this.style.display='none'">
           <div class="info">
             <label class="select-row">
@@ -1170,10 +1170,10 @@
           </div>
           <div class="actions">
             <button class="btn btn-secondary btn-small"
-                    onclick="openUploadModal('${esc(j.job_id)}', '${esc(j.prompt || j.job_id)}')">
+                    data-upload-job-id="${esc(j.job_id)}">
               Upload to TV</button>
             <button class="btn btn-secondary btn-small"
-                    onclick="openRemixFromJob('${esc(j.job_id)}', '${esc(j.prompt || j.job_id)}')">
+                    data-remix-job-id="${esc(j.job_id)}">
               Edit / Generate New</button>
             <button class="btn btn-ghost btn-small" data-tag-job-id="${esc(j.job_id)}">Tags</button>
           </div>
@@ -1234,11 +1234,32 @@
   });
   document.getElementById('btn-batch-upload-apply').addEventListener('click', applyBatchUpload);
   document.getElementById('gallery-grid').addEventListener('click', (event) => {
-    const button = event.target.closest('[data-tag-job-id]');
-    if (!button) return;
-    setTagsForJobs([button.dataset.tagJobId]).catch((error) => {
-      showToast(error?.message || 'Could not save tags.', 'error');
-    });
+    const target = event.target;
+    const uploadButton = target.closest('[data-upload-job-id]');
+    if (uploadButton) {
+      const jobId = uploadButton.dataset.uploadJobId;
+      const job = loadedGalleryJobs[jobId];
+      window.openUploadModal(jobId, job?.prompt || jobId);
+      return;
+    }
+    const remixButton = target.closest('[data-remix-job-id]');
+    if (remixButton) {
+      const jobId = remixButton.dataset.remixJobId;
+      const job = loadedGalleryJobs[jobId];
+      window.openRemixFromJob(jobId, job?.prompt || jobId);
+      return;
+    }
+    const preview = target.closest('[data-preview-job-id]');
+    if (preview) {
+      window.showPreview(preview.dataset.previewJobId);
+      return;
+    }
+    const tagButton = target.closest('[data-tag-job-id]');
+    if (tagButton) {
+      setTagsForJobs([tagButton.dataset.tagJobId]).catch((error) => {
+        showToast(error?.message || 'Could not save tags.', 'error');
+      });
+    }
   });
   document.getElementById('btn-gallery-filter').addEventListener('click', loadGallery);
   document.getElementById('gallery-search').addEventListener('keydown', (event) => {
@@ -2762,6 +2783,56 @@
     updateTVSelectionUI();
   }
 
+  function setTVThumbnailState(wrapper, state, message) {
+    const image = wrapper.querySelector('.art-thumb');
+    const fallback = wrapper.querySelector('.art-thumb-fallback');
+    wrapper.dataset.thumbnailState = state;
+    fallback.textContent = message;
+    fallback.disabled = state !== 'error';
+    fallback.style.display = state === 'loaded' ? 'none' : 'flex';
+    image.style.display = state === 'loaded' ? 'block' : 'none';
+  }
+
+  async function loadTVThumbnail(wrapper, tvIp, contentId, refresh = false) {
+    const image = wrapper.querySelector('.art-thumb');
+    setTVThumbnailState(wrapper, 'loading', 'Loading thumbnail…');
+    const params = new URLSearchParams({ tv_ip: tvIp, content_id: contentId });
+    if (refresh) params.set('refresh', 'true');
+    try {
+      const response = await apiFetch('/tv/art/thumbnail?' + params.toString());
+      if (response.status === 404) {
+        setTVThumbnailState(wrapper, 'missing', 'No thumbnail available');
+        return;
+      }
+      if (!response.ok) {
+        setTVThumbnailState(wrapper, 'error', 'TV unavailable · Retry');
+        return;
+      }
+      const blob = await response.blob();
+      const previousUrl = image.dataset.objectUrl;
+      if (previousUrl) URL.revokeObjectURL(previousUrl);
+      const objectUrl = URL.createObjectURL(blob);
+      image.dataset.objectUrl = objectUrl;
+      image.loading = 'eager';
+      image.onload = () => setTVThumbnailState(wrapper, 'loaded', '');
+      image.onerror = () => setTVThumbnailState(wrapper, 'error', 'Preview unavailable · Retry');
+      image.src = objectUrl;
+    } catch {
+      setTVThumbnailState(wrapper, 'error', 'TV unavailable · Retry');
+    }
+  }
+
+  function loadTVThumbnailQueue(wrappers, tvIp) {
+    const queue = [...wrappers];
+    const worker = async () => {
+      while (queue.length) {
+        const wrapper = queue.shift();
+        await loadTVThumbnail(wrapper, tvIp, wrapper.dataset.contentId);
+      }
+    };
+    Promise.all([worker(), worker()]).catch(() => {});
+  }
+
   async function loadTVArt() {
     const tvIp = document.getElementById('tv-art-select').value;
     const grid = document.getElementById('tv-art-grid');
@@ -2795,20 +2866,27 @@
 
       loadedTVArtById = Object.fromEntries(artworks.map(a => [a.content_id, a]));
 
-      grid.innerHTML = artworks.map(a => `
+      grid.innerHTML = artworks.map(a => {
+        const localPreview = a.local_job_id
+          ? '/jobs/' + encodeURIComponent(a.local_job_id) + '/image'
+          : '';
+        return `
         <div class="tv-art-item">
           <label class="art-select-row">
             <input type="checkbox" class="tv-art-select-item" data-content-id="${esc(a.content_id)}">
             <span class="art-id">${esc(a.content_id)}</span>
             ${a.is_favourite ? '<span class="art-fav">\u2665 favourite</span>' : ''}
           </label>
-          <div class="art-thumb-wrap">
+          <div class="art-thumb-wrap" data-content-id="${esc(a.content_id)}"
+               data-thumbnail-state="${localPreview ? 'local' : 'loading'}">
             <img class="art-thumb"
-                 src="/tv/art/thumbnail?tv_ip=${encodeURIComponent(tvIp)}&content_id=${encodeURIComponent(a.content_id)}"
+                 ${localPreview ? `src="${esc(localPreview)}"` : ''}
                  alt="Thumbnail ${esc(a.content_id)}"
-                 loading="lazy"
-                 onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
-            <div class="art-thumb-fallback">No thumbnail</div>
+                 loading="lazy"${localPreview ? '' : ' style="display:none"'}>
+            <button type="button" class="art-thumb-fallback"
+                    ${localPreview ? 'style="display:none" disabled' : 'disabled'}>
+              ${localPreview ? '' : 'Loading thumbnail…'}
+            </button>
           </div>
           <div class="art-actions">
             <button class="btn btn-small"
@@ -2825,8 +2903,29 @@
               Delete</button>
           </div>
         </div>
-      `).join('');
+      `;
+      }).join('');
       animateStaggeredChildren(grid, '.tv-art-item');
+
+      const coldThumbnails = [];
+      grid.querySelectorAll('.art-thumb-wrap').forEach((wrapper) => {
+        const contentId = wrapper.dataset.contentId;
+        const image = wrapper.querySelector('.art-thumb');
+        const fallback = wrapper.querySelector('.art-thumb-fallback');
+        fallback.addEventListener('click', () => {
+          loadTVThumbnail(wrapper, tvIp, contentId, true);
+        });
+        if (wrapper.dataset.thumbnailState === 'local') {
+          image.addEventListener('load', () => setTVThumbnailState(wrapper, 'loaded', ''));
+          image.addEventListener('error', () => loadTVThumbnail(wrapper, tvIp, contentId));
+          if (image.complete && image.naturalWidth > 0) {
+            setTVThumbnailState(wrapper, 'loaded', '');
+          }
+        } else {
+          coldThumbnails.push(wrapper);
+        }
+      });
+      loadTVThumbnailQueue(coldThumbnails, tvIp);
 
       grid.querySelectorAll('.tv-art-select-item').forEach(el => {
         el.addEventListener('change', (e) => {
