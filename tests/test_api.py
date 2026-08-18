@@ -1170,9 +1170,10 @@ class TestManagedTVs:
 class TestTVListArt:
     @patch("frameart.api._settings")
     @patch("frameart.tv.controller.list_art_deduplicated")
-    def test_returns_deduplicated_list(self, mock_list, mock_settings):
+    def test_returns_deduplicated_list(self, mock_list, mock_settings, tmp_path):
         settings = MagicMock()
         settings.tvs = {}
+        settings.data_dir = tmp_path
         mock_settings.return_value = settings
 
         mock_list.return_value = [
@@ -1187,6 +1188,31 @@ class TestTVListArt:
         assert data[0]["content_id"] == "MY_F0001"
         assert data[0]["is_favourite"] is True
         assert data[1]["is_favourite"] is False
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.list_art_deduplicated")
+    def test_returns_local_job_preview_when_content_id_matches(
+        self,
+        mock_list,
+        mock_settings,
+        tmp_path,
+    ):
+        job_dir = tmp_path / "artifacts" / "2026" / "01" / "01" / "local-job"
+        job_dir.mkdir(parents=True)
+        (job_dir / "final.png").write_bytes(b"local")
+        (job_dir / "meta.json").write_text(
+            '{"job_id":"local-job","content_id":"MY_F0001"}'
+        )
+        settings = MagicMock()
+        settings.tvs = {}
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        mock_list.return_value = [{"content_id": "MY_F0001", "is_favourite": False}]
+
+        resp = client.get("/tv/art?tv_ip=192.168.1.100")
+
+        assert resp.status_code == 200
+        assert resp.json()[0]["local_job_id"] == "local-job"
 
     @patch("frameart.api._settings")
     def test_no_tv_returns_400(self, mock_settings):
@@ -1217,27 +1243,77 @@ class TestTVListArt:
 class TestTVArtThumbnail:
     @patch("frameart.api._settings")
     @patch("frameart.tv.controller.get_art_thumbnail")
-    def test_returns_thumbnail_bytes(self, mock_thumb, mock_settings):
+    def test_returns_thumbnail_bytes(self, mock_thumb, mock_settings, tmp_path):
         settings = MagicMock()
         settings.tvs = {}
+        settings.data_dir = tmp_path
         mock_settings.return_value = settings
         mock_thumb.return_value = b"\xff\xd8\xff\xd9"
 
         resp = client.get("/tv/art/thumbnail?tv_ip=192.168.1.100&content_id=MY_F0001")
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "image/jpeg"
+        assert resp.headers["x-frameart-cache"] == "miss"
         assert resp.content == b"\xff\xd8\xff\xd9"
+
+        second = client.get(
+            "/tv/art/thumbnail?tv_ip=192.168.1.100&content_id=MY_F0001"
+        )
+        assert second.status_code == 200
+        assert second.headers["x-frameart-cache"] == "hit"
+        mock_thumb.assert_called_once()
 
     @patch("frameart.api._settings")
     @patch("frameart.tv.controller.get_art_thumbnail")
-    def test_returns_404_when_unavailable(self, mock_thumb, mock_settings):
+    def test_returns_404_when_unavailable(self, mock_thumb, mock_settings, tmp_path):
         settings = MagicMock()
         settings.tvs = {}
+        settings.data_dir = tmp_path
         mock_settings.return_value = settings
         mock_thumb.return_value = None
 
         resp = client.get("/tv/art/thumbnail?tv_ip=192.168.1.100&content_id=MY_F0001")
         assert resp.status_code == 404
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.get_art_thumbnail")
+    def test_transport_timeout_returns_504(self, mock_thumb, mock_settings, tmp_path):
+        from frameart.tv.controller import TVOperationTimeoutError
+
+        settings = MagicMock()
+        settings.tvs = {}
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        mock_thumb.side_effect = TVOperationTimeoutError("timed out")
+
+        resp = client.get("/tv/art/thumbnail?tv_ip=192.168.1.100&content_id=MY_F0001")
+
+        assert resp.status_code == 504
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.get_art_thumbnail")
+    def test_refresh_serves_stale_thumbnail_on_failure(
+        self,
+        mock_thumb,
+        mock_settings,
+        tmp_path,
+    ):
+        from frameart.tv.controller import TVOperationTimeoutError
+
+        settings = MagicMock()
+        settings.tvs = {}
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        mock_thumb.return_value = b"cached-jpeg"
+        url = "/tv/art/thumbnail?tv_ip=192.168.1.100&content_id=MY_F0001"
+        assert client.get(url).status_code == 200
+
+        mock_thumb.side_effect = TVOperationTimeoutError("timed out")
+        resp = client.get(url + "&refresh=true")
+
+        assert resp.status_code == 200
+        assert resp.content == b"cached-jpeg"
+        assert resp.headers["x-frameart-cache"] == "stale"
 
 
 # ---------------------------------------------------------------------------
@@ -1248,9 +1324,16 @@ class TestTVDeleteArt:
     @patch("frameart.api._settings")
     @patch("frameart.tv.controller.delete_art")
     @patch("frameart.tv.controller.list_art_deduplicated")
-    def test_skips_favorites_by_default(self, mock_list, mock_delete, mock_settings):
+    def test_skips_favorites_by_default(
+        self,
+        mock_list,
+        mock_delete,
+        mock_settings,
+        tmp_path,
+    ):
         settings = MagicMock()
         settings.tvs = {}
+        settings.data_dir = tmp_path
         mock_settings.return_value = settings
 
         mock_list.return_value = [
@@ -1272,9 +1355,16 @@ class TestTVDeleteArt:
     @patch("frameart.api._settings")
     @patch("frameart.tv.controller.delete_art")
     @patch("frameart.tv.controller.list_art_deduplicated")
-    def test_include_favorites(self, mock_list, mock_delete, mock_settings):
+    def test_include_favorites(
+        self,
+        mock_list,
+        mock_delete,
+        mock_settings,
+        tmp_path,
+    ):
         settings = MagicMock()
         settings.tvs = {}
+        settings.data_dir = tmp_path
         mock_settings.return_value = settings
 
         mock_list.return_value = [
@@ -1345,6 +1435,36 @@ class TestTVDeleteArt:
             "content_ids": ["MY_F0001"],
         })
         assert resp.status_code == 400
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.delete_art", return_value=True)
+    def test_success_invalidates_cached_thumbnail(
+        self,
+        mock_delete,
+        mock_settings,
+        tmp_path,
+    ):
+        from frameart.tv.cache import TVCacheStore
+
+        settings = MagicMock()
+        settings.tvs = {}
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        cache = TVCacheStore(tmp_path)
+        cache.set_thumbnail("192.168.1.100:8002", "MY_F0001", b"cached")
+
+        resp = client.post(
+            "/tv/art/delete",
+            json={
+                "content_ids": ["MY_F0001"],
+                "tv_ip": "192.168.1.100",
+                "include_favorites": True,
+            },
+        )
+
+        assert resp.status_code == 200
+        assert cache.get_thumbnail("192.168.1.100:8002", "MY_F0001") is None
+        mock_delete.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1455,9 +1575,10 @@ class TestTVDisplayArt:
 class TestTVMattes:
     @patch("frameart.api._settings")
     @patch("frameart.tv.controller.get_matte_list")
-    def test_returns_mattes(self, mock_mattes, mock_settings):
+    def test_returns_mattes(self, mock_mattes, mock_settings, tmp_path):
         settings = MagicMock()
         settings.tvs = {}
+        settings.data_dir = tmp_path
         mock_settings.return_value = settings
         mock_mattes.return_value = [
             {"matte_id": "shadowbox_polar"},
@@ -1469,6 +1590,12 @@ class TestTVMattes:
         data = resp.json()
         assert len(data) == 2
         assert data[0]["matte_id"] == "shadowbox_polar"
+        assert resp.headers["x-frameart-cache"] == "miss"
+
+        second = client.get("/tv/mattes?tv_ip=192.168.1.100")
+        assert second.status_code == 200
+        assert second.headers["x-frameart-cache"] == "hit"
+        mock_mattes.assert_called_once()
 
     @patch("frameart.api._settings")
     def test_no_tv_returns_400(self, mock_settings):
@@ -1481,15 +1608,106 @@ class TestTVMattes:
 
     @patch("frameart.api._settings")
     @patch("frameart.tv.controller.get_matte_list")
-    def test_upstream_failure_returns_502(self, mock_mattes, mock_settings):
+    def test_upstream_failure_returns_502(self, mock_mattes, mock_settings, tmp_path):
         settings = MagicMock()
         settings.tvs = {}
+        settings.data_dir = tmp_path
         mock_settings.return_value = settings
         mock_mattes.side_effect = TimeoutError("timed out")
 
         resp = client.get("/tv/mattes?tv_ip=192.168.1.100")
         assert resp.status_code == 502
         assert "TV matte list failed" in resp.json()["detail"]
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.get_matte_list")
+    def test_refresh_replaces_cache_and_stale_fallback_survives_timeout(
+        self,
+        mock_mattes,
+        mock_settings,
+        tmp_path,
+    ):
+        settings = MagicMock()
+        settings.tvs = {}
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        url = "/tv/mattes?tv_ip=192.168.1.100"
+        mock_mattes.return_value = [{"matte_id": "first"}]
+        assert client.get(url).json()[0]["matte_id"] == "first"
+
+        mock_mattes.return_value = [{"matte_id": "second"}]
+        refreshed = client.get(url + "&refresh=true")
+        assert refreshed.json()[0]["matte_id"] == "second"
+        assert refreshed.headers["x-frameart-cache"] == "miss"
+
+        mock_mattes.side_effect = TimeoutError("timed out")
+        stale = client.get(url + "&refresh=true")
+        assert stale.status_code == 200
+        assert stale.json()[0]["matte_id"] == "second"
+        assert stale.headers["x-frameart-cache"] == "stale"
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.get_matte_list")
+    def test_empty_matte_response_is_not_cached(
+        self,
+        mock_mattes,
+        mock_settings,
+        tmp_path,
+    ):
+        settings = MagicMock()
+        settings.tvs = {}
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        mock_mattes.return_value = []
+
+        first = client.get("/tv/mattes?tv_ip=192.168.1.100")
+        second = client.get("/tv/mattes?tv_ip=192.168.1.100")
+
+        assert first.status_code == 502
+        assert second.status_code == 502
+        assert mock_mattes.call_count == 2
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.get_matte_list")
+    def test_cache_keys_do_not_mix_tvs(self, mock_mattes, mock_settings, tmp_path):
+        settings = MagicMock()
+        settings.tvs = {}
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        mock_mattes.side_effect = [
+            [{"matte_id": "tv-one"}],
+            [{"matte_id": "tv-two"}],
+        ]
+
+        first = client.get("/tv/mattes?tv_ip=192.168.1.100")
+        second = client.get("/tv/mattes?tv_ip=192.168.1.101")
+
+        assert first.json()[0]["matte_id"] == "tv-one"
+        assert second.json()[0]["matte_id"] == "tv-two"
+        assert mock_mattes.call_count == 2
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.get_matte_list")
+    def test_explicit_invalidate_forces_next_refresh(
+        self,
+        mock_mattes,
+        mock_settings,
+        tmp_path,
+    ):
+        settings = MagicMock()
+        settings.tvs = {}
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        mock_mattes.side_effect = [
+            [{"matte_id": "first"}],
+            [{"matte_id": "second"}],
+        ]
+        url = "/tv/mattes?tv_ip=192.168.1.100"
+
+        assert client.get(url).json()[0]["matte_id"] == "first"
+        invalidated = client.delete("/tv/mattes/cache?tv_ip=192.168.1.100")
+        assert invalidated.status_code == 200
+        assert client.get(url).json()[0]["matte_id"] == "second"
 
 
 # ---------------------------------------------------------------------------

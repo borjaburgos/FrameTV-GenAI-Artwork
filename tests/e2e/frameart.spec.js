@@ -156,6 +156,117 @@ test('searches, tags, and collects library artwork', async ({ page }) => {
   }
 });
 
+test('library actions safely handle hostile prompt text', async ({ page }) => {
+  const cases = [
+    ['e2e-prompt-apostrophe', "child's drawing"],
+    ['e2e-prompt-backslash', 'path \\ through woods'],
+    ['e2e-prompt-quote', 'the "blue" room'],
+    ['e2e-prompt-linebreak', 'first line\nsecond line'],
+    ['e2e-prompt-html', '<b>test</b>'],
+  ];
+  const jobDirs = [];
+  const errors = [];
+  page.on('console', (message) => {
+    if (message.type() === 'error') errors.push(message.text());
+  });
+  page.on('pageerror', (error) => errors.push(error.message));
+
+  for (const [jobId, prompt] of cases) {
+    const jobDir = path.join(
+      process.cwd(), '.e2e-data', 'artifacts', '2026', '01', '03', jobId,
+    );
+    jobDirs.push(jobDir);
+    await mkdir(jobDir, { recursive: true });
+    await writeFile(
+      path.join(jobDir, 'final.png'),
+      Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII=',
+        'base64',
+      ),
+    );
+    await writeFile(
+      path.join(jobDir, 'meta.json'),
+      JSON.stringify({ job_id: jobId, prompt_original: prompt, provider: 'openai' }),
+    );
+  }
+
+  try {
+    await page.goto('/');
+    await page.locator('.tabs').getByRole('button', { name: 'Library' }).click();
+
+    for (const [jobId, prompt] of cases) {
+      await page.locator(`[data-upload-job-id="${jobId}"]`).click();
+      expect(await page.locator('#upload-job-id').evaluate((node) => node.textContent)).toBe(prompt);
+      await page.locator('#btn-upload-cancel').click();
+
+      await page.locator(`[data-remix-job-id="${jobId}"]`).click();
+      expect(
+        await page.locator('#remix-source-label').evaluate((node) => node.textContent),
+      ).toBe('Library · ' + prompt);
+      await page.locator('#btn-remix-cancel').click();
+    }
+
+    expect(errors).toEqual([]);
+  } finally {
+    await Promise.all(jobDirs.map((jobDir) => rm(jobDir, { recursive: true, force: true })));
+  }
+});
+
+test('TV gallery distinguishes loaded, missing, and unavailable thumbnails', async ({ page, request }) => {
+  await request.post('/settings/tvs', {
+    data: {
+      profile_id: 'e2e_thumbnail_tv',
+      ip: '192.168.50.29',
+      port: 8002,
+      client_name: 'FrameArt E2E',
+      ssl: true,
+    },
+  });
+  await page.route('**/tv/art?**', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify([
+        { content_id: 'MY_LOADED', is_favourite: false, local_job_id: null },
+        { content_id: 'MY_MISSING', is_favourite: false, local_job_id: null },
+        { content_id: 'MY_BUSY', is_favourite: false, local_job_id: null },
+      ]),
+    });
+  });
+  await page.route('**/tv/art/thumbnail?**', async (route) => {
+    const contentId = new URL(route.request().url()).searchParams.get('content_id');
+    if (contentId === 'MY_LOADED') {
+      await route.fulfill({
+        contentType: 'image/png',
+        body: Buffer.from(
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYPgPAAEDAQAIicLsAAAAAElFTkSuQmCC',
+          'base64',
+        ),
+      });
+    } else if (contentId === 'MY_MISSING') {
+      await route.fulfill({ status: 404, contentType: 'application/json', body: '{}' });
+    } else {
+      await route.fulfill({ status: 503, contentType: 'application/json', body: '{}' });
+    }
+  });
+
+  try {
+    await page.goto('/');
+    await page.locator('.tabs').getByRole('button', { name: 'TVs' }).click();
+    await page.locator('#tv-art-select').selectOption('192.168.50.29');
+    await page.getByRole('button', { name: 'Load Art' }).click();
+
+    const loaded = page.locator('.tv-art-item').filter({ hasText: 'MY_LOADED' });
+    const missing = page.locator('.tv-art-item').filter({ hasText: 'MY_MISSING' });
+    const busy = page.locator('.tv-art-item').filter({ hasText: 'MY_BUSY' });
+    await expect(loaded.locator('.art-thumb-wrap')).toHaveAttribute('data-thumbnail-state', 'loaded');
+    await expect(missing.locator('.art-thumb-fallback')).toHaveText('No thumbnail available');
+    await expect(busy.locator('.art-thumb-fallback')).toHaveText('TV unavailable · Retry');
+    await expect(busy.locator('.art-thumb-fallback')).toBeEnabled();
+  } finally {
+    await request.delete('/settings/tvs/e2e_thumbnail_tv');
+  }
+});
+
 test('creates TV groups, playlists, and durable schedules', async ({ page, request }) => {
   const jobId = 'e2e-automation-art';
   const jobDir = path.join(process.cwd(), '.e2e-data', 'artifacts', '2026', '01', '02', jobId);

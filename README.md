@@ -244,6 +244,10 @@ Loopback-only serving leaves authentication off by default. Non-loopback binds a
 |--------|------|-------------|
 | `GET` | `/tv/status` | Check TV connection and art mode |
 | `GET` | `/tv/discover` | Auto-discover Samsung TVs via SSDP |
+| `GET` | `/tv/art` | List TV artwork and matching local preview jobs |
+| `GET` | `/tv/art/thumbnail` | Serve a bounded, persistent TV thumbnail (`refresh=true` forces refresh) |
+| `GET` | `/tv/mattes` | List cached TV matte styles (`refresh=true` forces refresh) |
+| `DELETE` | `/tv/mattes/cache` | Invalidate one TV's matte cache (admin token required) |
 | `GET` | `/jobs` | List recent jobs |
 | `GET` | `/jobs/{job_id}/image` | Serve the final processed image |
 | `PUT` | `/jobs/{job_id}/tags` | Replace persistent artwork tags |
@@ -715,6 +719,17 @@ FrameArt attempts to switch to Art Mode automatically. If it fails, press the po
 - Check that the TV is in Art Mode: `frameart tv status --tv-ip <IP>`
 - The image may need a moment to process on the TV after upload.
 - Try listing artworks to confirm it uploaded: `frameart tv list-art --tv-ip <IP>`
+
+### TV gallery thumbnail or matte errors
+
+- FrameArt stores successful thumbnails and matte lists beneath `FRAMEART_DATA_DIR` and serves
+  the last good value while a TV is temporarily unavailable.
+- Gallery cards distinguish a confirmed missing thumbnail from a retryable TV error; select the
+  retry message to force a fresh thumbnail request.
+- Force a matte refresh with `GET /tv/mattes?tv_ip=<IP>&refresh=true`, or invalidate it with
+  `DELETE /tv/mattes/cache?tv_ip=<IP>` using an admin token.
+- Successful artwork deletion removes the matching cached thumbnail automatically. The cache is
+  bounded to 500 files or 256 MiB and evicts the oldest entries first.
 
 ### Public-domain image timeouts
 

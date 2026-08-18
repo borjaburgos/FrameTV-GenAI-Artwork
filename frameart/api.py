@@ -95,6 +95,18 @@ from frameart.settings_store import (
     restore_settings_backup,
     update_management_state,
 )
+from frameart.tv.cache import (
+    MATTE_CACHE_TTL_SECONDS,
+    TVCacheStore,
+    coalesced_cache_fill,
+    thumbnail_fetch_slot,
+    tv_cache_key,
+)
+from frameart.tv.controller import (
+    TVOperationBusyError,
+    TVOperationError,
+    TVOperationTimeoutError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +127,7 @@ _PUBLIC_PATHS = {
     "/redoc",
 }
 _PUBLIC_PREFIXES = ("/static/",)
-_ADMIN_PATHS = {"/jobs/delete", "/tv/art/delete", "/tv/art/matte"}
+_ADMIN_PATHS = {"/jobs/delete", "/tv/art/delete", "/tv/art/matte", "/tv/mattes/cache"}
 _ADMIN_PREFIXES = ("/settings", "/automation")
 _rate_limit_events: dict[str, deque[float]] = defaultdict(deque)
 _rate_limit_lock = threading.Lock()
@@ -365,6 +377,7 @@ class TVArtItem(BaseModel):
 
     content_id: str
     is_favourite: bool = False
+    local_job_id: str | None = None
 
 
 class DeleteArtRequest(BaseModel):
@@ -810,6 +823,101 @@ def _settings():
 def _library_store(settings=None) -> LibraryStore:
     settings = settings or _settings()
     return LibraryStore(settings.data_dir)
+
+
+def _tv_cache_store(settings=None) -> TVCacheStore:
+    settings = settings or _settings()
+    return TVCacheStore(Path(settings.data_dir))
+
+
+def _raise_tv_cache_http_error(exc: Exception, operation: str) -> None:
+    if isinstance(exc, TVOperationBusyError):
+        raise HTTPException(
+            status_code=503,
+            detail=f"{operation} is busy; retry shortly.",
+            headers={"Retry-After": "2"},
+        ) from exc
+    if isinstance(exc, TVOperationTimeoutError):
+        raise HTTPException(status_code=504, detail=f"{operation} timed out.") from exc
+    raise HTTPException(status_code=502, detail=f"{operation} failed: {exc}") from exc
+
+
+def _cached_tv_thumbnail(settings, profile: TVProfile, content_id: str, *, refresh: bool = False):
+    """Return a cached/upstream thumbnail entry plus cache status."""
+    from frameart.tv.controller import get_art_thumbnail
+
+    cache = _tv_cache_store(settings)
+    key = tv_cache_key(profile)
+    initial = cache.get_thumbnail(key, content_id)
+    if initial is not None and not refresh:
+        return initial, "hit"
+
+    with coalesced_cache_fill("thumbnail", key, content_id):
+        current = cache.get_thumbnail(key, content_id)
+        if current is not None and (
+            not refresh
+            or initial is None
+            or current.updated_at > initial.updated_at
+        ):
+            return current, "hit"
+
+        stale = current or initial
+        with thumbnail_fetch_slot(key) as admitted:
+            if not admitted:
+                if stale is not None:
+                    return stale, "stale"
+                raise TVOperationBusyError("Thumbnail fetch queue is full")
+            try:
+                thumbnail = get_art_thumbnail(profile, content_id)
+            except Exception:
+                if stale is not None:
+                    return stale, "stale"
+                raise
+
+        if thumbnail is None:
+            return None, "missing"
+        return cache.set_thumbnail(key, content_id, thumbnail), "miss"
+
+
+def _cached_tv_mattes(settings, profile: TVProfile, *, refresh: bool = False):
+    """Return cached matte styles with stale-on-error behavior."""
+    from frameart.tv.controller import get_matte_list
+
+    cache = _tv_cache_store(settings)
+    key = tv_cache_key(profile)
+    now = time.time()
+    initial = cache.get_mattes(key)
+    if (
+        initial is not None
+        and not refresh
+        and now - initial.updated_at < MATTE_CACHE_TTL_SECONDS
+    ):
+        return initial, "hit"
+
+    with coalesced_cache_fill("mattes", key):
+        current = cache.get_mattes(key)
+        if current is not None:
+            current_is_fresh = time.time() - current.updated_at < MATTE_CACHE_TTL_SECONDS
+            refreshed_by_other = (
+                initial is None and current.updated_at > now
+            ) or (
+                initial is not None and current.updated_at > initial.updated_at
+            )
+            if (not refresh and current_is_fresh) or refreshed_by_other:
+                return current, "hit"
+
+        stale = current or initial
+        try:
+            mattes = get_matte_list(profile)
+        except Exception:
+            if stale is not None:
+                return stale, "stale"
+            raise
+        if not mattes:
+            if stale is not None:
+                return stale, "stale"
+            raise TVOperationError("TV returned an empty matte list")
+        return cache.set_mattes(key, mattes), "miss"
 
 
 def _automation_store(settings=None) -> AutomationStore:
@@ -2138,6 +2246,7 @@ def tv_list_art(
     """List artworks on the Frame TV (deduplicated, with favourite flag)."""
     from frameart.tv.controller import list_art_deduplicated
 
+    settings = _settings()
     profile = _resolve_tv_profile(tv, tv_ip)
     try:
         artworks = list_art_deduplicated(profile)
@@ -2146,10 +2255,16 @@ def tv_list_art(
             status_code=502,
             detail=f"TV art list failed: {e}",
         ) from e
+    local_jobs = _artifact_job_ids_by_content_id(
+        settings,
+        {a.get("content_id", "") for a in artworks},
+        source_tv_ip=profile.ip,
+    )
     return [
         TVArtItem(
             content_id=a.get("content_id", "unknown"),
             is_favourite=a.get("is_favourite", False),
+            local_job_id=local_jobs.get(a.get("content_id", "")),
         )
         for a in artworks
     ]
@@ -2163,16 +2278,28 @@ def tv_art_thumbnail(
     ),
     tv: str | None = Query(None, max_length=100, description="TV profile name."),
     tv_ip: str | None = Query(None, max_length=45, description="Private TV IP address."),
+    refresh: bool = Query(False, description="Refresh the TV thumbnail cache."),
 ):
-    """Fetch thumbnail bytes for an artwork on the Frame TV."""
-    from frameart.tv.controller import get_art_thumbnail
-
+    """Fetch a persistent, coalesced thumbnail for artwork on the Frame TV."""
+    settings = _settings()
     profile = _resolve_tv_profile(tv, tv_ip)
-    thumbnail = get_art_thumbnail(profile, content_id)
-    if thumbnail is None:
+    try:
+        entry, cache_status = _cached_tv_thumbnail(
+            settings,
+            profile,
+            content_id,
+            refresh=refresh,
+        )
+    except Exception as exc:
+        _raise_tv_cache_http_error(exc, "TV thumbnail request")
+    if entry is None:
         raise HTTPException(status_code=404, detail="Thumbnail not available.")
 
-    return Response(content=thumbnail, media_type="image/jpeg")
+    return Response(
+        content=entry.value["data"],
+        media_type=entry.value["media_type"],
+        headers={"X-FrameArt-Cache": cache_status},
+    )
 
 
 @app.post("/tv/art/delete", response_model=DeleteArtResponse)
@@ -2208,6 +2335,11 @@ def tv_delete_art(req: DeleteArtRequest):
         return DeleteArtResponse(deleted=[], skipped_favorites=skipped)
 
     if delete_art(profile, ids):
+        try:
+            settings = _settings()
+            _tv_cache_store(settings).delete_thumbnails(tv_cache_key(profile), ids)
+        except Exception as exc:
+            logger.warning("Could not invalidate deleted TV thumbnails: %s", exc)
         return DeleteArtResponse(deleted=ids, skipped_favorites=skipped)
 
     raise HTTPException(
@@ -2250,15 +2382,31 @@ def tv_display_art(req: DisplayArtRequest):
 def tv_mattes(
     tv: str | None = Query(None, description="TV profile name from config."),
     tv_ip: str | None = Query(None, description="TV IP address."),
+    refresh: bool = Query(False, description="Refresh the persistent matte cache."),
 ):
-    """List matte styles supported by the TV."""
-    from frameart.tv.controller import get_matte_list
-
+    """List matte styles with a persistent fresh/stale cache."""
+    settings = _settings()
     profile = _resolve_tv_profile(tv, tv_ip)
     try:
-        return get_matte_list(profile)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"TV matte list failed: {e}") from e
+        entry, cache_status = _cached_tv_mattes(settings, profile, refresh=refresh)
+    except Exception as exc:
+        _raise_tv_cache_http_error(exc, "TV matte list")
+    return JSONResponse(
+        content=entry.value,
+        headers={"X-FrameArt-Cache": cache_status},
+    )
+
+
+@app.delete("/tv/mattes/cache")
+def invalidate_tv_mattes(
+    tv: str | None = Query(None, description="TV profile name from config."),
+    tv_ip: str | None = Query(None, description="TV IP address."),
+):
+    """Explicitly invalidate one TV's persisted matte cache."""
+    settings = _settings()
+    profile = _resolve_tv_profile(tv, tv_ip)
+    _tv_cache_store(settings).invalidate_mattes(tv_cache_key(profile))
+    return {"ok": True}
 
 
 @app.get("/tv/configured", response_model=list[ConfiguredTVResponse])
@@ -2856,6 +3004,49 @@ def _find_artifact_image_by_content_id(
     return None
 
 
+def _artifact_job_ids_by_content_id(
+    settings,
+    content_ids: set[str],
+    *,
+    source_tv_ip: str | None = None,
+) -> dict[str, str]:
+    """Map TV content IDs to local jobs in one bounded artifact scan."""
+    unresolved = {content_id for content_id in content_ids if content_id}
+    matches: dict[str, str] = {}
+    artifacts_dir = Path(settings.data_dir) / "artifacts"
+    if not unresolved or not artifacts_dir.exists():
+        return matches
+
+    for meta_path in sorted(artifacts_dir.rglob("meta.json"), reverse=True):
+        if not unresolved:
+            break
+        try:
+            metadata = json.loads(meta_path.read_text())
+        except Exception:
+            continue
+
+        candidates: set[str] = set()
+        content_id = metadata.get("content_id")
+        if isinstance(content_id, str):
+            candidates.add(content_id)
+        tv_map = metadata.get("tv_content_ids")
+        if isinstance(tv_map, dict):
+            if source_tv_ip and isinstance(tv_map.get(source_tv_ip), str):
+                candidates.add(tv_map[source_tv_ip])
+            elif not source_tv_ip:
+                candidates.update(str(value) for value in tv_map.values() if value)
+
+        job_dir = meta_path.parent
+        if not (job_dir / "final.png").exists() and not (job_dir / "source.png").exists():
+            continue
+
+        job_id = str(metadata.get("job_id") or meta_path.parent.name)
+        for candidate in candidates & unresolved:
+            matches[candidate] = job_id
+            unresolved.remove(candidate)
+    return matches
+
+
 @app.post("/jobs/{job_id}/edit-and-apply", response_model=JobResponse)
 def edit_job_artwork(job_id: str, req: EditFromExistingRequest):
     """Create a new image by editing an existing server-side artwork job image."""
@@ -2890,7 +3081,6 @@ def edit_job_artwork(job_id: str, req: EditFromExistingRequest):
 def edit_tv_artwork(req: TVArtEditRequest):
     """Create a new image by editing artwork currently stored on a TV."""
     from frameart.pipeline import run_edit_and_apply
-    from frameart.tv.controller import get_art_thumbnail
 
     settings = _settings()
     edit_prompt = req.prompt.strip()
@@ -2919,9 +3109,17 @@ def edit_tv_artwork(req: TVArtEditRequest):
                 ),
             )
 
-        source_bytes = get_art_thumbnail(source_profile, req.content_id)
-        if not source_bytes:
+        try:
+            thumbnail_entry, _cache_status = _cached_tv_thumbnail(
+                settings,
+                source_profile,
+                req.content_id,
+            )
+        except Exception as exc:
+            _raise_tv_cache_http_error(exc, "TV artwork thumbnail request")
+        if thumbnail_entry is None:
             raise HTTPException(status_code=404, detail="TV artwork thumbnail not available.")
+        source_bytes = thumbnail_entry.value["data"]
 
         upload_dir = settings.data_dir / "uploads"
         upload_dir.mkdir(parents=True, exist_ok=True)
