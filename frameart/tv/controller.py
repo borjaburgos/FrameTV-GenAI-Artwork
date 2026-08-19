@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 3
 RETRY_BACKOFF = [2, 4, 8]
 DEFAULT_TIMEOUT = 10  # seconds for websocket operations
+TV_PREFLIGHT_TIMEOUT = 3.0
 
 # Samsung Frame TVs reject large uploads over WebSocket.
 # Convert images to JPEG to keep size reasonable.
@@ -171,7 +172,7 @@ def _resolve_token_file(profile: TVProfile) -> str:
     return token_file
 
 
-def _connect(profile: TVProfile) -> SamsungTVWS:
+def _connect(profile: TVProfile, *, timeout: float = DEFAULT_TIMEOUT) -> SamsungTVWS:
     """Create a SamsungTVWS connection from a TVProfile.
 
     Used for REST-only operations (pairing, device info).  For art operations,
@@ -189,7 +190,7 @@ def _connect(profile: TVProfile) -> SamsungTVWS:
         port=profile.port,
         token_file=token_file,
         name=profile.name,
-        timeout=DEFAULT_TIMEOUT,
+        timeout=timeout,
     )
 
 
@@ -393,6 +394,43 @@ def _run_tv_op(
     return result
 
 
+def _frame_support_from_device_info(device_info: dict[str, Any]) -> bool:
+    device = device_info.get("device", {})
+    is_support_str = device_info.get("isSupport", "{}")
+    return (
+        isinstance(device, dict)
+        and device.get("FrameTVSupport") == "true"
+    ) or '"FrameTVSupport":"true"' in str(is_support_str)
+
+
+def preflight_tv(
+    profile: TVProfile,
+    *,
+    timeout_sec: float = TV_PREFLIGHT_TIMEOUT,
+) -> TVStatus:
+    """Run a short REST-only reachability and Frame capability check."""
+    def _probe() -> dict[str, Any]:
+        tv = _connect(profile, timeout=max(0.1, timeout_sec))
+        try:
+            info = tv.rest_device_info()
+            return info if isinstance(info, dict) else {}
+        finally:
+            with contextlib.suppress(Exception):
+                tv.close()
+
+    device_info, error = _run_with_timeout(_probe, timeout_sec=max(0.1, timeout_sec))
+    if error:
+        detail = "timed out" if error == "timed out" else error
+        return TVStatus(reachable=False, error=f"TV preflight {detail}")
+
+    supported = _frame_support_from_device_info(device_info or {})
+    return TVStatus(
+        reachable=True,
+        art_mode_supported=supported,
+        error=None if supported else "TV is reachable but does not report Frame Art Mode support.",
+    )
+
+
 def get_status(profile: TVProfile) -> TVStatus:
     """Check the current status of the Frame TV."""
     # Step 1: REST-only reachability check (no websocket)
@@ -403,12 +441,7 @@ def get_status(profile: TVProfile) -> TVStatus:
         return TVStatus(reachable=False, error=str(e))
 
     # Step 2: Check FrameTVSupport from REST response (no websocket)
-    device = device_info.get("device", {})
-    is_support_str = device_info.get("isSupport", "{}")
-    frame_supported = (
-        device.get("FrameTVSupport") == "true"
-        or '"FrameTVSupport":"true"' in is_support_str
-    )
+    frame_supported = _frame_support_from_device_info(device_info)
 
     if not frame_supported:
         return TVStatus(reachable=True, art_mode_supported=False)

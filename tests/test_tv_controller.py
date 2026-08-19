@@ -18,9 +18,40 @@ from frameart.tv.controller import (
     _tv_operation_gate,
     get_art_thumbnails,
     get_matte_list,
+    preflight_tv,
     switch_art,
     wait_for_art,
 )
+
+
+@patch("frameart.tv.controller._connect")
+def test_preflight_is_short_rest_only_capability_check(mock_connect):
+    tv = mock_connect.return_value
+    tv.rest_device_info.return_value = {
+        "device": {"FrameTVSupport": "true"},
+        "isSupport": '{"FrameTVSupport":"true"}',
+    }
+
+    status = preflight_tv(TVProfile(ip="192.168.1.205"), timeout_sec=0.2)
+
+    assert status.reachable is True
+    assert status.art_mode_supported is True
+    mock_connect.assert_called_once_with(
+        TVProfile(ip="192.168.1.205"),
+        timeout=0.2,
+    )
+    tv.rest_device_info.assert_called_once()
+    tv.close.assert_called_once()
+
+
+@patch("frameart.tv.controller._run_with_timeout", return_value=(None, "timed out"))
+def test_preflight_returns_structured_unreachable_status(mock_timeout):
+    status = preflight_tv(TVProfile(ip="192.168.1.206"), timeout_sec=0.2)
+
+    assert status.reachable is False
+    assert status.art_mode_supported is False
+    assert status.error == "TV preflight timed out"
+    mock_timeout.assert_called_once()
 
 
 def test_run_with_timeout_returns_without_waiting_for_blocked_worker():

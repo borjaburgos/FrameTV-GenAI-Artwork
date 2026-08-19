@@ -216,9 +216,22 @@ frameart serve --host 0.0.0.0 --port 8000
 
 Interactive API docs are available at `http://localhost:8000/docs` and the web UI at `http://localhost:8000/` once the server is running.
 
+Generate-and-display requests run a short TV reachability and Art Mode preflight before
+calling a paid image provider. An offline target returns the stable
+`tv_unreachable` error code and the web UI offers **Generate Anyway**. FrameArt checks
+again immediately before upload; if the TV drops after generation, the completed
+artifact remains in the Library with a **Retry TV** action that does not regenerate or
+incur another provider charge. API clients can set `generate_anyway: true` on
+`/generate-and-apply` or `/async/generate-and-apply` to save without TV delivery.
+
 Loopback-only serving leaves authentication off by default. Non-loopback binds are refused unless authentication is enabled. Admin tokens have `read`, `control`, and `admin` access; the optional `FRAMEART_AUTOMATION_TOKEN` has `read` and `control` access but cannot delete artwork or jobs. API clients can send either `Authorization: Bearer <token>` or `X-FrameArt-Token: <token>`.
 
 The web UI remembers a successful token login as a revocable browser device for 365 days by default. Settings > Access & Paired Devices can create a one-time QR/link or short code for another browser, list paired devices, and revoke them individually. A new browser can scan the QR, open the link, or enter the code in the normal authentication prompt. Only hashes of device credentials and pairing codes are stored.
+
+Provider and integration exceptions are sanitized before they reach runtime logs or
+persisted async-job errors. Request URL query strings, URL credentials, authorization
+values, bearer tokens, and configured provider keys are removed while retaining safe
+status, host, and path diagnostics.
 
 ### Hybrid local and Tailscale access
 

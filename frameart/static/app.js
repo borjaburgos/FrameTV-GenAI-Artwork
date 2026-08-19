@@ -131,7 +131,9 @@
     if (!response.ok) {
       const detail = typeof payload?.detail === 'string'
         ? payload.detail
-        : (typeof payload?.detail?.message === 'string' ? payload.detail.message : null);
+        : (typeof payload?.detail?.message === 'string'
+          ? payload.detail.message
+          : (typeof payload?.detail?.error === 'string' ? payload.detail.error : null));
       throw new Error(detail || fallbackMessage || ('Server returned ' + response.status));
     }
     return payload;
@@ -737,19 +739,31 @@
       const cardClass = job.status === 'completed' ? ' done' : (job.status === 'failed' ? ' error' : '');
       const prompt = esc(job.prompt || '');
       const errorBlock = job.error ? `<div class="gen-job-meta" style="color:var(--err)">Error: ${esc(job.error)}</div>` : '';
+      const deliveryBlock = job.deliveryStatus && job.deliveryStatus !== 'not_requested'
+        ? `<div class="gen-job-meta">Delivery: ${esc(job.deliveryStatus.replaceAll('_', ' '))}</div>`
+        : '';
       const previewToken = job.previewNonce || '';
       const imageJobId = job.resultJobId || job.jobId;
-      const previewBlock = (job.status === 'completed' && job.imageAvailable)
+      const previewBlock = job.imageAvailable
         ? `<div class="gen-job-thumb-wrap">
              <img src="/jobs/${esc(imageJobId)}/image?${previewToken}" alt="${prompt}" loading="lazy"
                onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
              <div class="gen-job-thumb-fallback">No image available</div>
            </div>`
         : '';
-      const actionsBlock = job.status === 'completed' && job.imageAvailable
-        ? `<div class="gen-job-actions">
-             <button class="btn btn-secondary btn-small btn-gen-open" data-job-id="${esc(imageJobId)}">Open Image</button>
-           </div>`
+      const actions = [];
+      if (job.imageAvailable) {
+        actions.push(`<button class="btn btn-secondary btn-small btn-gen-open" data-job-id="${esc(imageJobId)}">Open Image</button>`);
+      }
+      if (job.errorCode === 'tv_unreachable' || job.errorCode === 'tv_art_mode_unavailable') {
+        if (job.generationSucceeded && job.imageAvailable && job.tvIp) {
+          actions.push(`<button class="btn btn-small btn-gen-retry-tv" data-queue-id="${esc(job.jobId)}">Retry TV</button>`);
+        } else if (!job.generationSucceeded) {
+          actions.push(`<button class="btn btn-small btn-gen-anyway" data-queue-id="${esc(job.jobId)}">Generate Anyway</button>`);
+        }
+      }
+      const actionsBlock = actions.length
+        ? `<div class="gen-job-actions">${actions.join('')}</div>`
         : '';
       return `
         <div class="gen-job-card${cardClass}">
@@ -761,6 +775,7 @@
           <div class="gen-job-meta">Provider: ${esc(providerLabel)} · Model: ${esc(modelLabel)}</div>
           <div class="gen-job-meta">Style: ${esc(styleLabel)} · TV: ${esc(tvLabel)}</div>
           ${errorBlock}
+          ${deliveryBlock}
           ${previewBlock}
           ${actionsBlock}
         </div>
@@ -774,6 +789,86 @@
         window.showPreview(jobId);
       });
     });
+    grid.querySelectorAll('.btn-gen-anyway').forEach((btn) => {
+      btn.addEventListener('click', async (event) => {
+        const job = generationJobs.get(event.currentTarget.dataset.queueId);
+        if (!job) return;
+        setButtonBusy(event.currentTarget, 'Queueing...');
+        try {
+          const queued = await queueGeneration(job, { generateAnyway: true });
+          showStatus('Queued generate-anyway job ' + queued.job_id + '.', '');
+        } catch (error) {
+          showStatus('Failed: ' + error.message, 'error');
+        } finally {
+          clearButtonBusy(event.currentTarget);
+        }
+      });
+    });
+    grid.querySelectorAll('.btn-gen-retry-tv').forEach((btn) => {
+      btn.addEventListener('click', async (event) => {
+        const job = generationJobs.get(event.currentTarget.dataset.queueId);
+        if (!job) return;
+        setButtonBusy(event.currentTarget, 'Retrying...');
+        try {
+          const response = await apiFetch(
+            '/jobs/' + encodeURIComponent(job.resultJobId || job.jobId) + '/apply',
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ tv_ip: job.tvIp, matte: 'none' }),
+            },
+          );
+          const result = await parseJSONResponse(response, 'TV delivery retry failed.');
+          job.status = 'completed';
+          job.error = null;
+          job.errorCode = null;
+          job.deliveryStatus = result.delivery_status || 'displayed';
+          renderGenerationJobs();
+          showStatus('Delivered saved artwork to the TV.', 'done');
+        } catch (error) {
+          showStatus('Delivery failed: ' + error.message, 'error');
+        } finally {
+          clearButtonBusy(event.currentTarget);
+        }
+      });
+    });
+  }
+
+  async function queueGeneration(source, { generateAnyway = false } = {}) {
+    const useTV = Boolean(source.tvIp);
+    const endpoint = useTV ? '/async/generate-and-apply' : '/async/generate';
+    const body = {
+      prompt: source.prompt,
+      style: source.style || undefined,
+      provider: source.provider || undefined,
+      model: source.model || undefined,
+    };
+    if (useTV) body.tv_ip = source.tvIp;
+    if (generateAnyway) body.generate_anyway = true;
+    const response = await apiFetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await parseJSONResponse(response, 'Could not queue generation.');
+    generationJobs.set(data.job_id, {
+      jobId: data.job_id,
+      prompt: source.prompt,
+      provider: source.provider,
+      model: source.model,
+      style: source.style,
+      tvIp: source.tvIp,
+      status: data.status || 'pending',
+      error: null,
+      errorCode: null,
+      generationSucceeded: false,
+      deliveryStatus: generateAnyway ? 'skipped' : 'not_attempted',
+      imageAvailable: false,
+      createdAt: Date.now(),
+    });
+    renderGenerationJobs();
+    ensureGenerationPolling();
+    return data;
   }
 
   function clearFinishedGenerationJobs() {
@@ -822,15 +917,16 @@
         }
         const data = await resp.json();
         const nextStatus = data.status || job.status;
-        const nextError = data.error || null;
+        const result = data.result || null;
+        const nextError = data.error || result?.error || null;
         if (nextStatus !== job.status || nextError !== job.error) {
           changed = true;
           job.status = nextStatus;
           job.error = nextError;
         }
-        if (data.status === 'completed' && data.result) {
-          const nextResultJobId = data.result.job_id || job.jobId;
-          const nextImageAvailable = Boolean(data.result.final_path);
+        if (result) {
+          const nextResultJobId = result.job_id || job.jobId;
+          const nextImageAvailable = Boolean(result.final_path);
           if (job.resultJobId !== nextResultJobId || job.imageAvailable !== nextImageAvailable) {
             changed = true;
             job.resultJobId = nextResultJobId;
@@ -840,6 +936,11 @@
             changed = true;
             job.previewNonce = Date.now();
           }
+          job.errorCode = result.error_code || null;
+          job.generationSucceeded = Boolean(result.generation_succeeded);
+          job.deliveryStatus = result.delivery_status || 'not_requested';
+        }
+        if (data.status === 'completed' && result) {
           showStatus('Done: ' + job.jobId, 'done');
           if (job.imageAvailable) {
             const img = document.getElementById('gen-preview-img');
@@ -847,10 +948,6 @@
             document.getElementById('gen-preview').style.display = 'block';
           }
         } else if (data.status === 'failed') {
-          if (job.imageAvailable) {
-            job.imageAvailable = false;
-            changed = true;
-          }
           showStatus('Failed: ' + (data.error || job.jobId), 'error');
         }
       } catch (e) {
@@ -877,35 +974,11 @@
     const model = document.getElementById('model').value || undefined;
     const tvIp = document.getElementById('tv-select').value || undefined;
 
-    const useTV = !!tvIp;
-    const endpoint = useTV ? '/async/generate-and-apply' : '/async/generate';
-    const body = { prompt, style, provider, model };
-    if (useTV) { body.tv_ip = tvIp; }
-
     setButtonBusy(btnGen, 'Queueing...');
     showStatus('Submitting job...');
 
     try {
-      const resp = await apiFetch(endpoint, {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(body),
-      });
-      if (!resp.ok) { throw new Error('Server returned ' + resp.status); }
-      const data = await resp.json();
-      generationJobs.set(data.job_id, {
-        jobId: data.job_id,
-        prompt,
-        provider,
-        model,
-        style,
-        tvIp,
-        status: data.status || 'pending',
-        error: null,
-        imageAvailable: false,
-        createdAt: Date.now(),
-      });
-      renderGenerationJobs();
-      ensureGenerationPolling();
+      const data = await queueGeneration({ prompt, provider, model, style, tvIp });
       showStatus('Queued job ' + data.job_id + '.', '');
     } catch (e) {
       showStatus('Failed: ' + e.message, 'error');
@@ -938,6 +1011,9 @@
         current.error = item.error || null;
         current.resultJobId = resultJobId;
         current.imageAvailable = Boolean(item.result && item.result.final_path);
+        current.errorCode = item.result?.error_code || null;
+        current.generationSucceeded = Boolean(item.result?.generation_succeeded);
+        current.deliveryStatus = item.result?.delivery_status || 'not_requested';
         if (current.imageAvailable && !current.previewNonce) current.previewNonce = Date.now();
         generationJobs.set(item.job_id, current);
       }
