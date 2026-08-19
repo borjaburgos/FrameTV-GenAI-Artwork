@@ -151,7 +151,7 @@
     background: rgba(9, 12, 18, .95);
     border-top: 1px solid var(--border);
     backdrop-filter: blur(8px);
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-template-columns: repeat(6, minmax(0, 1fr));
     padding: .35rem .5rem max(.5rem, env(safe-area-inset-bottom));
     gap: .35rem;
   }
@@ -263,6 +263,15 @@
     border-radius: 8px;
   }
   .automation-checklist input { width: auto; margin: 0; }
+  .live-score-preview {
+    width: min(420px, 100%);
+    aspect-ratio: 16 / 9;
+    object-fit: cover;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    margin-top: .55rem;
+    background: #07111f;
+  }
 
   /* --- Forms --- */
   label { display: block; color: var(--muted); font-size: .8rem; margin-bottom: .25rem; }

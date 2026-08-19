@@ -2822,6 +2822,105 @@ class TestAutomationManagement:
         assert missing_art.status_code == 422
 
 
+class TestLiveScoreMode:
+    @staticmethod
+    def create_group():
+        client.post(
+            "/settings/tvs",
+            json={
+                "profile_id": "score_tv",
+                "ip": "192.168.1.61",
+                "port": 8002,
+                "client_name": "FrameArt",
+                "ssl": True,
+            },
+        )
+        response = client.post(
+            "/automation/groups",
+            json={"name": "Score TVs", "tv_profile_ids": ["score_tv"]},
+        )
+        return response.json()["id"]
+
+    @patch("frameart.live_score.IntegrationPublisher.publish", return_value=[])
+    @patch("frameart.live_score.LiveScoreService._display")
+    @patch("frameart.tv.controller.delete_art", return_value=True)
+    def test_create_feed_preview_pause_and_delete(
+        self,
+        _delete_art,
+        mock_display,
+        _publish,
+        managed_config_env,
+    ):
+        group_id = self.create_group()
+        mock_display.return_value = (
+            {"score_tv": "content-score"},
+            {},
+            [{"tv_profile_id": "score_tv", "content_id": "content-score"}],
+            [],
+        )
+        created = client.post(
+            "/modes/live-score",
+            json={
+                "name": "Derby",
+                "provider": "manual",
+                "tracking_kind": "game",
+                "tracking_value": "game-1",
+                "group_id": group_id,
+                "poll_seconds": 30,
+                "refresh_seconds": 300,
+                "theme": "dark",
+            },
+        )
+        assert created.status_code == 201
+        tracker_id = created.json()["id"]
+        assert "api_key" not in created.json()
+
+        fed = client.post(
+            f"/modes/live-score/{tracker_id}/feed",
+            json={
+                "event_id": "game-1",
+                "league": "Premier League",
+                "sport": "Soccer",
+                "home_team": "Arsenal",
+                "away_team": "Chelsea",
+                "home_score": "2",
+                "away_score": "1",
+                "status": "2H",
+                "progress": "76'",
+                "highlights": ["Goal — Arsenal"],
+            },
+        )
+        assert fed.status_code == 200
+        assert fed.json()["status"] == "displayed"
+        preview = client.get(f"/modes/live-score/{tracker_id}/image")
+        assert preview.status_code == 200
+        assert preview.headers["content-type"] == "image/png"
+        listed = client.get("/modes/live-score").json()[0]
+        assert listed["last_event"]["home_score"] == "2"
+
+        paused = client.put(
+            f"/modes/live-score/{tracker_id}/enabled",
+            json={"enabled": False},
+        )
+        assert paused.status_code == 200
+        assert paused.json()["enabled"] is False
+        assert client.delete(f"/modes/live-score/{tracker_id}").status_code == 200
+
+    def test_sportsdb_requires_premium_key(self, managed_config_env):
+        group_id = self.create_group()
+        response = client.post(
+            "/modes/live-score",
+            json={
+                "name": "No key",
+                "provider": "thesportsdb",
+                "tracking_kind": "league",
+                "tracking_value": "4328",
+                "group_id": group_id,
+            },
+        )
+        assert response.status_code == 422
+
+
 # ---------------------------------------------------------------------------
 # GET / — Web UI
 # ---------------------------------------------------------------------------
@@ -2873,3 +2972,13 @@ class TestWebUI:
         assert 'id="automation-webhook-list"' in page.text
         assert "'/automation/groups'" in script.text
         assert "'/automation/schedules'" in script.text
+
+    def test_modes_ui_has_live_score_management_and_feed(self):
+        page = client.get("/")
+        script = client.get("/static/app.js")
+
+        assert 'data-page="modes"' in page.text
+        assert 'id="live-score-list"' in page.text
+        assert 'id="btn-live-score-create"' in page.text
+        assert 'id="btn-live-score-feed"' in page.text
+        assert "'/modes/live-score'" in script.text

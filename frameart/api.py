@@ -85,6 +85,7 @@ from frameart.automation import (
 from frameart.config import STYLE_PRESETS, ProviderConfig, Settings, TVProfile, load_settings
 from frameart.jobs import JobQueueFullError
 from frameart.library import LibraryStore
+from frameart.live_score import LiveScoreService, LiveScoreStore, ScoreEvent
 from frameart.logging_utils import safe_exception_message
 from frameart.providers.registry import available_providers
 from frameart.settings_store import (
@@ -142,6 +143,7 @@ _ADMIN_PREFIXES = (
     "/auth/access",
     "/auth/devices",
     "/auth/pairings",
+    "/modes",
 )
 _rate_limit_events: dict[str, deque[float]] = defaultdict(deque)
 _rate_limit_lock = threading.Lock()
@@ -168,15 +170,18 @@ ContentId = Annotated[str, Field(pattern=_IDENTIFIER_RE)]
 JobId = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")]
 
 _automation_scheduler = AutomationScheduler(load_settings)
+_live_score_service = LiveScoreService(load_settings)
 
 
 @asynccontextmanager
 async def _app_lifespan(_app: FastAPI):
     """Run the durable automation loop for every ASGI deployment."""
     _automation_scheduler.start()
+    _live_score_service.start()
     try:
         yield
     finally:
+        _live_score_service.stop()
         _automation_scheduler.stop()
 
 
@@ -326,6 +331,14 @@ def _origin_matches_request(request: Request) -> bool:
 
 
 def _required_scope(request: Request) -> str:
+    if request.url.path.startswith("/modes/") and request.method == "GET":
+        return "read"
+    if (
+        request.method == "POST"
+        and request.url.path.startswith("/modes/")
+        and (request.url.path.endswith("/refresh") or request.url.path.endswith("/feed"))
+    ):
+        return "control"
     if request.url.path == "/automation/status" and request.method == "GET":
         return "read"
     if (
@@ -910,6 +923,9 @@ class WebhookCreateRequest(BaseModel):
             "schedule.partial",
             "schedule.failed",
             "integration.test",
+            "live_score.displayed",
+            "live_score.partial",
+            "live_score.error",
         }
         normalized = list(dict.fromkeys(event.strip() for event in value if event.strip()))
         unsupported = sorted(set(normalized) - supported)
@@ -918,6 +934,55 @@ class WebhookCreateRequest(BaseModel):
                 "events must contain supported schedule or integration events"
             )
         return normalized
+
+
+class LiveScoreCreateRequest(BaseModel):
+    """Create a live-score tracker and its bounded display loop."""
+
+    name: str = Field(..., min_length=1, max_length=100)
+    provider: str = Field("thesportsdb", pattern=r"^(thesportsdb|manual)$")
+    api_key: SecretStr | None = Field(None, min_length=1, max_length=4096)
+    tracking_kind: str = Field(..., pattern=r"^(league|team|game|sport)$")
+    tracking_value: str = Field(..., min_length=1, max_length=200)
+    group_id: AutomationId
+    poll_seconds: int = Field(60, ge=30, le=300)
+    refresh_seconds: int = Field(300, ge=30, le=3600)
+    theme: str = Field("dark", pattern=r"^(dark|light|stadium)$")
+    enabled: bool = True
+
+    @field_validator("name", "tracking_value")
+    @classmethod
+    def strip_live_score_text(cls, value: str) -> str:
+        return _strip_nonempty(value)
+
+
+class LiveScoreEnabledRequest(BaseModel):
+    """Pause or resume a live-score tracker."""
+
+    enabled: bool
+
+
+class LiveScoreFeedRequest(BaseModel):
+    """Provider-neutral score event for custom feeds and enriched highlights."""
+
+    event_id: str = Field(..., min_length=1, max_length=100)
+    league: str = Field(..., min_length=1, max_length=200)
+    sport: str = Field("", max_length=100)
+    home_team: str = Field(..., min_length=1, max_length=200)
+    away_team: str = Field(..., min_length=1, max_length=200)
+    home_score: str = Field("-", max_length=20)
+    away_score: str = Field("-", max_length=20)
+    status: str = Field("LIVE", max_length=50)
+    progress: str = Field("Live", max_length=100)
+    start_time: str | None = Field(None, max_length=100)
+    home_team_id: str | None = Field(None, max_length=100)
+    away_team_id: str | None = Field(None, max_length=100)
+    league_id: str | None = Field(None, max_length=100)
+    highlights: list[Annotated[str, Field(min_length=1, max_length=300)]] = Field(
+        default_factory=list,
+        max_length=20,
+    )
+    provider_updated_at: str | None = Field(None, max_length=100)
 
 
 CollectionId = Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")]
@@ -1116,6 +1181,11 @@ def _cached_tv_mattes(settings, profile: TVProfile, *, refresh: bool = False):
 def _automation_store(settings=None) -> AutomationStore:
     settings = settings or _settings()
     return AutomationStore(settings.data_dir)
+
+
+def _live_score_store(settings=None) -> LiveScoreStore:
+    settings = settings or _settings()
+    return LiveScoreStore(settings.data_dir)
 
 
 _SENSITIVE_SETTING_TERMS = ("api_key", "password", "secret", "token")
@@ -3347,6 +3417,96 @@ def automation_status():
             "note": "Automation management routes require an admin token.",
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Routes — Live Score mode
+# ---------------------------------------------------------------------------
+
+
+@app.get("/modes/live-score")
+def list_live_score_trackers():
+    return _live_score_store().list_trackers()
+
+
+@app.post("/modes/live-score", status_code=201)
+def create_live_score_tracker(req: LiveScoreCreateRequest):
+    settings = _settings()
+    if _automation_store(settings).get_group(req.group_id) is None:
+        raise HTTPException(status_code=422, detail="TV group was not found.")
+    api_key = _secret_value(req.api_key)
+    if req.provider == "thesportsdb" and not api_key:
+        raise HTTPException(
+            status_code=422,
+            detail="TheSportsDB live scores require a premium v2 API key.",
+        )
+    try:
+        return _live_score_store(settings).create_tracker(
+            name=req.name,
+            provider=req.provider,
+            api_key=api_key,
+            tracking_kind=req.tracking_kind,
+            tracking_value=req.tracking_value,
+            group_id=req.group_id,
+            poll_seconds=req.poll_seconds,
+            refresh_seconds=req.refresh_seconds,
+            theme=req.theme,
+            enabled=req.enabled,
+        )
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="A live-score tracker with that name exists.",
+        ) from exc
+
+
+@app.put("/modes/live-score/{tracker_id}/enabled")
+def set_live_score_enabled(tracker_id: AutomationId, req: LiveScoreEnabledRequest):
+    store = _live_score_store()
+    if not store.set_enabled(tracker_id, req.enabled):
+        raise HTTPException(status_code=404, detail="Live-score tracker was not found.")
+    return store.get_tracker(tracker_id)
+
+
+@app.post("/modes/live-score/{tracker_id}/refresh")
+def refresh_live_score_tracker(tracker_id: AutomationId):
+    try:
+        return _live_score_service.refresh_tracker(tracker_id, force=True)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Live-score tracker was not found.") from exc
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/modes/live-score/{tracker_id}/feed")
+def feed_live_score_tracker(tracker_id: AutomationId, req: LiveScoreFeedRequest):
+    try:
+        return _live_score_service.process_event(
+            tracker_id,
+            ScoreEvent(**req.model_dump()),
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Live-score tracker was not found.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/modes/live-score/{tracker_id}/image")
+def get_live_score_image(tracker_id: AutomationId):
+    settings = _settings()
+    if _live_score_store(settings).get_tracker(tracker_id) is None:
+        raise HTTPException(status_code=404, detail="Live-score tracker was not found.")
+    image_path = settings.data_dir / "modes" / "live-score" / tracker_id / "current.png"
+    if not image_path.is_file():
+        raise HTTPException(status_code=404, detail="Scoreboard has not been rendered yet.")
+    return FileResponse(image_path, media_type="image/png")
+
+
+@app.delete("/modes/live-score/{tracker_id}")
+def delete_live_score_tracker(tracker_id: AutomationId):
+    if not _live_score_service.delete_tracker(tracker_id):
+        raise HTTPException(status_code=404, detail="Live-score tracker was not found.")
+    return {"deleted": tracker_id}
 
 
 @app.post("/jobs/delete", response_model=DeleteJobsResponse)

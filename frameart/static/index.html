@@ -14,6 +14,7 @@
     <button class="active" data-page="create">Create</button>
     <button data-page="library">Library</button>
     <button data-page="tvs">TVs</button>
+    <button data-page="modes">Modes</button>
     <button data-page="automations">Automations</button>
     <button data-page="settings">Settings</button>
   </div>
@@ -293,6 +294,120 @@
         <button class="btn btn-danger btn-small" id="btn-tv-delete-selected-inline" disabled>Delete Selected</button>
         <button class="btn btn-ghost btn-small" id="btn-tv-clear-selection-inline" disabled>Clear</button>
       </div>
+    </div>
+  </div>
+</div>
+
+<div class="panel" id="panel-modes">
+  <div class="page-eyebrow">Modes</div>
+  <div class="section-heading">
+    <h2>Live Display Modes</h2>
+    <button class="btn btn-secondary" id="btn-modes-refresh">Refresh</button>
+  </div>
+  <p class="page-intro">Keep a screen current from live data while bounding host and TV storage.</p>
+  <div class="settings-grid">
+    <div class="settings-card settings-card-wide">
+      <h3>Live Score</h3>
+      <p>Track a sport, league, team, or game. A deterministic 4K scoreboard is replaced on changes or at the selected refresh interval.</p>
+      <div class="row">
+        <div>
+          <label for="live-score-name">Tracker name</label>
+          <input id="live-score-name" maxlength="100" placeholder="Arsenal match">
+        </div>
+        <div>
+          <label for="live-score-provider">Score provider</label>
+          <select id="live-score-provider">
+            <option value="thesportsdb">TheSportsDB v2</option>
+            <option value="manual">Manual / webhook feed</option>
+          </select>
+        </div>
+        <div>
+          <label for="live-score-key">TheSportsDB premium key</label>
+          <input id="live-score-key" type="password" maxlength="4096" autocomplete="new-password" placeholder="Required for TheSportsDB">
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label for="live-score-kind">Track by</label>
+          <select id="live-score-kind">
+            <option value="league">League ID or exact name</option>
+            <option value="team">Team ID or exact name</option>
+            <option value="game">Game / event ID</option>
+            <option value="sport">Sport name</option>
+          </select>
+        </div>
+        <div>
+          <label for="live-score-value">League, team, game, or sport</label>
+          <input id="live-score-value" maxlength="200" placeholder="4328">
+        </div>
+        <div>
+          <label for="live-score-group">TV group</label>
+          <select id="live-score-group"></select>
+        </div>
+        <div>
+          <label for="live-score-poll">Poll provider</label>
+          <select id="live-score-poll">
+            <option value="30">Every 30 seconds</option>
+            <option value="60" selected>Every minute</option>
+            <option value="300">Every 5 minutes</option>
+          </select>
+        </div>
+        <div>
+          <label for="live-score-refresh">Force new still</label>
+          <select id="live-score-refresh">
+            <option value="30">Every 30 seconds</option>
+            <option value="60">Every minute</option>
+            <option value="300" selected>Every 5 minutes</option>
+            <option value="900">Every 15 minutes</option>
+          </select>
+        </div>
+        <div>
+          <label for="live-score-theme">Theme</label>
+          <select id="live-score-theme">
+            <option value="dark">Dark</option>
+            <option value="stadium">Stadium</option>
+            <option value="light">Light</option>
+          </select>
+        </div>
+      </div>
+      <button class="btn btn-small" id="btn-live-score-create">Create Live Score</button>
+      <div class="settings-list" id="live-score-list"></div>
+    </div>
+    <div class="settings-card settings-card-wide">
+      <h3>Manual / Enriched Score Update</h3>
+      <p>Drive a manual tracker, or add goals, fouls, key plays, and other highlights from a custom data source.</p>
+      <div class="row">
+        <div>
+          <label for="live-score-feed-tracker">Tracker</label>
+          <select id="live-score-feed-tracker"></select>
+        </div>
+        <div>
+          <label for="live-score-feed-event">Event ID</label>
+          <input id="live-score-feed-event" maxlength="100">
+        </div>
+        <div>
+          <label for="live-score-feed-league">League</label>
+          <input id="live-score-feed-league" maxlength="200">
+        </div>
+        <div>
+          <label for="live-score-feed-sport">Sport</label>
+          <input id="live-score-feed-sport" maxlength="100">
+        </div>
+      </div>
+      <div class="row">
+        <div><label for="live-score-feed-home">Home team</label><input id="live-score-feed-home" maxlength="200"></div>
+        <div><label for="live-score-feed-home-score">Home score</label><input id="live-score-feed-home-score" maxlength="20"></div>
+        <div><label for="live-score-feed-away">Away team</label><input id="live-score-feed-away" maxlength="200"></div>
+        <div><label for="live-score-feed-away-score">Away score</label><input id="live-score-feed-away-score" maxlength="20"></div>
+        <div><label for="live-score-feed-progress">Status / progress</label><input id="live-score-feed-progress" maxlength="100" placeholder="76' · 2H"></div>
+      </div>
+      <label for="live-score-feed-highlights">Highlights (one per line)</label>
+      <textarea id="live-score-feed-highlights" placeholder="Goal — Arsenal, 74'&#10;Yellow card — Chelsea, 70'"></textarea>
+      <button class="btn btn-small" id="btn-live-score-feed">Send Score Update</button>
+    </div>
+    <div class="settings-card settings-card-wide">
+      <h3>Live Album</h3>
+      <p>Public album slideshow management will appear here. Album adapters use one-at-a-time caching so the host and TV do not accumulate copies.</p>
     </div>
   </div>
 </div>
@@ -722,6 +837,7 @@
   <button class="active" data-page="create">Create</button>
   <button data-page="library">Library</button>
   <button data-page="tvs">TVs</button>
+  <button data-page="modes">Modes</button>
   <button data-page="automations">Automations</button>
   <button data-page="settings">Settings</button>
 </div>
