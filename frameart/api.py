@@ -52,26 +52,30 @@ import tempfile
 import threading
 import time
 import uuid
+from base64 import b64encode
 from collections import defaultdict, deque
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from email.header import decode_header, make_header
 from io import BytesIO
-from ipaddress import ip_address
+from ipaddress import ip_address, ip_network
 from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urlsplit
 
 import httpx2 as httpx
+import qrcode
 import yaml
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import AfterValidator, BaseModel, Field, SecretStr, field_validator
 
 import frameart.public_domain as public_domain
 from frameart import __version__
+from frameart.access import AccessStore, InvalidPairingCodeError
 from frameart.automation import (
     AutomationScheduler,
     AutomationStore,
@@ -82,6 +86,7 @@ from frameart.config import STYLE_PRESETS, ProviderConfig, Settings, TVProfile, 
 from frameart.jobs import JobQueueFullError
 from frameart.library import LibraryStore
 from frameart.live_score import LiveScoreService, LiveScoreStore, ScoreEvent
+from frameart.logging_utils import safe_exception_message
 from frameart.providers.registry import available_providers
 from frameart.settings_store import (
     SETTINGS_SCHEMA_VERSION,
@@ -96,11 +101,25 @@ from frameart.settings_store import (
     restore_settings_backup,
     update_management_state,
 )
+from frameart.tv.cache import (
+    MATTE_CACHE_TTL_SECONDS,
+    TVCacheStore,
+    coalesced_cache_fill,
+    thumbnail_fetch_slot,
+    tv_cache_key,
+)
+from frameart.tv.controller import (
+    TVOperationBusyError,
+    TVOperationError,
+    TVOperationTimeoutError,
+    preflight_tv,
+)
 
 logger = logging.getLogger(__name__)
 
 _ALLOWED_UPLOAD_EXTS = {".jpg", ".jpeg", ".png"}
 _ALLOWED_UPLOAD_MIME = {"image/jpeg", "image/jpg", "image/png"}
+_UPLOAD_FORMAT_SUFFIXES = {"JPEG": ".jpg", "MPO": ".jpg", "PNG": ".png"}
 _MAX_UPLOAD_BYTES = 30 * 1024 * 1024
 _MAX_UPLOAD_PIXELS = 50_000_000
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
@@ -110,14 +129,22 @@ _PUBLIC_PATHS = {
     "/health",
     "/health/ready",
     "/auth/session",
+    "/auth/pair",
     "/docs",
     "/docs/oauth2-redirect",
     "/openapi.json",
     "/redoc",
 }
 _PUBLIC_PREFIXES = ("/static/",)
-_ADMIN_PATHS = {"/jobs/delete", "/tv/art/delete", "/tv/art/matte"}
-_ADMIN_PREFIXES = ("/settings", "/automation", "/modes")
+_ADMIN_PATHS = {"/jobs/delete", "/tv/art/delete", "/tv/art/matte", "/tv/mattes/cache"}
+_ADMIN_PREFIXES = (
+    "/settings",
+    "/automation",
+    "/auth/access",
+    "/auth/devices",
+    "/auth/pairings",
+    "/modes",
+)
 _rate_limit_events: dict[str, deque[float]] = defaultdict(deque)
 _rate_limit_lock = threading.Lock()
 
@@ -184,6 +211,10 @@ def _presented_token(request: Request) -> tuple[str | None, bool]:
     return (cookie_token, True) if cookie_token else (None, False)
 
 
+def _access_store(settings) -> AccessStore:
+    return AccessStore(Path(settings.data_dir))
+
+
 def _token_scopes(settings, token: str | None) -> set[str]:
     if not token:
         return set()
@@ -194,6 +225,109 @@ def _token_scopes(settings, token: str | None) -> set[str]:
     if automation_token and secrets.compare_digest(token, automation_token):
         return {"read", "control"}
     return set()
+
+
+def _trusted_lan_identity(settings, request: Request) -> str | None:
+    if not settings.trusted_lan_cidrs:
+        return None
+    client_host = _request_client_ip(request)
+    if client_host is None:
+        return None
+    try:
+        client_ip = ip_address(client_host)
+    except ValueError:
+        return None
+    if any(client_ip in ip_network(cidr) for cidr in settings.trusted_lan_cidrs):
+        return str(client_ip)
+    return None
+
+
+def _request_client_ip(request: Request) -> str | None:
+    """Resolve the client IP, trusting proxy headers only from loopback."""
+    if request.client is None:
+        return None
+    immediate_host = request.client.host
+    try:
+        immediate_ip = ip_address(immediate_host)
+    except ValueError:
+        return immediate_host
+    if immediate_ip.is_loopback:
+        forwarded_for = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
+        if forwarded_for:
+            try:
+                return str(ip_address(forwarded_for))
+            except ValueError:
+                return None
+    return str(immediate_ip)
+
+
+def _tailscale_identity(settings, request: Request) -> str | None:
+    if not settings.tailscale_auth_enabled:
+        return None
+    encoded_login = request.headers.get("tailscale-user-login", "").strip()
+    if not encoded_login:
+        return None
+    try:
+        login = str(make_header(decode_header(encoded_login))).strip().lower()
+    except (LookupError, UnicodeError):
+        return None
+    allowed = set(settings.tailscale_allowed_users)
+    if allowed and login not in allowed:
+        return None
+    return login
+
+
+def _authentication_context(request: Request, settings) -> dict[str, object]:
+    token, from_cookie = _presented_token(request)
+    scopes = _token_scopes(settings, token)
+    if scopes:
+        return {
+            "scopes": scopes,
+            "method": "token_session" if from_cookie else "token",
+            "identity": None,
+            "device_id": None,
+        }
+
+    device = _access_store(settings).authenticate_device(
+        request.cookies.get("frameart_device")
+    )
+    if device:
+        return {
+            "scopes": set(device["scopes"]),
+            "method": "paired_device",
+            "identity": device["name"],
+            "device_id": device["id"],
+        }
+
+    tailscale_login = _tailscale_identity(settings, request)
+    if tailscale_login:
+        return {
+            "scopes": {"read", "control", "admin"},
+            "method": "tailscale",
+            "identity": tailscale_login,
+            "device_id": None,
+        }
+
+    trusted_lan_ip = _trusted_lan_identity(settings, request)
+    if trusted_lan_ip:
+        return {
+            "scopes": {"read", "control", "admin"},
+            "method": "trusted_lan",
+            "identity": trusted_lan_ip,
+            "device_id": None,
+        }
+
+    return {"scopes": set(), "method": None, "identity": None, "device_id": None}
+
+
+def _origin_matches_request(request: Request) -> bool:
+    origin = request.headers.get("origin")
+    if not origin:
+        return True
+    try:
+        return urlsplit(origin).netloc == request.headers.get("host")
+    except ValueError:
+        return False
 
 
 def _required_scope(request: Request) -> str:
@@ -249,8 +383,8 @@ async def authenticate_request(
     if not settings.auth_enabled:
         return await call_next(request)
 
-    token, from_cookie = _presented_token(request)
-    scopes = _token_scopes(settings, token)
+    context = _authentication_context(request, settings)
+    scopes = context["scopes"]
     required = _required_scope(request)
     if required not in scopes:
         status_code = 401 if not scopes else 403
@@ -260,13 +394,11 @@ async def authenticate_request(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    if from_cookie and request.method not in {"GET", "HEAD", "OPTIONS"}:
-        origin = request.headers.get("origin")
-        if origin and origin.rstrip("/").split("://")[-1] != request.headers.get("host"):
-            return JSONResponse(status_code=403, content={"detail": "Origin check failed."})
+    if request.method not in {"GET", "HEAD", "OPTIONS"} and not _origin_matches_request(request):
+        return JSONResponse(status_code=403, content={"detail": "Origin check failed."})
 
     if request.method not in {"GET", "HEAD", "OPTIONS"}:
-        client_id = f"{next(iter(sorted(scopes)))}:{request.client.host if request.client else '-'}"
+        client_id = f"{next(iter(sorted(scopes)))}:{_request_client_ip(request) or '-'}"
         if not _within_rate_limit(client_id, settings.api_rate_limit_per_minute):
             return JSONResponse(
                 status_code=429,
@@ -275,6 +407,9 @@ async def authenticate_request(
             )
 
     request.state.frameart_scopes = scopes
+    request.state.frameart_auth_method = context["method"]
+    request.state.frameart_identity = context["identity"]
+    request.state.frameart_device_id = context["device_id"]
     return await call_next(request)
 
 
@@ -320,6 +455,10 @@ class GenerateAndApplyRequest(GenerateRequest):
         description="Matte style (e.g., none, shadowbox_polar, shadowbox_noir).",
     )
     no_switch: bool = Field(False, description="Upload but don't switch displayed art.")
+    generate_anyway: bool = Field(
+        False,
+        description="Generate and save the artwork without contacting the selected TV.",
+    )
 
 
 class JobResponse(BaseModel):
@@ -334,6 +473,9 @@ class JobResponse(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     timings: dict[str, float] = Field(default_factory=dict)
     error: str | None = None
+    error_code: str | None = None
+    generation_succeeded: bool = False
+    delivery_status: str = "not_requested"
 
 
 class AsyncJobResponse(BaseModel):
@@ -377,6 +519,23 @@ class TVArtItem(BaseModel):
 
     content_id: str
     is_favourite: bool = False
+    local_job_id: str | None = None
+
+
+class TVThumbnailWarmRequest(BaseModel):
+    """Warm persistent thumbnail cache entries in one TV batch request."""
+
+    content_ids: list[ContentId] = Field(..., min_length=1, max_length=100)
+    tv: str | None = Field(None, max_length=100, description="TV profile name from config.")
+    tv_ip: PrivateTVIPv4 | None = Field(None, description="Private TV IP address.")
+
+
+class TVThumbnailWarmResponse(BaseModel):
+    """Result of warming a group of TV thumbnails."""
+
+    cached: list[str] = Field(default_factory=list)
+    warmed: list[str] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
 
 
 class DeleteArtRequest(BaseModel):
@@ -454,6 +613,15 @@ class AuthSessionRequest(BaseModel):
     """Token exchange used by the browser UI."""
 
     token: SecretStr = Field(..., min_length=20, max_length=4096)
+    remember_device: bool = True
+    device_name: str = Field("Browser device", min_length=1, max_length=100)
+
+
+class PairDeviceRequest(BaseModel):
+    """Exchange a short-lived code for a durable browser-device session."""
+
+    code: str = Field(..., min_length=10, max_length=20)
+    device_name: str = Field(..., min_length=1, max_length=100)
 
 
 class ProviderOption(BaseModel):
@@ -558,6 +726,7 @@ class DefaultsSettingsRequest(BaseModel):
 class TVSettingsRequest(BaseModel):
     """Editable TV profile settings."""
 
+    profile_id: ProfileId | None = None
     ip: PrivateTVIPv4
     port: int = Field(8002, ge=1, le=65535)
     client_name: str = Field("FrameArt", min_length=1, max_length=100)
@@ -587,12 +756,14 @@ class ManagedTVResponse(BaseModel):
     client_name: str
     ssl: bool
     token_configured: bool = False
+    conflicts_with: list[str] = Field(default_factory=list)
 
 
 class ManagedTVsResponse(BaseModel):
     """Persisted TV profiles."""
 
     tvs: list[ManagedTVResponse] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
 
 
 class ConnectionTestResponse(BaseModel):
@@ -876,6 +1047,137 @@ def _library_store(settings=None) -> LibraryStore:
     return LibraryStore(settings.data_dir)
 
 
+def _tv_cache_store(settings=None) -> TVCacheStore:
+    settings = settings or _settings()
+    return TVCacheStore(Path(settings.data_dir))
+
+
+def _raise_tv_cache_http_error(exc: Exception, operation: str) -> None:
+    if isinstance(exc, TVOperationBusyError):
+        raise HTTPException(
+            status_code=503,
+            detail=f"{operation} is busy; retry shortly.",
+            headers={"Retry-After": "2"},
+        ) from exc
+    if isinstance(exc, TVOperationTimeoutError):
+        raise HTTPException(status_code=504, detail=f"{operation} timed out.") from exc
+    raise HTTPException(status_code=502, detail=f"{operation} failed: {exc}") from exc
+
+
+def _cached_tv_thumbnail(settings, profile: TVProfile, content_id: str, *, refresh: bool = False):
+    """Return a cached/upstream thumbnail entry plus cache status."""
+    from frameart.tv.controller import get_art_thumbnail
+
+    cache = _tv_cache_store(settings)
+    key = tv_cache_key(profile)
+    initial = cache.get_thumbnail(key, content_id)
+    if initial is not None and not refresh:
+        return initial, "hit"
+
+    with coalesced_cache_fill("thumbnail", key, content_id):
+        current = cache.get_thumbnail(key, content_id)
+        if current is not None and (
+            not refresh
+            or initial is None
+            or current.updated_at > initial.updated_at
+        ):
+            return current, "hit"
+
+        stale = current or initial
+        with thumbnail_fetch_slot(key) as admitted:
+            if not admitted:
+                if stale is not None:
+                    return stale, "stale"
+                raise TVOperationBusyError("Thumbnail fetch queue is full")
+            try:
+                thumbnail = get_art_thumbnail(profile, content_id)
+            except Exception:
+                if stale is not None:
+                    return stale, "stale"
+                raise
+
+        if thumbnail is None:
+            return None, "missing"
+        return cache.set_thumbnail(key, content_id, thumbnail), "miss"
+
+
+def _warm_tv_thumbnails(
+    settings,
+    profile: TVProfile,
+    content_ids: list[str],
+) -> TVThumbnailWarmResponse:
+    """Fill cold thumbnail entries through one bounded legacy-compatible call."""
+    from frameart.tv.controller import get_art_thumbnails
+
+    requested = list(dict.fromkeys(content_ids))
+    cache = _tv_cache_store(settings)
+    key = tv_cache_key(profile)
+
+    with coalesced_cache_fill("thumbnail-batch", key):
+        cached = [content_id for content_id in requested if cache.get_thumbnail(key, content_id)]
+        cold = [content_id for content_id in requested if content_id not in set(cached)]
+        if not cold:
+            return TVThumbnailWarmResponse(cached=cached)
+
+        with thumbnail_fetch_slot(key) as admitted:
+            if not admitted:
+                raise TVOperationBusyError("Thumbnail fetch queue is full")
+            fetched = get_art_thumbnails(profile, cold)
+
+        warmed: list[str] = []
+        for content_id in cold:
+            data = fetched.get(content_id)
+            if data and cache.set_thumbnail(key, content_id, data) is not None:
+                warmed.append(content_id)
+
+    return TVThumbnailWarmResponse(
+        cached=cached,
+        warmed=warmed,
+        missing=[content_id for content_id in cold if content_id not in set(warmed)],
+    )
+
+
+def _cached_tv_mattes(settings, profile: TVProfile, *, refresh: bool = False):
+    """Return cached matte styles with stale-on-error behavior."""
+    from frameart.tv.controller import get_matte_list
+
+    cache = _tv_cache_store(settings)
+    key = tv_cache_key(profile)
+    now = time.time()
+    initial = cache.get_mattes(key)
+    if (
+        initial is not None
+        and not refresh
+        and now - initial.updated_at < MATTE_CACHE_TTL_SECONDS
+    ):
+        return initial, "hit"
+
+    with coalesced_cache_fill("mattes", key):
+        current = cache.get_mattes(key)
+        if current is not None:
+            current_is_fresh = time.time() - current.updated_at < MATTE_CACHE_TTL_SECONDS
+            refreshed_by_other = (
+                initial is None and current.updated_at > now
+            ) or (
+                initial is not None and current.updated_at > initial.updated_at
+            )
+            if (not refresh and current_is_fresh) or refreshed_by_other:
+                return current, "hit"
+
+        stale = current or initial
+        try:
+            mattes = get_matte_list(profile)
+        except Exception:
+            if stale is not None:
+                return stale, "stale"
+            raise
+        if not mattes:
+            if stale is not None:
+                return stale, "stale"
+            raise TVOperationError("TV returned an empty matte list")
+        return cache.set_mattes(key, mattes), "miss"
+
+
 def _automation_store(settings=None) -> AutomationStore:
     settings = settings or _settings()
     return AutomationStore(settings.data_dir)
@@ -1054,6 +1356,9 @@ def _diagnostics_payload() -> dict[str, Any]:
             "provider_count": len(settings.providers),
             "tv_count": len(settings.tvs),
             "auth_enabled": settings.auth_enabled,
+            "tailscale_auth_enabled": settings.tailscale_auth_enabled,
+            "trusted_lan_count": len(settings.trusted_lan_cidrs),
+            "paired_device_count": len(_access_store(settings).list_devices()),
             "recovered_pending_transaction": journal_pending,
             "managed_settings_present": managed_settings_path(settings.data_dir).is_file(),
             "provider_secrets_present": provider_secrets_path(settings.data_dir).is_file(),
@@ -1165,8 +1470,69 @@ def _managed_providers_response(settings=None) -> ManagedProvidersResponse:
     )
 
 
+def _normalized_tv_profile_id(profile_id: str) -> str:
+    """Normalize cosmetic case and separator variants for conflict checks."""
+    return re.sub(r"[-_]+", "", profile_id.casefold())
+
+
+def _tv_profile_conflicts(
+    settings,
+    profile_id: str,
+    ip: str,
+    *,
+    exclude: set[str] | None = None,
+) -> list[tuple[str, list[str]]]:
+    excluded = exclude or set()
+    normalized = _normalized_tv_profile_id(profile_id)
+    conflicts: list[tuple[str, list[str]]] = []
+    for existing_id, existing in settings.tvs.items():
+        if existing_id in excluded:
+            continue
+        reasons: list[str] = []
+        if existing.ip == ip:
+            reasons.append("physical_tv")
+        if _normalized_tv_profile_id(existing_id) == normalized:
+            reasons.append("profile_id")
+        if reasons:
+            conflicts.append((existing_id, reasons))
+    return conflicts
+
+
+def _raise_tv_profile_conflict(conflicts: list[tuple[str, list[str]]]) -> None:
+    existing_id, reasons = conflicts[0]
+    if "physical_tv" in reasons:
+        message = f"This TV is already configured as {existing_id!r}."
+    else:
+        message = f"A matching TV profile already exists as {existing_id!r}."
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "tv_profile_conflict",
+            "message": message,
+            "existing_profile_id": existing_id,
+            "reasons": reasons,
+        },
+    )
+
+
 def _managed_tvs_response(settings=None) -> ManagedTVsResponse:
     settings = settings or _settings()
+    conflict_map: dict[str, set[str]] = defaultdict(set)
+    warnings: list[str] = []
+    items = sorted(settings.tvs.items())
+    for index, (left_id, left) in enumerate(items):
+        for right_id, right in items[index + 1:]:
+            if (
+                left.ip == right.ip
+                or _normalized_tv_profile_id(left_id)
+                == _normalized_tv_profile_id(right_id)
+            ):
+                conflict_map[left_id].add(right_id)
+                conflict_map[right_id].add(left_id)
+                warnings.append(
+                    f"TV profiles {left_id!r} and {right_id!r} may represent the same TV."
+                )
+
     return ManagedTVsResponse(
         tvs=[
             ManagedTVResponse(
@@ -1178,9 +1544,11 @@ def _managed_tvs_response(settings=None) -> ManagedTVsResponse:
                 token_configured=bool(
                     profile.token_file and Path(profile.token_file).is_file()
                 ),
+                conflicts_with=sorted(conflict_map[name]),
             )
-            for name, profile in sorted(settings.tvs.items())
-        ]
+            for name, profile in items
+        ],
+        warnings=warnings,
     )
 
 
@@ -1256,7 +1624,23 @@ def _pipeline_result_to_response(result) -> JobResponse:
         metadata=value("metadata", {}),
         timings=value("timings", {}),
         error=value("error"),
+        error_code=value("error_code"),
+        generation_succeeded=bool(value("generation_succeeded", False)),
+        delivery_status=value("delivery_status", "not_requested"),
     )
+
+
+def _pipeline_error_status(result) -> int:
+    error_code = (
+        result.get("error_code")
+        if isinstance(result, dict)
+        else getattr(result, "error_code", None)
+    )
+    if error_code == "tv_unreachable":
+        return 503
+    if error_code == "tv_art_mode_unavailable":
+        return 409
+    return 500
 
 
 def _configured_job_store(settings=None):
@@ -1306,10 +1690,10 @@ def _read_validated_upload(image: UploadFile) -> tuple[str, str, bytes]:
     except (UnidentifiedImageError, OSError) as exc:
         raise HTTPException(status_code=400, detail="Uploaded file is not a valid image.") from exc
 
-    if image_format not in {"JPEG", "PNG"}:
+    if image_format not in _UPLOAD_FORMAT_SUFFIXES:
         raise HTTPException(status_code=400, detail="Unsupported image format. Use JPG or PNG.")
 
-    actual_suffix = ".jpg" if image_format == "JPEG" else ".png"
+    actual_suffix = _UPLOAD_FORMAT_SUFFIXES[image_format]
     if supplied_suffix and (
         (supplied_suffix in {".jpg", ".jpeg"} and actual_suffix != ".jpg")
         or (supplied_suffix == ".png" and actual_suffix != ".png")
@@ -1320,6 +1704,20 @@ def _read_validated_upload(image: UploadFile) -> tuple[str, str, bytes]:
         or (mime_type == "image/png" and actual_suffix != ".png")
     ):
         raise HTTPException(status_code=400, detail="Content type does not match image data.")
+
+    if image_format == "MPO":
+        try:
+            with Image.open(BytesIO(payload)) as decoded:
+                decoded.seek(0)
+                primary_frame = ImageOps.exif_transpose(decoded).convert("RGB")
+                normalized = BytesIO()
+                primary_frame.save(normalized, format="JPEG", quality=95)
+                payload = normalized.getvalue()
+        except (EOFError, OSError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded MPO image does not contain a valid primary frame.",
+            ) from exc
 
     return filename, actual_suffix, payload
 
@@ -1389,7 +1787,10 @@ def _fetch_openai_image_models(openai_cfg) -> list[str]:
                     models.append(model_id)
         return list(dict.fromkeys(models))
     except Exception as e:
-        logger.warning("OpenAI model discovery failed: %s", e)
+        logger.warning(
+            "OpenAI model discovery failed: %s",
+            safe_exception_message(e, secrets=[api_key]),
+        )
         return []
 
 
@@ -1471,7 +1872,10 @@ def _fetch_google_image_models(google_cfg) -> list[str]:
                     models.append(model_name[len("models/") :])
         return list(dict.fromkeys(models))
     except Exception as e:
-        logger.warning("Google model discovery failed: %s", e)
+        logger.warning(
+            "Google model discovery failed: %s",
+            safe_exception_message(e, secrets=[api_key]),
+        )
         return []
 
 
@@ -1499,8 +1903,28 @@ def readiness(response: Response):
     )
 
 
+def _set_browser_cookie(
+    response: Response,
+    request: Request,
+    *,
+    key: str,
+    value: str,
+    max_age: int,
+) -> None:
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip()
+    response.set_cookie(
+        key=key,
+        value=value,
+        max_age=max_age,
+        httponly=True,
+        secure=request.url.scheme == "https" or forwarded_proto == "https",
+        samesite="strict",
+        path="/",
+    )
+
+
 @app.post("/auth/session")
-def create_auth_session(req: AuthSessionRequest, response: Response):
+def create_auth_session(req: AuthSessionRequest, request: Request, response: Response):
     """Exchange an API token for an HttpOnly browser session cookie."""
     settings = _settings()
     if not settings.auth_enabled:
@@ -1511,34 +1935,149 @@ def create_auth_session(req: AuthSessionRequest, response: Response):
     if not scopes:
         raise HTTPException(status_code=401, detail="Invalid API token.")
 
-    response.set_cookie(
+    _set_browser_cookie(
+        response,
+        request,
         key="frameart_session",
         value=token,
         max_age=7 * 24 * 60 * 60,
-        httponly=True,
-        samesite="strict",
-        path="/",
     )
-    return {"authenticated": True, "auth_enabled": True, "scopes": sorted(scopes)}
+    device_id = None
+    if req.remember_device:
+        device_token, device = _access_store(settings).create_device(
+            device_name=req.device_name.strip(),
+            scopes=scopes,
+            lifetime_seconds=settings.device_session_days * 24 * 60 * 60,
+        )
+        _set_browser_cookie(
+            response,
+            request,
+            key="frameart_device",
+            value=device_token,
+            max_age=settings.device_session_days * 24 * 60 * 60,
+        )
+        device_id = device["id"]
+    return {
+        "authenticated": True,
+        "auth_enabled": True,
+        "scopes": sorted(scopes),
+        "device_id": device_id,
+    }
+
+
+@app.post("/auth/pair")
+def pair_device(req: PairDeviceRequest, request: Request, response: Response):
+    """Exchange a one-time pairing code for a revocable device cookie."""
+    settings = _settings()
+    if not settings.auth_enabled:
+        raise HTTPException(status_code=400, detail="Authentication is disabled.")
+    if not _origin_matches_request(request):
+        raise HTTPException(status_code=403, detail="Origin check failed.")
+    client_host = _request_client_ip(request) or "-"
+    if not _within_rate_limit(f"device-pair:{client_host}", 10):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many pairing attempts; retry in one minute.",
+            headers={"Retry-After": "60"},
+        )
+    try:
+        device_token, device = _access_store(settings).consume_pairing(
+            req.code,
+            device_name=req.device_name.strip(),
+            lifetime_seconds=settings.device_session_days * 24 * 60 * 60,
+        )
+    except InvalidPairingCodeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _set_browser_cookie(
+        response,
+        request,
+        key="frameart_device",
+        value=device_token,
+        max_age=settings.device_session_days * 24 * 60 * 60,
+    )
+    return {"authenticated": True, "scopes": device["scopes"], "device_id": device["id"]}
 
 
 @app.get("/auth/status")
 def auth_status(request: Request):
-    """Return the authenticated token's effective scopes."""
+    """Return the current request's authentication method and effective scopes."""
     settings = _settings()
     scopes = getattr(request.state, "frameart_scopes", {"read", "control", "admin"})
     return {
         "authenticated": True,
         "auth_enabled": settings.auth_enabled,
         "scopes": sorted(scopes),
+        "method": getattr(request.state, "frameart_auth_method", "off"),
+        "identity": getattr(request.state, "frameart_identity", None),
+        "device_id": getattr(request.state, "frameart_device_id", None),
     }
 
 
 @app.post("/auth/logout")
 def logout(response: Response):
-    """Clear the browser session cookie."""
+    """Clear browser token and paired-device cookies."""
     response.delete_cookie("frameart_session", path="/")
+    response.delete_cookie("frameart_device", path="/")
     return {"authenticated": False}
+
+
+@app.get("/auth/access")
+def access_status(request: Request):
+    """Return non-secret access configuration and revocable browser devices."""
+    settings = _settings()
+    current_device_id = getattr(request.state, "frameart_device_id", None)
+    devices = _access_store(settings).list_devices()
+    for device in devices:
+        device["current"] = device["id"] == current_device_id
+    return {
+        "auth_enabled": settings.auth_enabled,
+        "method": getattr(request.state, "frameart_auth_method", "off"),
+        "identity": getattr(request.state, "frameart_identity", None),
+        "tailscale_auth_enabled": settings.tailscale_auth_enabled,
+        "tailscale_allowed_users": settings.tailscale_allowed_users,
+        "trusted_lan_cidrs": settings.trusted_lan_cidrs,
+        "device_session_days": settings.device_session_days,
+        "pairing_code_minutes": settings.pairing_code_minutes,
+        "devices": devices,
+    }
+
+
+@app.post("/auth/pairings", status_code=201)
+def create_device_pairing(request: Request):
+    """Create a short-lived pairing link and QR code for another browser."""
+    settings = _settings()
+    if not settings.auth_enabled:
+        raise HTTPException(status_code=400, detail="Authentication is disabled.")
+    creator = (
+        getattr(request.state, "frameart_identity", None)
+        or getattr(request.state, "frameart_auth_method", None)
+        or "administrator"
+    )
+    pairing = _access_store(settings).create_pairing(
+        created_by=str(creator),
+        lifetime_seconds=settings.pairing_code_minutes * 60,
+    )
+    pairing_url = f"{str(request.base_url).rstrip('/')}?pair={pairing['code']}"
+    qr_image = qrcode.make(pairing_url)
+    qr_bytes = BytesIO()
+    qr_image.save(qr_bytes, format="PNG")
+    return {
+        **pairing,
+        "pairing_url": pairing_url,
+        "qr_data_url": f"data:image/png;base64,{b64encode(qr_bytes.getvalue()).decode('ascii')}",
+    }
+
+
+@app.delete("/auth/devices/{device_id}")
+def revoke_device(device_id: str, request: Request, response: Response):
+    """Revoke one paired browser device."""
+    if not re.fullmatch(r"[a-f0-9]{32}", device_id):
+        raise HTTPException(status_code=404, detail="Paired device not found.")
+    if not _access_store(_settings()).revoke_device(device_id):
+        raise HTTPException(status_code=404, detail="Paired device not found.")
+    if getattr(request.state, "frameart_device_id", None) == device_id:
+        response.delete_cookie("frameart_device", path="/")
+    return {"revoked": True, "device_id": device_id}
 
 
 @app.get("/styles", response_model=dict[str, str])
@@ -1866,11 +2405,9 @@ def get_managed_tvs():
 def create_managed_tv(req: TVCreateRequest):
     """Create a persisted TV profile."""
     settings = _settings()
-    if req.profile_id in settings.tvs:
-        raise HTTPException(
-            status_code=409,
-            detail=f"TV profile {req.profile_id!r} already exists.",
-        )
+    conflicts = _tv_profile_conflicts(settings, req.profile_id, req.ip)
+    if conflicts:
+        _raise_tv_profile_conflict(conflicts)
     token_file = settings.data_dir / "secrets" / f"{req.ip.replace('.', '_')}.token"
     profile = TVProfile(
         ip=req.ip,
@@ -1890,11 +2427,20 @@ def create_managed_tv(req: TVCreateRequest):
 
 @app.put("/settings/tvs/{profile_id}", response_model=ManagedTVsResponse)
 def update_managed_tv(profile_id: ProfileId, req: TVSettingsRequest):
-    """Replace editable fields for a persisted TV profile."""
+    """Replace editable fields and optionally rename a persisted TV profile."""
     settings = _settings()
     existing = settings.tvs.get(profile_id)
     if existing is None:
         raise HTTPException(status_code=404, detail=f"TV profile {profile_id!r} was not found.")
+    target_profile_id = req.profile_id or profile_id
+    conflicts = _tv_profile_conflicts(
+        settings,
+        target_profile_id,
+        req.ip,
+        exclude={profile_id},
+    )
+    if conflicts:
+        _raise_tv_profile_conflict(conflicts)
     if req.ip == existing.ip and existing.token_file:
         token_file = existing.token_file
     else:
@@ -1909,9 +2455,15 @@ def update_managed_tv(profile_id: ProfileId, req: TVSettingsRequest):
 
     def update(managed, _provider_keys):
         tvs = _ensure_managed_tvs(managed, settings)
-        tvs[profile_id] = _tv_payload(profile)
+        if target_profile_id != profile_id:
+            tvs.pop(profile_id, None)
+        tvs[target_profile_id] = _tv_payload(profile)
 
     _persist_management(settings, update)
+    if target_profile_id != profile_id:
+        AutomationStore(settings.data_dir).replace_tv_profile_ids(
+            {profile_id: target_profile_id}
+        )
     return _managed_tvs_response(load_settings())
 
 
@@ -1927,6 +2479,38 @@ def delete_managed_tv(profile_id: ProfileId):
         tvs.pop(profile_id, None)
 
     _persist_management(settings, update)
+    return _managed_tvs_response(load_settings())
+
+
+@app.post(
+    "/settings/tvs/{profile_id}/consolidate",
+    response_model=ManagedTVsResponse,
+)
+def consolidate_managed_tv(profile_id: ProfileId):
+    """Keep one TV profile and remove its conflicting aliases without deleting tokens."""
+    settings = _settings()
+    keeper = settings.tvs.get(profile_id)
+    if keeper is None:
+        raise HTTPException(status_code=404, detail=f"TV profile {profile_id!r} was not found.")
+    conflicts = _tv_profile_conflicts(
+        settings,
+        profile_id,
+        keeper.ip,
+        exclude={profile_id},
+    )
+    duplicate_ids = [duplicate_id for duplicate_id, _reasons in conflicts]
+    if not duplicate_ids:
+        raise HTTPException(status_code=409, detail="No duplicate TV profiles were found.")
+
+    def update(managed, _provider_keys):
+        tvs = _ensure_managed_tvs(managed, settings)
+        for duplicate_id in duplicate_ids:
+            tvs.pop(duplicate_id, None)
+
+    _persist_management(settings, update)
+    AutomationStore(settings.data_dir).replace_tv_profile_ids(
+        {duplicate_id: profile_id for duplicate_id in duplicate_ids}
+    )
     return _managed_tvs_response(load_settings())
 
 
@@ -2012,11 +2596,12 @@ def generate_and_apply(req: GenerateAndApplyRequest):
         tv_name=req.tv,
         tv_ip=req.tv_ip,
         matte=req.matte,
+        no_upload=req.generate_anyway,
         no_switch=req.no_switch,
     )
     resp = _pipeline_result_to_response(result)
     if result.error:
-        raise HTTPException(status_code=500, detail=resp.model_dump())
+        raise HTTPException(status_code=_pipeline_error_status(result), detail=resp.model_dump())
     return resp
 
 
@@ -2207,6 +2792,7 @@ def tv_list_art(
     """List artworks on the Frame TV (deduplicated, with favourite flag)."""
     from frameart.tv.controller import list_art_deduplicated
 
+    settings = _settings()
     profile = _resolve_tv_profile(tv, tv_ip)
     try:
         artworks = list_art_deduplicated(profile)
@@ -2215,10 +2801,16 @@ def tv_list_art(
             status_code=502,
             detail=f"TV art list failed: {e}",
         ) from e
+    local_jobs = _artifact_job_ids_by_content_id(
+        settings,
+        {a.get("content_id", "") for a in artworks},
+        source_tv_ip=profile.ip,
+    )
     return [
         TVArtItem(
             content_id=a.get("content_id", "unknown"),
             is_favourite=a.get("is_favourite", False),
+            local_job_id=local_jobs.get(a.get("content_id", "")),
         )
         for a in artworks
     ]
@@ -2232,16 +2824,39 @@ def tv_art_thumbnail(
     ),
     tv: str | None = Query(None, max_length=100, description="TV profile name."),
     tv_ip: str | None = Query(None, max_length=45, description="Private TV IP address."),
+    refresh: bool = Query(False, description="Refresh the TV thumbnail cache."),
 ):
-    """Fetch thumbnail bytes for an artwork on the Frame TV."""
-    from frameart.tv.controller import get_art_thumbnail
-
+    """Fetch a persistent, coalesced thumbnail for artwork on the Frame TV."""
+    settings = _settings()
     profile = _resolve_tv_profile(tv, tv_ip)
-    thumbnail = get_art_thumbnail(profile, content_id)
-    if thumbnail is None:
+    try:
+        entry, cache_status = _cached_tv_thumbnail(
+            settings,
+            profile,
+            content_id,
+            refresh=refresh,
+        )
+    except Exception as exc:
+        _raise_tv_cache_http_error(exc, "TV thumbnail request")
+    if entry is None:
         raise HTTPException(status_code=404, detail="Thumbnail not available.")
 
-    return Response(content=thumbnail, media_type="image/jpeg")
+    return Response(
+        content=entry.value["data"],
+        media_type=entry.value["media_type"],
+        headers={"X-FrameArt-Cache": cache_status},
+    )
+
+
+@app.post("/tv/art/thumbnails/warm", response_model=TVThumbnailWarmResponse)
+def tv_art_thumbnails_warm(req: TVThumbnailWarmRequest):
+    """Warm a cold gallery through one batch request to the TV art service."""
+    settings = _settings()
+    profile = _resolve_tv_profile(req.tv, req.tv_ip)
+    try:
+        return _warm_tv_thumbnails(settings, profile, list(req.content_ids))
+    except Exception as exc:
+        _raise_tv_cache_http_error(exc, "TV thumbnail batch request")
 
 
 @app.post("/tv/art/delete", response_model=DeleteArtResponse)
@@ -2277,6 +2892,11 @@ def tv_delete_art(req: DeleteArtRequest):
         return DeleteArtResponse(deleted=[], skipped_favorites=skipped)
 
     if delete_art(profile, ids):
+        try:
+            settings = _settings()
+            _tv_cache_store(settings).delete_thumbnails(tv_cache_key(profile), ids)
+        except Exception as exc:
+            logger.warning("Could not invalidate deleted TV thumbnails: %s", exc)
         return DeleteArtResponse(deleted=ids, skipped_favorites=skipped)
 
     raise HTTPException(
@@ -2319,15 +2939,31 @@ def tv_display_art(req: DisplayArtRequest):
 def tv_mattes(
     tv: str | None = Query(None, description="TV profile name from config."),
     tv_ip: str | None = Query(None, description="TV IP address."),
+    refresh: bool = Query(False, description="Refresh the persistent matte cache."),
 ):
-    """List matte styles supported by the TV."""
-    from frameart.tv.controller import get_matte_list
-
+    """List matte styles with a persistent fresh/stale cache."""
+    settings = _settings()
     profile = _resolve_tv_profile(tv, tv_ip)
     try:
-        return get_matte_list(profile)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"TV matte list failed: {e}") from e
+        entry, cache_status = _cached_tv_mattes(settings, profile, refresh=refresh)
+    except Exception as exc:
+        _raise_tv_cache_http_error(exc, "TV matte list")
+    return JSONResponse(
+        content=entry.value,
+        headers={"X-FrameArt-Cache": cache_status},
+    )
+
+
+@app.delete("/tv/mattes/cache")
+def invalidate_tv_mattes(
+    tv: str | None = Query(None, description="TV profile name from config."),
+    tv_ip: str | None = Query(None, description="TV IP address."),
+):
+    """Explicitly invalidate one TV's persisted matte cache."""
+    settings = _settings()
+    profile = _resolve_tv_profile(tv, tv_ip)
+    _tv_cache_store(settings).invalidate_mattes(tv_cache_key(profile))
+    return {"ok": True}
 
 
 @app.get("/tv/configured", response_model=list[ConfiguredTVResponse])
@@ -2361,8 +2997,16 @@ def catalog_search(
         logger.warning("Catalog search bad request source=%s q=%r: %s", source, q, e)
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
-        logger.exception("Catalog search upstream failure source=%s q=%r", source, q)
-        raise HTTPException(status_code=502, detail=f"Catalog search failed: {e}") from e
+        safe_error = safe_exception_message(e)
+        logger.error(
+            "Catalog search upstream failure source=%s q=%r: %s",
+            source,
+            q,
+            safe_error,
+        )
+        raise HTTPException(
+            status_code=502, detail=f"Catalog search failed: {safe_error}"
+        ) from e
 
     validated: list[PublicDomainArtwork] = []
     dropped = 0
@@ -3015,6 +3659,49 @@ def _find_artifact_image_by_content_id(
     return None
 
 
+def _artifact_job_ids_by_content_id(
+    settings,
+    content_ids: set[str],
+    *,
+    source_tv_ip: str | None = None,
+) -> dict[str, str]:
+    """Map TV content IDs to local jobs in one bounded artifact scan."""
+    unresolved = {content_id for content_id in content_ids if content_id}
+    matches: dict[str, str] = {}
+    artifacts_dir = Path(settings.data_dir) / "artifacts"
+    if not unresolved or not artifacts_dir.exists():
+        return matches
+
+    for meta_path in sorted(artifacts_dir.rglob("meta.json"), reverse=True):
+        if not unresolved:
+            break
+        try:
+            metadata = json.loads(meta_path.read_text())
+        except Exception:
+            continue
+
+        candidates: set[str] = set()
+        content_id = metadata.get("content_id")
+        if isinstance(content_id, str):
+            candidates.add(content_id)
+        tv_map = metadata.get("tv_content_ids")
+        if isinstance(tv_map, dict):
+            if source_tv_ip and isinstance(tv_map.get(source_tv_ip), str):
+                candidates.add(tv_map[source_tv_ip])
+            elif not source_tv_ip:
+                candidates.update(str(value) for value in tv_map.values() if value)
+
+        job_dir = meta_path.parent
+        if not (job_dir / "final.png").exists() and not (job_dir / "source.png").exists():
+            continue
+
+        job_id = str(metadata.get("job_id") or meta_path.parent.name)
+        for candidate in candidates & unresolved:
+            matches[candidate] = job_id
+            unresolved.remove(candidate)
+    return matches
+
+
 @app.post("/jobs/{job_id}/edit-and-apply", response_model=JobResponse)
 def edit_job_artwork(job_id: str, req: EditFromExistingRequest):
     """Create a new image by editing an existing server-side artwork job image."""
@@ -3049,7 +3736,6 @@ def edit_job_artwork(job_id: str, req: EditFromExistingRequest):
 def edit_tv_artwork(req: TVArtEditRequest):
     """Create a new image by editing artwork currently stored on a TV."""
     from frameart.pipeline import run_edit_and_apply
-    from frameart.tv.controller import get_art_thumbnail
 
     settings = _settings()
     edit_prompt = req.prompt.strip()
@@ -3078,9 +3764,17 @@ def edit_tv_artwork(req: TVArtEditRequest):
                 ),
             )
 
-        source_bytes = get_art_thumbnail(source_profile, req.content_id)
-        if not source_bytes:
+        try:
+            thumbnail_entry, _cache_status = _cached_tv_thumbnail(
+                settings,
+                source_profile,
+                req.content_id,
+            )
+        except Exception as exc:
+            _raise_tv_cache_http_error(exc, "TV artwork thumbnail request")
+        if thumbnail_entry is None:
             raise HTTPException(status_code=404, detail="TV artwork thumbnail not available.")
+        source_bytes = thumbnail_entry.value["data"]
 
         upload_dir = settings.data_dir / "uploads"
         upload_dir.mkdir(parents=True, exist_ok=True)
@@ -3163,6 +3857,40 @@ def apply_job_to_tv(job_id: str, req: JobApplyRequest):
     except HTTPException:
         profile = None
 
+    if profile is not None:
+        preflight = preflight_tv(profile)
+        if not (preflight.reachable and preflight.art_mode_supported):
+            error_code = (
+                "tv_unreachable" if not preflight.reachable else "tv_art_mode_unavailable"
+            )
+            message = (
+                "TV is unreachable. Wake it or check its network connection, then retry "
+                "this saved artwork; generation will not run again."
+                if error_code == "tv_unreachable"
+                else "The TV is reachable but does not report Frame Art Mode support."
+            )
+            failure = JobResponse(
+                job_id=job_id,
+                job_dir=str(job_dir),
+                final_path=str(selected_image),
+                metadata={
+                    "job_id": job_id,
+                    "tv_ip": profile.ip,
+                    "generation_succeeded": True,
+                    "delivery_status": "failed",
+                    "error_code": error_code,
+                    "tv_preflight_error": preflight.error,
+                },
+                error=message,
+                error_code=error_code,
+                generation_succeeded=True,
+                delivery_status="failed",
+            )
+            raise HTTPException(
+                status_code=503 if error_code == "tv_unreachable" else 409,
+                detail=failure.model_dump(),
+            )
+
     candidate_ids: list[str] = []
     if profile:
         mapped_id = tv_content_ids.get(profile.ip)
@@ -3204,6 +3932,8 @@ def apply_job_to_tv(job_id: str, req: JobApplyRequest):
                 },
                 timings={},
                 error=None,
+                generation_succeeded=True,
+                delivery_status="displayed",
             )
 
     result = run_apply(
@@ -3212,10 +3942,11 @@ def apply_job_to_tv(job_id: str, req: JobApplyRequest):
         tv_name=req.tv,
         tv_ip=req.tv_ip,
         matte=req.matte,
+        skip_preflight=True,
     )
     resp = _pipeline_result_to_response(result)
     if result.error:
-        raise HTTPException(status_code=500, detail=resp.model_dump())
+        raise HTTPException(status_code=_pipeline_error_status(result), detail=resp.model_dump())
 
     # Persist applied content ID back to the original job metadata for dedupe on re-apply.
     try:
@@ -3358,6 +4089,7 @@ def async_generate_and_apply(req: GenerateAndApplyRequest):
             "tv_name": req.tv,
             "tv_ip": req.tv_ip,
             "matte": req.matte,
+            "no_upload": req.generate_anyway,
             "no_switch": req.no_switch,
         },
         request_summary={
@@ -3368,6 +4100,7 @@ def async_generate_and_apply(req: GenerateAndApplyRequest):
             "model": req.model,
             "tv": req.tv,
             "tv_ip": req.tv_ip,
+            "generate_anyway": req.generate_anyway,
         },
     )
 
@@ -3435,6 +4168,15 @@ def run_server(host: str = "127.0.0.1", port: int = 8000) -> None:
     import uvicorn
 
     settings = load_settings()
+    if settings.tailscale_auth_enabled and not settings.auth_enabled:
+        raise RuntimeError(
+            "Tailscale authentication requires FRAMEART_AUTH_ENABLED=true."
+        )
+    if settings.tailscale_auth_enabled and not _is_loopback_host(host):
+        raise RuntimeError(
+            "Tailscale authentication headers are trusted only on a loopback bind. "
+            "Bind to 127.0.0.1 and expose FrameArt with Tailscale Serve."
+        )
     if not _is_loopback_host(host) and not settings.auth_enabled:
         raise RuntimeError(
             "Refusing a non-loopback bind without API authentication. Set "

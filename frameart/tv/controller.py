@@ -28,15 +28,12 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 3
 RETRY_BACKOFF = [2, 4, 8]
 DEFAULT_TIMEOUT = 10  # seconds for websocket operations
+TV_PREFLIGHT_TIMEOUT = 3.0
 
 # Samsung Frame TVs reject large uploads over WebSocket.
 # Convert images to JPEG to keep size reasonable.
 _JPEG_QUALITY = 95
 _MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB safety threshold
-
-_TV_OP_LOCKS: dict[str, threading.Lock] = {}
-_TV_OP_LOCKS_GUARD = threading.Lock()
-
 
 @dataclass
 class TVStatus:
@@ -56,6 +53,87 @@ class UploadResult:
     content_id: str
     success: bool
     error: str | None = None
+
+
+class TVOperationError(RuntimeError):
+    """Base error for bounded TV operation failures."""
+
+
+class TVOperationBusyError(TVOperationError):
+    """Raised when an operation expires before it can start."""
+
+
+class TVOperationTimeoutError(TVOperationError):
+    """Raised when an active TV operation exceeds its response deadline."""
+
+
+class _TVOperationGate:
+    """A cancellable per-TV gate that prioritizes mutations over reads."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._active_lease: int | None = None
+        self._next_lease = 1
+        self._quarantined_reads: set[int] = set()
+        self._waiting_mutations = 0
+
+    def acquire(self, timeout_sec: float, priority: str) -> int | None:
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        mutation = priority == "mutation"
+        acquired = False
+        with self._condition:
+            if mutation:
+                self._waiting_mutations += 1
+            try:
+                # A read that exceeded its deadline may still have a blocked
+                # library thread. Refuse more reads until that thread exits so
+                # repeated refreshes cannot create an unbounded pile of them.
+                if not mutation and self._quarantined_reads:
+                    return None
+
+                while self._active_lease is not None or (
+                    not mutation and self._waiting_mutations > 0
+                ):
+                    if not mutation and self._quarantined_reads:
+                        return None
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return None
+                    self._condition.wait(remaining)
+
+                if not mutation and self._quarantined_reads:
+                    return None
+
+                lease = self._next_lease
+                self._next_lease += 1
+                self._active_lease = lease
+                acquired = True
+                return lease
+            finally:
+                if mutation:
+                    self._waiting_mutations -= 1
+                if not acquired:
+                    self._condition.notify_all()
+
+    def release(self, lease: int) -> None:
+        with self._condition:
+            if lease in self._quarantined_reads:
+                self._quarantined_reads.remove(lease)
+            elif self._active_lease == lease:
+                self._active_lease = None
+            self._condition.notify_all()
+
+    def quarantine_read(self, lease: int) -> None:
+        """Release a timed-out read without letting late cleanup release its successor."""
+        with self._condition:
+            if self._active_lease == lease:
+                self._active_lease = None
+                self._quarantined_reads.add(lease)
+                self._condition.notify_all()
+
+
+_TV_OP_GATES: dict[str, _TVOperationGate] = {}
+_TV_OP_GATES_GUARD = threading.Lock()
 
 
 def _ensure_token_dir(token_file: str) -> None:
@@ -94,7 +172,7 @@ def _resolve_token_file(profile: TVProfile) -> str:
     return token_file
 
 
-def _connect(profile: TVProfile) -> SamsungTVWS:
+def _connect(profile: TVProfile, *, timeout: float = DEFAULT_TIMEOUT) -> SamsungTVWS:
     """Create a SamsungTVWS connection from a TVProfile.
 
     Used for REST-only operations (pairing, device info).  For art operations,
@@ -112,7 +190,7 @@ def _connect(profile: TVProfile) -> SamsungTVWS:
         port=profile.port,
         token_file=token_file,
         name=profile.name,
-        timeout=DEFAULT_TIMEOUT,
+        timeout=timeout,
     )
 
 
@@ -139,10 +217,17 @@ def _connect_art(profile: TVProfile) -> SamsungTVArt:
     )
 
 
-def _retry(func, description: str) -> Any:
+def _retry(
+    func,
+    description: str,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> Any:
     """Execute a function with retry and exponential backoff."""
     last_error = None
     for attempt in range(MAX_RETRIES):
+        if cancel_event is not None and cancel_event.is_set():
+            raise TVOperationTimeoutError(f"{description}: cancelled after timeout")
         try:
             return func()
         except Exception as e:
@@ -157,7 +242,13 @@ def _retry(func, description: str) -> Any:
                     "%s failed (attempt %d/%d): %s — retrying in %ds",
                     description, attempt + 1, MAX_RETRIES, e, wait,
                 )
-                time.sleep(wait)
+                if cancel_event is not None:
+                    if cancel_event.wait(wait):
+                        raise TVOperationTimeoutError(
+                            f"{description}: cancelled after timeout"
+                        ) from e
+                else:
+                    time.sleep(wait)
             else:
                 logger.error(
                     "%s failed after %d attempts: %s",
@@ -166,28 +257,15 @@ def _retry(func, description: str) -> Any:
     raise RuntimeError(f"{description} failed after {MAX_RETRIES} attempts: {last_error}")
 
 
-def _tv_operation_lock(profile: TVProfile) -> threading.Lock:
-    """Return a per-TV lock to serialize websocket art operations."""
+def _tv_operation_gate(profile: TVProfile) -> _TVOperationGate:
+    """Return the cancellable, priority-aware gate for one TV."""
     key = f"{profile.ip}:{profile.port}"
-    with _TV_OP_LOCKS_GUARD:
-        lock = _TV_OP_LOCKS.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _TV_OP_LOCKS[key] = lock
-        return lock
-
-
-def _run_serialized(profile: TVProfile, func, description: str) -> Any:
-    """Run a TV operation under a per-device lock."""
-    lock = _tv_operation_lock(profile)
-    logger.debug(
-        "Acquiring TV operation lock for %s:%d (%s)",
-        profile.ip,
-        profile.port,
-        description,
-    )
-    with lock:
-        return func()
+    with _TV_OP_GATES_GUARD:
+        gate = _TV_OP_GATES.get(key)
+        if gate is None:
+            gate = _TVOperationGate()
+            _TV_OP_GATES[key] = gate
+        return gate
 
 
 def pair(profile: TVProfile) -> bool:
@@ -227,9 +305,11 @@ def pair(profile: TVProfile) -> bool:
 
 
 TV_OP_TIMEOUT = 20  # seconds — cap for any single TV WebSocket operation
+ART_READINESS_TIMEOUT = 3.0
+ART_READINESS_POLL_INTERVAL = 0.25
 
 
-def _run_with_timeout(func, timeout_sec: int = TV_OP_TIMEOUT):
+def _run_with_timeout(func, timeout_sec: float = TV_OP_TIMEOUT):
     """Run a function in a thread with a timeout. Returns (result, error)."""
     import queue
 
@@ -255,22 +335,100 @@ def _run_with_timeout(func, timeout_sec: int = TV_OP_TIMEOUT):
     return None, str(value)
 
 
-def _run_tv_op(profile: TVProfile, func, description: str, timeout_sec: int = TV_OP_TIMEOUT):
-    """Run a TV WebSocket operation with serialization, retry, and timeout.
+def _run_tv_op(
+    profile: TVProfile,
+    func,
+    description: str,
+    timeout_sec: float = TV_OP_TIMEOUT,
+    *,
+    priority: str = "mutation",
+    cancel=None,
+):
+    """Run a TV operation through a cancellable, priority-aware device gate.
 
-    Raises RuntimeError if the operation fails or times out.
+    Waiting happens in the caller thread. An expired waiter therefore never
+    creates a background worker and can never contact the TV later. Once an
+    operation starts, the gate stays occupied until its worker actually exits,
+    even if the caller's response deadline expires.
     """
-    def _inner():
-        return _run_serialized(
-            profile,
-            lambda: _retry(func, description),
-            description,
+    if priority not in {"read", "mutation"}:
+        raise ValueError("priority must be 'read' or 'mutation'")
+
+    started_at = time.monotonic()
+    gate = _tv_operation_gate(profile)
+    lease = gate.acquire(timeout_sec, priority)
+    if lease is None:
+        raise TVOperationBusyError(
+            f"{description}: TV busy; operation expired before it could start"
         )
 
-    result, err = _run_with_timeout(_inner, timeout_sec=timeout_sec)
+    remaining = timeout_sec - (time.monotonic() - started_at)
+    if remaining <= 0:
+        gate.release(lease)
+        raise TVOperationBusyError(
+            f"{description}: TV busy; operation expired before it could start"
+        )
+
+    cancel_event = threading.Event()
+
+    def _inner():
+        try:
+            return _retry(func, description, cancel_event=cancel_event)
+        finally:
+            gate.release(lease)
+
+    result, err = _run_with_timeout(_inner, timeout_sec=remaining)
     if err:
-        raise RuntimeError(f"{description}: {err}")
+        if err == "timed out":
+            cancel_event.set()
+            if priority == "read":
+                # A stale read must not permanently block uploads or display
+                # changes. Its lease is quarantined so late cleanup cannot
+                # release a newer mutation's lease.
+                gate.quarantine_read(lease)
+            if cancel is not None:
+                with contextlib.suppress(Exception):
+                    cancel()
+            raise TVOperationTimeoutError(f"{description}: timed out")
+        raise TVOperationError(f"{description}: {err}")
     return result
+
+
+def _frame_support_from_device_info(device_info: dict[str, Any]) -> bool:
+    device = device_info.get("device", {})
+    is_support_str = device_info.get("isSupport", "{}")
+    return (
+        isinstance(device, dict)
+        and device.get("FrameTVSupport") == "true"
+    ) or '"FrameTVSupport":"true"' in str(is_support_str)
+
+
+def preflight_tv(
+    profile: TVProfile,
+    *,
+    timeout_sec: float = TV_PREFLIGHT_TIMEOUT,
+) -> TVStatus:
+    """Run a short REST-only reachability and Frame capability check."""
+    def _probe() -> dict[str, Any]:
+        tv = _connect(profile, timeout=max(0.1, timeout_sec))
+        try:
+            info = tv.rest_device_info()
+            return info if isinstance(info, dict) else {}
+        finally:
+            with contextlib.suppress(Exception):
+                tv.close()
+
+    device_info, error = _run_with_timeout(_probe, timeout_sec=max(0.1, timeout_sec))
+    if error:
+        detail = "timed out" if error == "timed out" else error
+        return TVStatus(reachable=False, error=f"TV preflight {detail}")
+
+    supported = _frame_support_from_device_info(device_info or {})
+    return TVStatus(
+        reachable=True,
+        art_mode_supported=supported,
+        error=None if supported else "TV is reachable but does not report Frame Art Mode support.",
+    )
 
 
 def get_status(profile: TVProfile) -> TVStatus:
@@ -283,12 +441,7 @@ def get_status(profile: TVProfile) -> TVStatus:
         return TVStatus(reachable=False, error=str(e))
 
     # Step 2: Check FrameTVSupport from REST response (no websocket)
-    device = device_info.get("device", {})
-    is_support_str = device_info.get("isSupport", "{}")
-    frame_supported = (
-        device.get("FrameTVSupport") == "true"
-        or '"FrameTVSupport":"true"' in is_support_str
-    )
+    frame_supported = _frame_support_from_device_info(device_info)
 
     if not frame_supported:
         return TVStatus(reachable=True, art_mode_supported=False)
@@ -298,42 +451,30 @@ def get_status(profile: TVProfile) -> TVStatus:
     art_mode_on = False
     current_artwork = None
 
-    def _query_art_mode():
-        art = None
-        try:
-            art = _connect_art(profile)
-            return art.get_artmode()
-        finally:
-            with contextlib.suppress(Exception):
-                art.close()
+    try:
+        result = _run_art_call(
+            profile,
+            lambda art: art.get_artmode(),
+            "Get art mode status",
+            priority="read",
+        )
+        art_mode_on = _art_mode_is_on(result)
+    except TVOperationError as exc:
+        logger.warning("Could not get art mode status: %s", exc)
 
-    def _query_current():
-        art = None
-        try:
-            art = _connect_art(profile)
-            return art.get_current()
-        finally:
-            with contextlib.suppress(Exception):
-                art.close()
-
-    result, err = _run_with_timeout(
-        lambda: _run_serialized(profile, _query_art_mode, "Get art mode status"),
-    )
-    if err:
-        logger.warning("Could not get art mode status: %s", err)
-    else:
-        art_mode_on = bool(result)
-
-    result, err = _run_with_timeout(
-        lambda: _run_serialized(profile, _query_current, "Get current artwork"),
-    )
-    if err:
-        logger.warning("Could not get current artwork: %s", err)
-    else:
+    try:
+        result = _run_art_call(
+            profile,
+            lambda art: art.get_current(),
+            "Get current artwork",
+            priority="read",
+        )
         if isinstance(result, dict):
             current_artwork = result.get("content_id")
         elif isinstance(result, str):
             current_artwork = result
+    except TVOperationError as exc:
+        logger.warning("Could not get current artwork: %s", exc)
 
     return TVStatus(
         reachable=True,
@@ -434,18 +575,7 @@ def upload_image(
         upload_type, len(upload_bytes) / 1024, ft, effective_matte,
     )
 
-    art: SamsungTVArt | None = None
-
-    def _do_upload() -> str:
-        nonlocal art
-        # Close any leftover connection from a previous attempt so we
-        # don't pile up stale WebSocket clients on the TV.
-        if art is not None:
-            with contextlib.suppress(Exception):
-                art.close()
-
-        art = _connect_art(profile)
-
+    def _do_upload(art: SamsungTVArt) -> str:
         logger.debug(
             "Upload details: host=%s port=%d size=%d bytes file_type=%s "
             "matte=%s token_file=%s",
@@ -462,7 +592,12 @@ def upload_image(
         return content_id
 
     try:
-        content_id = _run_tv_op(profile, _do_upload, "Upload image", timeout_sec=60)
+        content_id = _run_art_call(
+            profile,
+            _do_upload,
+            "Upload image",
+            timeout_sec=60,
+        )
         logger.info("Uploaded image, content_id=%s", content_id)
         return UploadResult(content_id=content_id, success=True)
     except Exception as e:
@@ -483,58 +618,243 @@ def upload_image(
                 "  - Ensure the TV screen is on (not in standby)"
             )
         return UploadResult(content_id="", success=False, error=error_msg)
-    finally:
-        if art is not None:
-            with contextlib.suppress(Exception):
-                art.close()
 
 
 # --- Art management -----------------------------------------------------------
 
 
-def switch_art(profile: TVProfile, content_id: str) -> bool:
-    """Switch the displayed artwork on the Frame TV.
+def _run_art_call(
+    profile: TVProfile,
+    func,
+    description: str,
+    *,
+    timeout_sec: float = TV_OP_TIMEOUT,
+    priority: str = "mutation",
+):
+    """Run one art-service call with its own connection and deadline."""
 
-    Also attempts to put the TV into Art Mode if it isn't already.
-    """
+    state_lock = threading.Lock()
+    cancelled = threading.Event()
+    active_art: list[SamsungTVArt | None] = [None]
+    active_sockets: set[Any] = set()
 
-    def _do_switch() -> None:
+    def _abort_art(art: SamsungTVArt | None) -> None:
+        connection = getattr(art, "connection", None)
+        abort = getattr(connection, "abort", None)
+        if callable(abort):
+            with contextlib.suppress(Exception):
+                abort()
+
+    def _cancel() -> None:
+        cancelled.set()
+        with state_lock:
+            art = active_art[0]
+            sockets = list(active_sockets)
+        _abort_art(art)
+        for sock in sockets:
+            with contextlib.suppress(Exception):
+                sock.close()
+
+    def _call():
         art = None
         try:
+            if cancelled.is_set():
+                raise TVOperationTimeoutError(f"{description}: cancelled after timeout")
             art = _connect_art(profile)
 
-            # Try to enter art mode first
-            try:
-                art.set_artmode(True)
-            except Exception as e:
-                logger.warning("Could not set art mode (may already be on): %s", e)
+            # samsungtvws may move thumbnail bytes over a secondary D2D
+            # socket. Track it as well as the WebSocket so cancellation can
+            # wake either blocking receive path.
+            open_d2d = getattr(art, "_open_d2d_socket", None)
+            if callable(open_d2d):
+                def _open_tracked_socket(*args, **kwargs):
+                    sock = open_d2d(*args, **kwargs)
+                    with state_lock:
+                        if cancelled.is_set():
+                            with contextlib.suppress(Exception):
+                                sock.close()
+                            raise TVOperationTimeoutError(
+                                f"{description}: cancelled after timeout"
+                            )
+                        active_sockets.add(sock)
+                    return sock
 
-            art.select_image(content_id)
+                art._open_d2d_socket = _open_tracked_socket
+
+            with state_lock:
+                active_art[0] = art
+                should_abort = cancelled.is_set()
+            if should_abort:
+                _abort_art(art)
+                raise TVOperationTimeoutError(
+                    f"{description}: cancelled after timeout"
+                )
+            return func(art)
         finally:
-            with contextlib.suppress(Exception):
-                art.close()
+            with state_lock:
+                if active_art[0] is art:
+                    active_art[0] = None
+                active_sockets.clear()
+            if art is not None:
+                with contextlib.suppress(Exception):
+                    art.close()
+
+    return _run_tv_op(
+        profile,
+        _call,
+        description,
+        timeout_sec=timeout_sec,
+        priority=priority,
+        cancel=_cancel,
+    )
+
+
+def _art_mode_is_on(value: Any) -> bool:
+    """Normalize the bool/string states returned by different TV generations."""
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "on", "true", "yes"}
+    return bool(value)
+
+
+def _content_id_from_current(value: Any) -> str | None:
+    if isinstance(value, dict):
+        content_id = value.get("content_id")
+        return str(content_id) if content_id else None
+    if isinstance(value, str):
+        return value
+    return None
+
+
+def _get_current_artwork(
+    profile: TVProfile,
+    *,
+    timeout_sec: float = TV_OP_TIMEOUT,
+) -> str | None:
+    current = _run_art_call(
+        profile,
+        lambda art: art.get_current(),
+        "Get current artwork",
+        timeout_sec=timeout_sec,
+    )
+    return _content_id_from_current(current)
+
+
+def wait_for_art(
+    profile: TVProfile,
+    content_id: str,
+    *,
+    timeout_sec: float = ART_READINESS_TIMEOUT,
+) -> bool:
+    """Briefly wait for a newly uploaded content ID to appear in the TV library.
+
+    Readiness is advisory: callers should still attempt selection if the TV's
+    content-list operation is unavailable or exceeds this bounded deadline.
+    """
+    if timeout_sec <= 0:
+        return True
+
+    def _wait(art) -> bool:
+        deadline = time.monotonic() + timeout_sec
+        while True:
+            artworks = art.available()
+            if any(item.get("content_id") == content_id for item in artworks):
+                return True
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(ART_READINESS_POLL_INTERVAL, remaining))
 
     try:
-        _run_tv_op(profile, _do_switch, f"Switch art to {content_id}")
+        ready = bool(
+            _run_art_call(
+                profile,
+                _wait,
+                f"Wait for artwork {content_id}",
+                timeout_sec=timeout_sec,
+            )
+        )
+    except Exception as exc:
+        logger.warning("Could not confirm artwork readiness for %s: %s", content_id, exc)
+        return False
+
+    if not ready:
+        logger.warning("Artwork %s was not listed before the readiness deadline", content_id)
+    return ready
+
+
+def switch_art(
+    profile: TVProfile,
+    content_id: str,
+    *,
+    wait_for_ready: bool = False,
+    readiness_timeout_sec: float = ART_READINESS_TIMEOUT,
+) -> bool:
+    """Switch the displayed artwork on the Frame TV.
+
+    Art-mode detection, enabling Art Mode, and image selection each receive an
+    independent bounded deadline. If selection fails or times out, query the TV
+    once more and accept success when the requested content is already current.
+    """
+    if wait_for_ready:
+        wait_for_art(profile, content_id, timeout_sec=readiness_timeout_sec)
+
+    art_mode_on = False
+    try:
+        art_mode_on = _art_mode_is_on(
+            _run_art_call(profile, lambda art: art.get_artmode(), "Get art mode status")
+        )
+    except Exception as exc:
+        logger.warning("Could not get art mode status before switching: %s", exc)
+
+    if not art_mode_on:
+        try:
+            _run_art_call(profile, lambda art: art.set_artmode(True), "Enable art mode")
+        except Exception as exc:
+            # Some TVs report an error even when Art Mode is already active.
+            # Selection still gets its own connection and deadline below.
+            logger.warning("Could not enable art mode before switching: %s", exc)
+
+    try:
+        _run_art_call(
+            profile,
+            lambda art: art.select_image(content_id),
+            f"Switch art to {content_id}",
+        )
         logger.info("Switched display to content_id=%s", content_id)
         return True
-    except Exception as e:
-        logger.error("Failed to switch art: %s", e)
+    except Exception as exc:
+        logger.warning("Artwork selection did not complete for %s: %s", content_id, exc)
+
+    try:
+        current = _get_current_artwork(profile)
+    except Exception as exc:
+        logger.error("Failed to reconcile display state for %s: %s", content_id, exc)
         return False
+
+    if current == content_id:
+        logger.info(
+            "Selection response failed, but the TV confirms content_id=%s is displayed",
+            content_id,
+        )
+        return True
+
+    logger.error(
+        "Failed to switch art to %s; TV reports current artwork %s",
+        content_id,
+        current or "unknown",
+    )
+    return False
 
 
 def list_art(profile: TVProfile) -> list[dict[str, Any]]:
     """List all artworks available on the TV (raw, includes duplicates across categories)."""
-    def _do_list() -> list[dict[str, Any]]:
-        art = None
-        try:
-            art = _connect_art(profile)
-            return art.available()
-        finally:
-            with contextlib.suppress(Exception):
-                art.close()
-
-    return _run_tv_op(profile, _do_list, "List art")
+    return _run_art_call(
+        profile,
+        lambda art: art.available(),
+        "List art",
+        priority="read",
+    )
 
 
 def list_art_deduplicated(profile: TVProfile) -> list[dict[str, Any]]:
@@ -568,47 +888,108 @@ def get_art_thumbnail(profile: TVProfile, content_id: str) -> bytes | None:
 
     Returns ``None`` if the TV does not provide a thumbnail for the content.
     """
-    def _do_thumbnail() -> bytes | None:
-        art = None
-        try:
-            art = _connect_art(profile)
-            data = art.get_thumbnail(content_id)
-            if isinstance(data, (bytes, bytearray)):
-                return bytes(data)
-            return None
-        finally:
-            with contextlib.suppress(Exception):
-                art.close()
-
-    try:
-        return _run_tv_op(profile, _do_thumbnail, f"Fetch thumbnail for {content_id}")
-    except Exception as e:
-        logger.warning("Failed to fetch thumbnail for %s: %s", content_id, e)
+    def _do_thumbnail(art: SamsungTVArt) -> bytes | None:
+        data = art.get_thumbnail(content_id)
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data)
         return None
 
+    return _run_art_call(
+        profile,
+        _do_thumbnail,
+        f"Fetch thumbnail for {content_id}",
+        priority="read",
+    )
 
-def get_matte_list(profile: TVProfile) -> list[dict[str, Any]]:
+
+def get_art_thumbnails(
+    profile: TVProfile,
+    content_ids: list[str],
+) -> dict[str, bytes]:
+    """Fetch several thumbnails with the TV's single-request batch transport.
+
+    Older Frame models support ``get_thumbnail_list`` even when repeated
+    ``get_thumbnail`` calls stall. Besides being a compatibility path, this
+    keeps a cold gallery to one bounded TV operation instead of one operation
+    per artwork.
+    """
+    requested = list(dict.fromkeys(content_ids))
+    if not requested:
+        return {}
+
+    requested_set = set(requested)
+
+    def _do_thumbnails(art: SamsungTVArt) -> dict[str, bytes]:
+        raw = art.get_thumbnail_list(requested)
+        if not isinstance(raw, dict):
+            return {}
+
+        thumbnails: dict[str, bytes] = {}
+        for filename, data in raw.items():
+            if not isinstance(data, (bytes, bytearray)):
+                continue
+            raw_name = str(filename)
+            content_id = raw_name if raw_name in requested_set else Path(raw_name).stem
+            if content_id in requested_set:
+                thumbnails[content_id] = bytes(data)
+        return thumbnails
+
+    return _run_art_call(
+        profile,
+        _do_thumbnails,
+        f"Fetch {len(requested)} thumbnails",
+        priority="read",
+    )
+
+
+def _normalize_matte_types(value: Any) -> list[dict[str, str]]:
+    """Normalize matte entries returned by different Samsung API generations."""
+    if not isinstance(value, list):
+        return []
+
+    normalized: list[dict[str, str]] = []
+    seen: set[str] = set()
+    keys = ("matte_id", "matte_type", "matteId", "matteType")
+    for entry in value:
+        candidate: Any = entry
+        if isinstance(entry, dict):
+            candidate = next(
+                (
+                    entry[key]
+                    for key in keys
+                    if isinstance(entry.get(key), str) and entry[key].strip()
+                ),
+                None,
+            )
+        if not isinstance(candidate, str):
+            continue
+        matte_id = candidate.strip()
+        if not matte_id or len(matte_id) > 100 or matte_id in seen:
+            continue
+        seen.add(matte_id)
+        normalized.append({"matte_id": matte_id})
+    return normalized
+
+
+def get_matte_list(profile: TVProfile) -> list[dict[str, str]]:
     """Query the TV for its supported matte types.
 
-    Returns a list of dicts, each with at least a ``matte_id`` key.
+    Returns a list of dicts with a stable string ``matte_id`` key.
     The samsungtvws v3.x library handles both ``matte_type_list`` (modern)
-    and ``matte_list`` (API 0.97) response keys internally.
+    and ``matte_list`` (API 0.97) response keys internally, but individual
+    entries vary between ``matte_type`` and ``matte_id`` across versions.
     """
-    def _do_get_mattes():
-        art = None
-        try:
-            art = _connect_art(profile)
-            return art.get_matte_list()
-        finally:
-            with contextlib.suppress(Exception):
-                art.close()
-
-    result = _run_tv_op(profile, _do_get_mattes, "Get matte list")
+    result = _run_art_call(
+        profile,
+        lambda art: art.get_matte_list(),
+        "Get matte list",
+        priority="read",
+    )
     # v3.x returns {"matte_types": [...], "matte_colors": [...]}
     if isinstance(result, dict):
-        return result.get("matte_types", [])
+        return _normalize_matte_types(result.get("matte_types", []))
     # Fallback for unexpected return types
-    return result
+    return _normalize_matte_types(result)
 
 
 def delete_art(profile: TVProfile, content_ids: list[str]) -> bool:

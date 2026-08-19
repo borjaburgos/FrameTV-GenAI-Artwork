@@ -11,10 +11,11 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from fastapi import Request
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from frameart.api import app
+from frameart.api import _request_client_ip, _trusted_lan_identity, app
 
 client = TestClient(app)
 
@@ -34,6 +35,9 @@ class FakePipelineResult:
     metadata: dict[str, Any] = field(default_factory=dict)
     timings: dict[str, float] = field(default_factory=lambda: {"generation_ms": 5000.0})
     error: str | None = None
+    error_code: str | None = None
+    generation_succeeded: bool = True
+    delivery_status: str = "displayed"
 
 
 def _fake_result(**overrides) -> FakePipelineResult:
@@ -43,6 +47,14 @@ def _fake_result(**overrides) -> FakePipelineResult:
 def _jpeg_bytes() -> bytes:
     output = BytesIO()
     Image.new("RGB", (4, 4), "blue").save(output, format="JPEG")
+    return output.getvalue()
+
+
+def _mpo_bytes() -> bytes:
+    output = BytesIO()
+    primary = Image.new("RGB", (4, 4), "red")
+    secondary = Image.new("RGB", (4, 4), "blue")
+    primary.save(output, format="MPO", save_all=True, append_images=[secondary])
     return output.getvalue()
 
 
@@ -146,10 +158,11 @@ class TestDiagnosticsAndBackups:
 
 
 class TestAuthentication:
-    def test_admin_token_creates_browser_session(self, monkeypatch):
+    def test_admin_token_creates_browser_session(self, monkeypatch, tmp_path):
         token = "admin-token-with-at-least-twenty-characters"
         monkeypatch.setenv("FRAMEART_AUTH_ENABLED", "true")
         monkeypatch.setenv("FRAMEART_ADMIN_TOKEN", token)
+        monkeypatch.setenv("FRAMEART_DATA_DIR", str(tmp_path))
 
         with TestClient(app) as secured_client:
             assert secured_client.get("/health").status_code == 200
@@ -159,7 +172,120 @@ class TestAuthentication:
             login = secured_client.post("/auth/session", json={"token": token})
             assert login.status_code == 200
             assert login.json()["scopes"] == ["admin", "control", "read"]
+            assert login.json()["device_id"]
+            assert secured_client.cookies.get("frameart_device")
             assert secured_client.get("/styles").status_code == 200
+
+            secured_client.cookies.delete("frameart_session")
+            assert secured_client.get("/styles").status_code == 200
+            access = secured_client.get("/auth/access").json()
+            assert access["method"] == "paired_device"
+            assert access["devices"][0]["name"] == "Browser device"
+            assert access["devices"][0]["current"] is True
+
+    def test_pairing_link_creates_and_revokes_a_device(self, monkeypatch, tmp_path):
+        token = "admin-token-with-at-least-twenty-characters"
+        monkeypatch.setenv("FRAMEART_AUTH_ENABLED", "true")
+        monkeypatch.setenv("FRAMEART_ADMIN_TOKEN", token)
+        monkeypatch.setenv("FRAMEART_DATA_DIR", str(tmp_path))
+        admin_headers = {"Authorization": f"Bearer {token}"}
+
+        with TestClient(app) as admin_client, TestClient(app) as new_device:
+            pairing_response = admin_client.post("/auth/pairings", headers=admin_headers)
+            assert pairing_response.status_code == 201
+            pairing = pairing_response.json()
+            assert pairing["pairing_url"].endswith(f"?pair={pairing['code']}")
+            assert pairing["qr_data_url"].startswith("data:image/png;base64,")
+
+            paired = new_device.post(
+                "/auth/pair",
+                json={"code": pairing["code"], "device_name": "Hallway display"},
+            )
+            assert paired.status_code == 200
+            device_id = paired.json()["device_id"]
+            assert new_device.get("/styles").status_code == 200
+
+            replay = admin_client.post(
+                "/auth/pair",
+                json={"code": pairing["code"], "device_name": "Replay"},
+            )
+            assert replay.status_code == 400
+
+            devices = admin_client.get("/auth/access", headers=admin_headers).json()["devices"]
+            assert any(device["name"] == "Hallway display" for device in devices)
+            revoked = admin_client.delete(f"/auth/devices/{device_id}", headers=admin_headers)
+            assert revoked.status_code == 200
+            assert new_device.get("/styles").status_code == 401
+
+    def test_tailscale_identity_can_replace_token_prompt(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("FRAMEART_AUTH_ENABLED", "true")
+        monkeypatch.setenv("FRAMEART_ADMIN_TOKEN", "admin-token-with-twenty-characters")
+        monkeypatch.setenv("FRAMEART_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("FRAMEART_TAILSCALE_AUTH_ENABLED", "true")
+        monkeypatch.setenv("FRAMEART_TAILSCALE_ALLOWED_USERS", '["owner@example.com"]')
+
+        with TestClient(app) as secured_client:
+            allowed = secured_client.get(
+                "/auth/status",
+                headers={"Tailscale-User-Login": "owner@example.com"},
+            )
+            assert allowed.status_code == 200
+            assert allowed.json()["method"] == "tailscale"
+            assert allowed.json()["identity"] == "owner@example.com"
+
+            denied = secured_client.get(
+                "/styles",
+                headers={"Tailscale-User-Login": "someone-else@example.com"},
+            )
+            assert denied.status_code == 401
+
+            cross_origin = secured_client.post(
+                "/jobs/delete",
+                json={"job_ids": ["job-1"]},
+                headers={
+                    "Tailscale-User-Login": "owner@example.com",
+                    "Origin": "https://attacker.example",
+                },
+            )
+            assert cross_origin.status_code == 403
+            assert cross_origin.json()["detail"] == "Origin check failed."
+
+    def test_trusted_lan_cidr_can_replace_token_prompt(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("FRAMEART_AUTH_ENABLED", "true")
+        monkeypatch.setenv("FRAMEART_ADMIN_TOKEN", "admin-token-with-twenty-characters")
+        monkeypatch.setenv("FRAMEART_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("FRAMEART_TRUSTED_LAN_CIDRS", '["192.168.50.0/24"]')
+
+        with TestClient(app, client=("192.168.50.25", 54321)) as lan_client:
+            status = lan_client.get("/auth/status")
+            assert status.status_code == 200
+            assert status.json()["method"] == "trusted_lan"
+            assert status.json()["identity"] == "192.168.50.25"
+
+    def test_trusted_lan_uses_forwarded_ip_only_from_loopback_proxy(self):
+        settings = MagicMock(trusted_lan_cidrs=["192.168.50.0/24"])
+
+        def request_from(client_ip: str) -> Request:
+            return Request(
+                {
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/auth/status",
+                    "headers": [(b"x-forwarded-for", b"192.168.50.25")],
+                    "client": (client_ip, 54321),
+                    "server": ("frameart.home.arpa", 443),
+                    "scheme": "https",
+                    "query_string": b"",
+                }
+            )
+
+        proxied = request_from("127.0.0.1")
+        assert _request_client_ip(proxied) == "192.168.50.25"
+        assert _trusted_lan_identity(settings, proxied) == "192.168.50.25"
+
+        direct = request_from("203.0.113.10")
+        assert _request_client_ip(direct) == "203.0.113.10"
+        assert _trusted_lan_identity(settings, direct) is None
 
     def test_automation_token_cannot_use_admin_scope(self, monkeypatch):
         token = "automation-token-with-twenty-characters"
@@ -204,6 +330,16 @@ class TestServerSecurity:
 
         monkeypatch.setenv("FRAMEART_AUTH_ENABLED", "false")
         with pytest.raises(RuntimeError, match="non-loopback"):
+            run_server(host="0.0.0.0", port=8123)
+        mock_run.assert_not_called()
+
+    @patch("uvicorn.run")
+    def test_tailscale_headers_require_loopback_bind(self, mock_run, monkeypatch):
+        from frameart.api import run_server
+
+        monkeypatch.setenv("FRAMEART_AUTH_ENABLED", "true")
+        monkeypatch.setenv("FRAMEART_TAILSCALE_AUTH_ENABLED", "true")
+        with pytest.raises(RuntimeError, match="loopback bind"):
             run_server(host="0.0.0.0", port=8123)
         mock_run.assert_not_called()
 
@@ -567,6 +703,47 @@ class TestGenerateAndApply:
         assert resp.status_code == 200
         assert mock_run.call_args.kwargs["matte"] == "none"
 
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_generate_and_apply")
+    def test_unreachable_tv_returns_structured_503(self, mock_run, mock_settings):
+        mock_settings.return_value = MagicMock()
+        mock_run.return_value = _fake_result(
+            final_path=None,
+            error="TV is unreachable. Choose Generate Anyway.",
+            error_code="tv_unreachable",
+            generation_succeeded=False,
+            delivery_status="not_attempted",
+        )
+
+        response = client.post(
+            "/generate-and-apply",
+            json={"prompt": "flowers", "tv_ip": "192.168.1.100"},
+        )
+
+        assert response.status_code == 503
+        detail = response.json()["detail"]
+        assert detail["error_code"] == "tv_unreachable"
+        assert detail["generation_succeeded"] is False
+        assert detail["delivery_status"] == "not_attempted"
+
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_generate_and_apply")
+    def test_generate_anyway_skips_upload(self, mock_run, mock_settings):
+        mock_settings.return_value = MagicMock()
+        mock_run.return_value = _fake_result(delivery_status="skipped")
+
+        response = client.post(
+            "/generate-and-apply",
+            json={
+                "prompt": "flowers",
+                "tv_ip": "192.168.1.100",
+                "generate_anyway": True,
+            },
+        )
+
+        assert response.status_code == 200
+        assert mock_run.call_args.kwargs["no_upload"] is True
+
     def test_rejects_public_tv_ip(self):
         resp = client.post(
             "/generate-and-apply",
@@ -612,6 +789,42 @@ class TestUploadAndApply:
         assert data["content_id"] == "MY_ART_001"
         mock_run.assert_called_once()
         assert mock_run.call_args.kwargs["tv_ip"] == "192.168.1.50"
+
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_import_and_apply")
+    def test_accepts_mpo_with_uppercase_jpg_extension(self, mock_run, mock_settings, tmp_path):
+        settings = MagicMock()
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        inspected_upload: dict[str, object] = {}
+
+        def inspect_upload(_settings, image_path, **_kwargs):
+            inspected_upload["suffix"] = Path(image_path).suffix
+            with Image.open(image_path) as uploaded:
+                inspected_upload["format"] = uploaded.format
+                inspected_upload["frames"] = getattr(uploaded, "n_frames", 1)
+            return _fake_result()
+
+        mock_run.side_effect = inspect_upload
+
+        resp = client.post(
+            "/upload-and-apply",
+            data={"tv_ip": "192.168.1.50", "matte": "none"},
+            files={"image": ("sample.JPG", _mpo_bytes(), "image/jpeg")},
+        )
+
+        assert resp.status_code == 200
+        assert inspected_upload == {"suffix": ".jpg", "format": "JPEG", "frames": 1}
+
+    def test_rejects_mpo_with_png_content_type(self):
+        resp = client.post(
+            "/upload-and-apply",
+            data={"tv_ip": "192.168.1.50"},
+            files={"image": ("sample.JPG", _mpo_bytes(), "image/png")},
+        )
+
+        assert resp.status_code == 400
+        assert "Content type does not match image data" in resp.json()["detail"]
 
     @patch("frameart.api._settings")
     def test_rejects_unsupported_file_extension(self, mock_settings, tmp_path):
@@ -1105,8 +1318,10 @@ class TestManagedTVs:
                 "client_name": "FrameArt Living Room",
                 "ssl": True,
                 "token_configured": False,
+                "conflicts_with": [],
             }
         ]
+        assert created.json()["warnings"] == []
 
         updated = client.put(
             "/settings/tvs/living_room",
@@ -1123,7 +1338,104 @@ class TestManagedTVs:
 
         deleted = client.delete("/settings/tvs/living_room")
         assert deleted.status_code == 200
-        assert deleted.json() == {"tvs": []}
+        assert deleted.json() == {"tvs": [], "warnings": []}
+
+    def test_rejects_physical_and_normalized_profile_duplicates(self, managed_config_env):
+        created = client.post(
+            "/settings/tvs",
+            json={"profile_id": "Master_Bedroom", "ip": "192.168.50.25"},
+        )
+        assert created.status_code == 201
+
+        same_tv = client.post(
+            "/settings/tvs",
+            json={"profile_id": "bedroom", "ip": "192.168.50.25"},
+        )
+        assert same_tv.status_code == 409
+        assert same_tv.json()["detail"] == {
+            "code": "tv_profile_conflict",
+            "message": "This TV is already configured as 'Master_Bedroom'.",
+            "existing_profile_id": "Master_Bedroom",
+            "reasons": ["physical_tv"],
+        }
+
+        normalized_name = client.post(
+            "/settings/tvs",
+            json={"profile_id": "master-bedroom", "ip": "192.168.50.26"},
+        )
+        assert normalized_name.status_code == 409
+        assert normalized_name.json()["detail"]["reasons"] == ["profile_id"]
+
+    def test_explicit_update_can_rename_profile_and_automation_reference(
+        self,
+        managed_config_env,
+    ):
+        from frameart.automation import AutomationStore
+
+        client.post(
+            "/settings/tvs",
+            json={"profile_id": "living_room", "ip": "192.168.50.25"},
+        )
+        store = AutomationStore(managed_config_env)
+        group = store.create_group("Main", ["living_room"])
+
+        updated = client.put(
+            "/settings/tvs/living_room",
+            json={
+                "profile_id": "Living-Room",
+                "ip": "192.168.50.25",
+                "client_name": "FrameArt",
+            },
+        )
+
+        assert updated.status_code == 200
+        assert [tv["profile_id"] for tv in updated.json()["tvs"]] == ["Living-Room"]
+        assert store.get_group(group["id"])["tv_profile_ids"] == ["Living-Room"]
+
+    def test_existing_duplicates_are_warned_and_consolidated_without_deleting_token(
+        self,
+        managed_config_env,
+    ):
+        from frameart.automation import AutomationStore
+        from frameart.settings_store import update_management_state
+
+        token_path = managed_config_env / "secrets" / "192_168_50_25.token"
+        token_path.parent.mkdir()
+        token_path.write_text("pairing-token")
+
+        def seed_duplicates(managed, _keys):
+            managed["tvs"] = {
+                "Master_Bedroom": {
+                    "ip": "192.168.50.25",
+                    "token_file": str(token_path),
+                },
+                "master-bedroom": {
+                    "ip": "192.168.50.25",
+                    "token_file": str(token_path),
+                },
+            }
+
+        update_management_state(managed_config_env, seed_duplicates)
+        store = AutomationStore(managed_config_env)
+        group = store.create_group(
+            "Bedrooms",
+            ["Master_Bedroom", "master-bedroom"],
+        )
+
+        listed = client.get("/settings/tvs")
+        assert listed.status_code == 200
+        assert listed.json()["warnings"]
+        assert listed.json()["tvs"][0]["conflicts_with"] == ["master-bedroom"]
+
+        consolidated = client.post("/settings/tvs/Master_Bedroom/consolidate")
+
+        assert consolidated.status_code == 200
+        assert [tv["profile_id"] for tv in consolidated.json()["tvs"]] == [
+            "Master_Bedroom"
+        ]
+        assert consolidated.json()["warnings"] == []
+        assert token_path.read_text() == "pairing-token"
+        assert store.get_group(group["id"])["tv_profile_ids"] == ["Master_Bedroom"]
 
     def test_rejects_public_tv_ip(self, managed_config_env):
         resp = client.post(
@@ -1170,9 +1482,10 @@ class TestManagedTVs:
 class TestTVListArt:
     @patch("frameart.api._settings")
     @patch("frameart.tv.controller.list_art_deduplicated")
-    def test_returns_deduplicated_list(self, mock_list, mock_settings):
+    def test_returns_deduplicated_list(self, mock_list, mock_settings, tmp_path):
         settings = MagicMock()
         settings.tvs = {}
+        settings.data_dir = tmp_path
         mock_settings.return_value = settings
 
         mock_list.return_value = [
@@ -1187,6 +1500,31 @@ class TestTVListArt:
         assert data[0]["content_id"] == "MY_F0001"
         assert data[0]["is_favourite"] is True
         assert data[1]["is_favourite"] is False
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.list_art_deduplicated")
+    def test_returns_local_job_preview_when_content_id_matches(
+        self,
+        mock_list,
+        mock_settings,
+        tmp_path,
+    ):
+        job_dir = tmp_path / "artifacts" / "2026" / "01" / "01" / "local-job"
+        job_dir.mkdir(parents=True)
+        (job_dir / "final.png").write_bytes(b"local")
+        (job_dir / "meta.json").write_text(
+            '{"job_id":"local-job","content_id":"MY_F0001"}'
+        )
+        settings = MagicMock()
+        settings.tvs = {}
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        mock_list.return_value = [{"content_id": "MY_F0001", "is_favourite": False}]
+
+        resp = client.get("/tv/art?tv_ip=192.168.1.100")
+
+        assert resp.status_code == 200
+        assert resp.json()[0]["local_job_id"] == "local-job"
 
     @patch("frameart.api._settings")
     def test_no_tv_returns_400(self, mock_settings):
@@ -1217,27 +1555,137 @@ class TestTVListArt:
 class TestTVArtThumbnail:
     @patch("frameart.api._settings")
     @patch("frameart.tv.controller.get_art_thumbnail")
-    def test_returns_thumbnail_bytes(self, mock_thumb, mock_settings):
+    def test_returns_thumbnail_bytes(self, mock_thumb, mock_settings, tmp_path):
         settings = MagicMock()
         settings.tvs = {}
+        settings.data_dir = tmp_path
         mock_settings.return_value = settings
         mock_thumb.return_value = b"\xff\xd8\xff\xd9"
 
         resp = client.get("/tv/art/thumbnail?tv_ip=192.168.1.100&content_id=MY_F0001")
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "image/jpeg"
+        assert resp.headers["x-frameart-cache"] == "miss"
         assert resp.content == b"\xff\xd8\xff\xd9"
+
+        second = client.get(
+            "/tv/art/thumbnail?tv_ip=192.168.1.100&content_id=MY_F0001"
+        )
+        assert second.status_code == 200
+        assert second.headers["x-frameart-cache"] == "hit"
+        mock_thumb.assert_called_once()
 
     @patch("frameart.api._settings")
     @patch("frameart.tv.controller.get_art_thumbnail")
-    def test_returns_404_when_unavailable(self, mock_thumb, mock_settings):
+    def test_returns_404_when_unavailable(self, mock_thumb, mock_settings, tmp_path):
         settings = MagicMock()
         settings.tvs = {}
+        settings.data_dir = tmp_path
         mock_settings.return_value = settings
         mock_thumb.return_value = None
 
         resp = client.get("/tv/art/thumbnail?tv_ip=192.168.1.100&content_id=MY_F0001")
         assert resp.status_code == 404
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.get_art_thumbnail")
+    def test_transport_timeout_returns_504(self, mock_thumb, mock_settings, tmp_path):
+        from frameart.tv.controller import TVOperationTimeoutError
+
+        settings = MagicMock()
+        settings.tvs = {}
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        mock_thumb.side_effect = TVOperationTimeoutError("timed out")
+
+        resp = client.get("/tv/art/thumbnail?tv_ip=192.168.1.100&content_id=MY_F0001")
+
+        assert resp.status_code == 504
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.get_art_thumbnail")
+    def test_refresh_serves_stale_thumbnail_on_failure(
+        self,
+        mock_thumb,
+        mock_settings,
+        tmp_path,
+    ):
+        from frameart.tv.controller import TVOperationTimeoutError
+
+        settings = MagicMock()
+        settings.tvs = {}
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        mock_thumb.return_value = b"cached-jpeg"
+        url = "/tv/art/thumbnail?tv_ip=192.168.1.100&content_id=MY_F0001"
+        assert client.get(url).status_code == 200
+
+        mock_thumb.side_effect = TVOperationTimeoutError("timed out")
+        resp = client.get(url + "&refresh=true")
+
+        assert resp.status_code == 200
+        assert resp.content == b"cached-jpeg"
+        assert resp.headers["x-frameart-cache"] == "stale"
+
+
+# ---------------------------------------------------------------------------
+# POST /tv/art/thumbnails/warm
+# ---------------------------------------------------------------------------
+
+class TestTVArtThumbnailWarm:
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.get_art_thumbnails")
+    def test_batch_warms_cache_for_individual_image_requests(
+        self,
+        mock_thumbnails,
+        mock_settings,
+        tmp_path,
+    ):
+        settings = MagicMock()
+        settings.tvs = {}
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        mock_thumbnails.return_value = {
+            "MY_F0001": b"first-jpeg",
+            "MY_F0002": b"second-jpeg",
+        }
+
+        resp = client.post(
+            "/tv/art/thumbnails/warm",
+            json={
+                "tv_ip": "192.168.1.100",
+                "content_ids": ["MY_F0001", "MY_F0002", "MY_F0003"],
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "cached": [],
+            "warmed": ["MY_F0001", "MY_F0002"],
+            "missing": ["MY_F0003"],
+        }
+        assert client.get(
+            "/tv/art/thumbnail?tv_ip=192.168.1.100&content_id=MY_F0001"
+        ).content == b"first-jpeg"
+        mock_thumbnails.assert_called_once()
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.get_art_thumbnails")
+    def test_batch_timeout_returns_504(self, mock_thumbnails, mock_settings, tmp_path):
+        from frameart.tv.controller import TVOperationTimeoutError
+
+        settings = MagicMock()
+        settings.tvs = {}
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        mock_thumbnails.side_effect = TVOperationTimeoutError("timed out")
+
+        resp = client.post(
+            "/tv/art/thumbnails/warm",
+            json={"tv_ip": "192.168.1.100", "content_ids": ["MY_F0001"]},
+        )
+
+        assert resp.status_code == 504
 
 
 # ---------------------------------------------------------------------------
@@ -1248,9 +1696,16 @@ class TestTVDeleteArt:
     @patch("frameart.api._settings")
     @patch("frameart.tv.controller.delete_art")
     @patch("frameart.tv.controller.list_art_deduplicated")
-    def test_skips_favorites_by_default(self, mock_list, mock_delete, mock_settings):
+    def test_skips_favorites_by_default(
+        self,
+        mock_list,
+        mock_delete,
+        mock_settings,
+        tmp_path,
+    ):
         settings = MagicMock()
         settings.tvs = {}
+        settings.data_dir = tmp_path
         mock_settings.return_value = settings
 
         mock_list.return_value = [
@@ -1272,9 +1727,16 @@ class TestTVDeleteArt:
     @patch("frameart.api._settings")
     @patch("frameart.tv.controller.delete_art")
     @patch("frameart.tv.controller.list_art_deduplicated")
-    def test_include_favorites(self, mock_list, mock_delete, mock_settings):
+    def test_include_favorites(
+        self,
+        mock_list,
+        mock_delete,
+        mock_settings,
+        tmp_path,
+    ):
         settings = MagicMock()
         settings.tvs = {}
+        settings.data_dir = tmp_path
         mock_settings.return_value = settings
 
         mock_list.return_value = [
@@ -1345,6 +1807,36 @@ class TestTVDeleteArt:
             "content_ids": ["MY_F0001"],
         })
         assert resp.status_code == 400
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.delete_art", return_value=True)
+    def test_success_invalidates_cached_thumbnail(
+        self,
+        mock_delete,
+        mock_settings,
+        tmp_path,
+    ):
+        from frameart.tv.cache import TVCacheStore
+
+        settings = MagicMock()
+        settings.tvs = {}
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        cache = TVCacheStore(tmp_path)
+        cache.set_thumbnail("192.168.1.100:8002", "MY_F0001", b"cached")
+
+        resp = client.post(
+            "/tv/art/delete",
+            json={
+                "content_ids": ["MY_F0001"],
+                "tv_ip": "192.168.1.100",
+                "include_favorites": True,
+            },
+        )
+
+        assert resp.status_code == 200
+        assert cache.get_thumbnail("192.168.1.100:8002", "MY_F0001") is None
+        mock_delete.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1455,9 +1947,10 @@ class TestTVDisplayArt:
 class TestTVMattes:
     @patch("frameart.api._settings")
     @patch("frameart.tv.controller.get_matte_list")
-    def test_returns_mattes(self, mock_mattes, mock_settings):
+    def test_returns_mattes(self, mock_mattes, mock_settings, tmp_path):
         settings = MagicMock()
         settings.tvs = {}
+        settings.data_dir = tmp_path
         mock_settings.return_value = settings
         mock_mattes.return_value = [
             {"matte_id": "shadowbox_polar"},
@@ -1469,6 +1962,12 @@ class TestTVMattes:
         data = resp.json()
         assert len(data) == 2
         assert data[0]["matte_id"] == "shadowbox_polar"
+        assert resp.headers["x-frameart-cache"] == "miss"
+
+        second = client.get("/tv/mattes?tv_ip=192.168.1.100")
+        assert second.status_code == 200
+        assert second.headers["x-frameart-cache"] == "hit"
+        mock_mattes.assert_called_once()
 
     @patch("frameart.api._settings")
     def test_no_tv_returns_400(self, mock_settings):
@@ -1481,15 +1980,106 @@ class TestTVMattes:
 
     @patch("frameart.api._settings")
     @patch("frameart.tv.controller.get_matte_list")
-    def test_upstream_failure_returns_502(self, mock_mattes, mock_settings):
+    def test_upstream_failure_returns_502(self, mock_mattes, mock_settings, tmp_path):
         settings = MagicMock()
         settings.tvs = {}
+        settings.data_dir = tmp_path
         mock_settings.return_value = settings
         mock_mattes.side_effect = TimeoutError("timed out")
 
         resp = client.get("/tv/mattes?tv_ip=192.168.1.100")
         assert resp.status_code == 502
         assert "TV matte list failed" in resp.json()["detail"]
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.get_matte_list")
+    def test_refresh_replaces_cache_and_stale_fallback_survives_timeout(
+        self,
+        mock_mattes,
+        mock_settings,
+        tmp_path,
+    ):
+        settings = MagicMock()
+        settings.tvs = {}
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        url = "/tv/mattes?tv_ip=192.168.1.100"
+        mock_mattes.return_value = [{"matte_id": "first"}]
+        assert client.get(url).json()[0]["matte_id"] == "first"
+
+        mock_mattes.return_value = [{"matte_id": "second"}]
+        refreshed = client.get(url + "&refresh=true")
+        assert refreshed.json()[0]["matte_id"] == "second"
+        assert refreshed.headers["x-frameart-cache"] == "miss"
+
+        mock_mattes.side_effect = TimeoutError("timed out")
+        stale = client.get(url + "&refresh=true")
+        assert stale.status_code == 200
+        assert stale.json()[0]["matte_id"] == "second"
+        assert stale.headers["x-frameart-cache"] == "stale"
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.get_matte_list")
+    def test_empty_matte_response_is_not_cached(
+        self,
+        mock_mattes,
+        mock_settings,
+        tmp_path,
+    ):
+        settings = MagicMock()
+        settings.tvs = {}
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        mock_mattes.return_value = []
+
+        first = client.get("/tv/mattes?tv_ip=192.168.1.100")
+        second = client.get("/tv/mattes?tv_ip=192.168.1.100")
+
+        assert first.status_code == 502
+        assert second.status_code == 502
+        assert mock_mattes.call_count == 2
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.get_matte_list")
+    def test_cache_keys_do_not_mix_tvs(self, mock_mattes, mock_settings, tmp_path):
+        settings = MagicMock()
+        settings.tvs = {}
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        mock_mattes.side_effect = [
+            [{"matte_id": "tv-one"}],
+            [{"matte_id": "tv-two"}],
+        ]
+
+        first = client.get("/tv/mattes?tv_ip=192.168.1.100")
+        second = client.get("/tv/mattes?tv_ip=192.168.1.101")
+
+        assert first.json()[0]["matte_id"] == "tv-one"
+        assert second.json()[0]["matte_id"] == "tv-two"
+        assert mock_mattes.call_count == 2
+
+    @patch("frameart.api._settings")
+    @patch("frameart.tv.controller.get_matte_list")
+    def test_explicit_invalidate_forces_next_refresh(
+        self,
+        mock_mattes,
+        mock_settings,
+        tmp_path,
+    ):
+        settings = MagicMock()
+        settings.tvs = {}
+        settings.data_dir = tmp_path
+        mock_settings.return_value = settings
+        mock_mattes.side_effect = [
+            [{"matte_id": "first"}],
+            [{"matte_id": "second"}],
+        ]
+        url = "/tv/mattes?tv_ip=192.168.1.100"
+
+        assert client.get(url).json()[0]["matte_id"] == "first"
+        invalidated = client.delete("/tv/mattes/cache?tv_ip=192.168.1.100")
+        assert invalidated.status_code == 200
+        assert client.get(url).json()[0]["matte_id"] == "second"
 
 
 # ---------------------------------------------------------------------------
@@ -1686,9 +2276,13 @@ class TestCatalogApply:
 # ---------------------------------------------------------------------------
 
 class TestJobApply:
+    @patch(
+        "frameart.api.preflight_tv",
+        return_value=MagicMock(reachable=True, art_mode_supported=True),
+    )
     @patch("frameart.api._settings")
     @patch("frameart.pipeline.run_apply")
-    def test_success(self, mock_run, mock_settings):
+    def test_success(self, mock_run, mock_settings, mock_preflight):
         import tempfile
 
         settings = MagicMock()
@@ -1707,7 +2301,13 @@ class TestJobApply:
             )
             assert resp.status_code == 200
             assert resp.json()["content_id"] == "MY_ART_001"
+            mock_preflight.assert_called_once()
+            assert mock_run.call_args.kwargs["skip_preflight"] is True
 
+    @patch(
+        "frameart.api.preflight_tv",
+        return_value=MagicMock(reachable=True, art_mode_supported=True),
+    )
     @patch("frameart.api._settings")
     @patch("frameart.pipeline.run_apply")
     @patch("frameart.tv.controller.switch_art")
@@ -1718,6 +2318,7 @@ class TestJobApply:
         mock_switch_art,
         mock_run_apply,
         mock_settings,
+        mock_preflight,
     ):
         import tempfile
 
@@ -1745,10 +2346,20 @@ class TestJobApply:
             assert data["tv_switched"] is True
             assert data["metadata"]["reused_existing_content"] is True
             mock_run_apply.assert_not_called()
+            mock_preflight.assert_called_once()
 
+    @patch(
+        "frameart.api.preflight_tv",
+        return_value=MagicMock(reachable=True, art_mode_supported=True),
+    )
     @patch("frameart.api._settings")
     @patch("frameart.pipeline.run_apply")
-    def test_persists_content_id_after_apply(self, mock_run, mock_settings):
+    def test_persists_content_id_after_apply(
+        self,
+        mock_run,
+        mock_settings,
+        mock_preflight,
+    ):
         import json
         import tempfile
 
@@ -1774,6 +2385,44 @@ class TestJobApply:
             persisted = json.loads((job_dir / "meta.json").read_text())
             assert persisted["content_id"] == "MY_F9000"
             assert persisted["tv_content_ids"]["192.168.1.100"] == "MY_F9000"
+            mock_preflight.assert_called_once()
+
+    @patch("frameart.api.preflight_tv")
+    @patch("frameart.tv.controller.list_art_deduplicated")
+    @patch("frameart.pipeline.run_apply")
+    @patch("frameart.api._settings")
+    def test_offline_tv_fails_before_dedupe_or_upload(
+        self,
+        mock_settings,
+        mock_run_apply,
+        mock_list_art,
+        mock_preflight,
+        tmp_path,
+    ):
+        job_dir = tmp_path / "artifacts" / "2025" / "01" / "01" / "test-job"
+        job_dir.mkdir(parents=True)
+        final_path = job_dir / "final.png"
+        final_path.write_bytes(b"saved")
+        settings = MagicMock(data_dir=tmp_path, tvs={})
+        mock_settings.return_value = settings
+        mock_preflight.return_value = MagicMock(
+            reachable=False,
+            art_mode_supported=False,
+            error="timed out",
+        )
+
+        response = client.post(
+            "/jobs/test-job/apply",
+            json={"tv_ip": "192.168.1.100"},
+        )
+
+        assert response.status_code == 503
+        detail = response.json()["detail"]
+        assert detail["error_code"] == "tv_unreachable"
+        assert detail["generation_succeeded"] is True
+        assert detail["final_path"] == str(final_path)
+        mock_list_art.assert_not_called()
+        mock_run_apply.assert_not_called()
 
     @patch("frameart.api._settings")
     def test_not_found(self, mock_settings):
@@ -1905,6 +2554,35 @@ class TestAsyncGenerateAndApply:
         assert request_summary["provider"] == "openai"
         assert request_summary["model"] == "gpt-image-1"
         assert request_summary["tv_ip"] == "10.0.0.1"
+
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_generate_and_apply")
+    def test_generate_anyway_is_persisted_in_request_summary(
+        self,
+        mock_run,
+        mock_settings,
+    ):
+        mock_settings.return_value = MagicMock()
+        mock_run.return_value = _fake_result(delivery_status="skipped")
+
+        response = client.post(
+            "/async/generate-and-apply",
+            json={
+                "prompt": "mountains",
+                "tv_ip": "10.0.0.1",
+                "generate_anyway": True,
+            },
+        )
+        job_id = response.json()["job_id"]
+        for _ in range(50):
+            status_response = client.get(f"/jobs/{job_id}/status")
+            if status_response.json()["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.05)
+
+        payload = status_response.json()
+        assert payload["request"]["generate_anyway"] is True
+        assert mock_run.call_args.kwargs["no_upload"] is True
 
 
 class TestAsyncApply:
@@ -2276,8 +2954,12 @@ class TestWebUI:
         assert 'id="provider-settings-modal"' in resp.text
         assert 'id="btn-settings-add-tv"' in resp.text
         assert 'id="tv-settings-modal"' in resp.text
+        assert 'id="settings-access-summary"' in resp.text
+        assert 'id="device-pairing-modal"' in resp.text
         assert "'/settings/providers'" in script.text
         assert "'/settings/tvs'" in script.text
+        assert "'/auth/pairings'" in script.text
+        assert "'/auth/access'" in script.text
 
     def test_automation_ui_has_groups_playlists_schedules_and_integrations(self):
         page = client.get("/")

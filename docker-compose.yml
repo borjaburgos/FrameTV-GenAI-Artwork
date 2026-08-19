@@ -40,6 +40,11 @@ services:
       # creates /data/frameart/secrets/admin-api.token on first startup.
       - FRAMEART_ADMIN_TOKEN=${FRAMEART_ADMIN_TOKEN:-}
       - FRAMEART_AUTOMATION_TOKEN=${FRAMEART_AUTOMATION_TOKEN:-}
+      - FRAMEART_TAILSCALE_AUTH_ENABLED=${FRAMEART_TAILSCALE_AUTH_ENABLED:-false}
+      - FRAMEART_TAILSCALE_ALLOWED_USERS=${FRAMEART_TAILSCALE_ALLOWED_USERS:-[]}
+      - FRAMEART_TRUSTED_LAN_CIDRS=${FRAMEART_TRUSTED_LAN_CIDRS:-[]}
+      - FRAMEART_DEVICE_SESSION_DAYS=${FRAMEART_DEVICE_SESSION_DAYS:-365}
+      - FRAMEART_PAIRING_CODE_MINUTES=${FRAMEART_PAIRING_CODE_MINUTES:-10}
       # Optional schedule event publishing:
       - FRAMEART_MQTT_BROKER=${FRAMEART_MQTT_BROKER:-}
       - FRAMEART_MQTT_PORT=${FRAMEART_MQTT_PORT:-1883}
@@ -65,6 +70,40 @@ services:
     profiles: ["lan"]
     container_name: frameart-api-lan
     ports: []
+    network_mode: host
+
+  # Hybrid access: Tailscale identity remotely and paired browser sessions on
+  # the local HTTPS endpoint. Tailscale must run on the Docker host.
+  # Start with: docker compose --profile tailscale up -d frameart-api-tailnet
+  # Then expose it privately with: tailscale serve --bg 8000
+  frameart-api-tailnet:
+    image: ${FRAMEART_IMAGE:-frameart:local}
+    build: .
+    profiles: ["tailscale"]
+    container_name: frameart-api-tailnet
+    command: ["serve", "--host", "127.0.0.1", "--port", "8000"]
+    volumes:
+      - frameart_data:/data/frameart
+    environment:
+      - FRAMEART_DATA_DIR=/data/frameart
+      - FRAMEART_AUTH_ENABLED=true
+      - FRAMEART_ADMIN_TOKEN=${FRAMEART_ADMIN_TOKEN:-}
+      - FRAMEART_AUTOMATION_TOKEN=${FRAMEART_AUTOMATION_TOKEN:-}
+      - FRAMEART_TAILSCALE_AUTH_ENABLED=true
+      - FRAMEART_TAILSCALE_ALLOWED_USERS=${FRAMEART_TAILSCALE_ALLOWED_USERS:-[]}
+      - FRAMEART_TRUSTED_LAN_CIDRS=${FRAMEART_TRUSTED_LAN_CIDRS:-[]}
+      - FRAMEART_DEVICE_SESSION_DAYS=${FRAMEART_DEVICE_SESSION_DAYS:-365}
+      - FRAMEART_PAIRING_CODE_MINUTES=${FRAMEART_PAIRING_CODE_MINUTES:-10}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://127.0.0.1:11434}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     network_mode: host
 
 volumes:

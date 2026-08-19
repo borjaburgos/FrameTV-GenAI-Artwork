@@ -17,6 +17,7 @@ from typing import Any
 import httpx2 as httpx
 
 from frameart.library import LibraryStore
+from frameart.logging_utils import safe_exception_message
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +121,33 @@ class AutomationStore:
                 (item["id"], item["name"], json.dumps(item["tv_profile_ids"]), item["created_at"]),
             )
         return item
+
+    def replace_tv_profile_ids(self, replacements: dict[str, str]) -> int:
+        """Rewrite renamed or consolidated TV profile IDs in every group."""
+        normalized = {
+            source: target
+            for source, target in replacements.items()
+            if source and target and source != target
+        }
+        if not normalized:
+            return 0
+
+        updated = 0
+        with self._connect() as connection:
+            rows = connection.execute("SELECT id, tv_profile_ids FROM tv_groups").fetchall()
+            for row in rows:
+                current = json.loads(row["tv_profile_ids"])
+                replacement = list(
+                    dict.fromkeys(normalized.get(profile_id, profile_id) for profile_id in current)
+                )
+                if replacement == current:
+                    continue
+                connection.execute(
+                    "UPDATE tv_groups SET tv_profile_ids = ? WHERE id = ?",
+                    (json.dumps(replacement), row["id"]),
+                )
+                updated += 1
+        return updated
 
     def delete_group(self, group_id: str) -> bool:
         with self._connect() as connection:
@@ -417,9 +445,13 @@ class IntegrationPublisher:
                 response.raise_for_status()
                 deliveries.append({"webhook_id": webhook["id"], "ok": True})
             except Exception as exc:
-                logger.warning("Webhook %s delivery failed: %s", webhook["name"], exc)
+                safe_error = safe_exception_message(
+                    exc,
+                    secrets=[webhook.get("secret", "")],
+                )
+                logger.warning("Webhook %s delivery failed: %s", webhook["name"], safe_error)
                 deliveries.append(
-                    {"webhook_id": webhook["id"], "ok": False, "error": str(exc)}
+                    {"webhook_id": webhook["id"], "ok": False, "error": safe_error}
                 )
         self._publish_mqtt(envelope)
         return deliveries
@@ -466,7 +498,7 @@ class IntegrationPublisher:
                 auth=auth,
             )
         except Exception as exc:
-            logger.warning("MQTT publish failed: %s", exc)
+            logger.warning("MQTT publish failed: %s", safe_exception_message(exc))
 
 
 class AutomationScheduler:
@@ -499,8 +531,11 @@ class AutomationScheduler:
         while not self._stop.wait(self.poll_seconds):
             try:
                 self.tick()
-            except Exception:
-                logger.exception("Automation scheduler tick failed")
+            except Exception as exc:
+                logger.error(
+                    "Automation scheduler tick failed: %s",
+                    safe_exception_message(exc),
+                )
 
     def tick(self, now: float | None = None) -> list[dict[str, Any]]:
         settings = self.settings_loader()
@@ -509,8 +544,12 @@ class AutomationScheduler:
         for schedule_id in store.due_schedule_ids(now):
             try:
                 results.append(self.run_schedule(schedule_id))
-            except Exception:
-                logger.exception("Scheduled run failed unexpectedly for %s", schedule_id)
+            except Exception as exc:
+                logger.error(
+                    "Scheduled run failed unexpectedly for %s: %s",
+                    schedule_id,
+                    safe_exception_message(exc),
+                )
         return results
 
     def run_schedule(self, schedule_id: str) -> dict[str, Any]:

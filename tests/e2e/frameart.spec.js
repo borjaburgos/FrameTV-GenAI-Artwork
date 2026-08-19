@@ -45,6 +45,153 @@ test('adds and removes an image provider', async ({ page }) => {
   await expect(provider).toHaveCount(0);
 });
 
+test('shows hybrid access and paired-device management', async ({ page }) => {
+  await openSettings(page);
+
+  const accessCard = page.locator('.settings-card').filter({
+    has: page.getByRole('heading', { name: 'Access & Paired Devices' }),
+  });
+  await expect(accessCard).toContainText('Authentication disabled');
+  await expect(accessCard).toContainText('No paired devices');
+  await expect(accessCard.getByRole('button', { name: 'Pair Device' })).toBeDisabled();
+});
+
+test('offers generate anyway before spending on an offline TV', async ({ page, request }) => {
+  await request.post('/settings/tvs', {
+    data: {
+      profile_id: 'e2e_offline_tv',
+      ip: '192.168.50.31',
+      port: 8002,
+      client_name: 'Offline TV',
+      ssl: true,
+    },
+  });
+  const submissions = [];
+  await page.route('**/async/generate-and-apply', async (route) => {
+    submissions.push(route.request().postDataJSON());
+    const generateAnyway = submissions.at(-1).generate_anyway === true;
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        job_id: generateAnyway ? 'e2e-generate-anyway' : 'e2e-offline-preflight',
+        status: 'pending',
+      }),
+    });
+  });
+  await page.route('**/jobs/e2e-offline-preflight/status', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        job_id: 'e2e-offline-preflight',
+        status: 'failed',
+        request: {},
+        error: 'TV is unreachable. Choose Generate Anyway.',
+        result: {
+          job_id: 'e2e-offline-preflight-result',
+          job_dir: '/tmp/e2e-offline-preflight-result',
+          final_path: null,
+          error: 'TV is unreachable. Choose Generate Anyway.',
+          error_code: 'tv_unreachable',
+          generation_succeeded: false,
+          delivery_status: 'not_attempted',
+        },
+      }),
+    });
+  });
+
+  try {
+    await page.goto('/');
+    await page.getByPlaceholder('A peaceful mountain lake at sunset').fill('Offline TV test');
+    await page.locator('#tv-select').selectOption('192.168.50.31');
+    await page.getByRole('button', { name: 'Generate', exact: true }).click();
+
+    const card = page.locator('.gen-job-card').filter({ hasText: 'Offline TV test' }).first();
+    await expect(card.getByRole('button', { name: 'Generate Anyway' })).toBeVisible();
+    await card.getByRole('button', { name: 'Generate Anyway' }).click();
+    await expect.poll(() => submissions.length).toBe(2);
+    expect(submissions[1].generate_anyway).toBe(true);
+  } finally {
+    await request.delete('/settings/tvs/e2e_offline_tv');
+  }
+});
+
+test('keeps generated artwork and retries only TV delivery', async ({ page, request }) => {
+  await request.post('/settings/tvs', {
+    data: {
+      profile_id: 'e2e_retry_tv',
+      ip: '192.168.50.32',
+      port: 8002,
+      client_name: 'Retry TV',
+      ssl: true,
+    },
+  });
+  let applyPayload = null;
+  await page.route('**/async/generate-and-apply', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ job_id: 'e2e-delivery-failed', status: 'pending' }),
+    });
+  });
+  await page.route('**/jobs/e2e-delivery-failed/status', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        job_id: 'e2e-delivery-failed',
+        status: 'failed',
+        request: {},
+        error: 'Artwork was saved, but the TV became unreachable.',
+        result: {
+          job_id: 'e2e-saved-art',
+          job_dir: '/tmp/e2e-saved-art',
+          final_path: '/tmp/e2e-saved-art/final.png',
+          error: 'Artwork was saved, but the TV became unreachable.',
+          error_code: 'tv_unreachable',
+          generation_succeeded: true,
+          delivery_status: 'failed',
+        },
+      }),
+    });
+  });
+  await page.route('**/jobs/e2e-saved-art/image?**', async (route) => {
+    await route.fulfill({
+      contentType: 'image/png',
+      body: Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII=',
+        'base64',
+      ),
+    });
+  });
+  await page.route('**/jobs/e2e-saved-art/apply', async (route) => {
+    applyPayload = route.request().postDataJSON();
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        job_id: 'e2e-saved-art',
+        job_dir: '/tmp/e2e-saved-art',
+        final_path: '/tmp/e2e-saved-art/final.png',
+        tv_switched: true,
+        delivery_status: 'displayed',
+      }),
+    });
+  });
+
+  try {
+    await page.goto('/');
+    await page.getByPlaceholder('A peaceful mountain lake at sunset').fill('Saved artwork test');
+    await page.locator('#tv-select').selectOption('192.168.50.32');
+    await page.getByRole('button', { name: 'Generate', exact: true }).click();
+
+    const card = page.locator('.gen-job-card').filter({ hasText: 'Saved artwork test' });
+    await expect(card.getByRole('button', { name: 'Open Image' })).toBeVisible();
+    await expect(card.getByRole('button', { name: 'Retry TV' })).toBeVisible();
+    await card.getByRole('button', { name: 'Retry TV' }).click();
+    await expect(card).toContainText('displayed');
+    expect(applyPayload.tv_ip).toBe('192.168.50.32');
+  } finally {
+    await request.delete('/settings/tvs/e2e_retry_tv');
+  }
+});
+
 test('adds and removes a persistent TV profile', async ({ page }) => {
   await openSettings(page);
   await page.getByRole('button', { name: 'Add TV' }).click();
@@ -62,6 +209,34 @@ test('adds and removes a persistent TV profile', async ({ page }) => {
   page.once('dialog', (dialog) => dialog.accept());
   await tv.getByRole('button', { name: 'Delete' }).click();
   await expect(tv).toHaveCount(0);
+});
+
+test('identifies an existing physical TV and intentionally renames it', async ({ page, request }) => {
+  await request.post('/settings/tvs', {
+    data: {
+      profile_id: 'e2e_existing_tv',
+      ip: '192.168.50.26',
+      port: 8002,
+      client_name: 'Existing TV',
+      ssl: true,
+    },
+  });
+
+  try {
+    await openSettings(page);
+    await page.getByRole('button', { name: 'Add TV' }).click();
+    const dialog = page.getByRole('dialog', { name: 'Add TV' });
+    await dialog.getByLabel('Profile ID').fill('e2e_renamed_tv');
+    await dialog.getByLabel('Private IPv4 address').fill('192.168.50.26');
+    page.once('dialog', (confirmation) => confirmation.accept());
+    await dialog.getByRole('button', { name: 'Save TV' }).click();
+
+    await expect(page.locator('#settings-tv-list')).toContainText('e2e_renamed_tv');
+    await expect(page.locator('#settings-tv-list')).not.toContainText('e2e_existing_tv');
+  } finally {
+    await request.delete('/settings/tvs/e2e_existing_tv');
+    await request.delete('/settings/tvs/e2e_renamed_tv');
+  }
 });
 
 test('shows discovered TVs and provides a persistent save action', async ({ page }) => {
@@ -153,6 +328,189 @@ test('searches, tags, and collects library artwork', async ({ page }) => {
     await expect(page.locator('#library-target-collection')).not.toContainText('E2E Favorites');
   } finally {
     await rm(jobDir, { recursive: true, force: true });
+  }
+});
+
+test('library actions safely handle hostile prompt text', async ({ page }) => {
+  const cases = [
+    ['e2e-prompt-apostrophe', "child's drawing"],
+    ['e2e-prompt-backslash', 'path \\ through woods'],
+    ['e2e-prompt-quote', 'the "blue" room'],
+    ['e2e-prompt-linebreak', 'first line\nsecond line'],
+    ['e2e-prompt-html', '<b>test</b>'],
+  ];
+  const jobDirs = [];
+  const errors = [];
+  page.on('console', (message) => {
+    if (message.type() === 'error') errors.push(message.text());
+  });
+  page.on('pageerror', (error) => errors.push(error.message));
+
+  for (const [jobId, prompt] of cases) {
+    const jobDir = path.join(
+      process.cwd(), '.e2e-data', 'artifacts', '2026', '01', '03', jobId,
+    );
+    jobDirs.push(jobDir);
+    await mkdir(jobDir, { recursive: true });
+    await writeFile(
+      path.join(jobDir, 'final.png'),
+      Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII=',
+        'base64',
+      ),
+    );
+    await writeFile(
+      path.join(jobDir, 'meta.json'),
+      JSON.stringify({ job_id: jobId, prompt_original: prompt, provider: 'openai' }),
+    );
+  }
+
+  try {
+    await page.goto('/');
+    await page.locator('.tabs').getByRole('button', { name: 'Library' }).click();
+
+    for (const [jobId, prompt] of cases) {
+      await page.locator(`[data-upload-job-id="${jobId}"]`).click();
+      expect(await page.locator('#upload-job-id').evaluate((node) => node.textContent)).toBe(prompt);
+      await page.locator('#btn-upload-cancel').click();
+
+      await page.locator(`[data-remix-job-id="${jobId}"]`).click();
+      expect(
+        await page.locator('#remix-source-label').evaluate((node) => node.textContent),
+      ).toBe('Library · ' + prompt);
+      await page.locator('#btn-remix-cancel').click();
+    }
+
+    expect(errors).toEqual([]);
+  } finally {
+    await Promise.all(jobDirs.map((jobDir) => rm(jobDir, { recursive: true, force: true })));
+  }
+});
+
+test('matte selectors normalize Samsung objects and ignore malformed entries', async ({ page, request }) => {
+  const jobId = 'e2e-matte-options';
+  const jobDir = path.join(
+    process.cwd(), '.e2e-data', 'artifacts', '2026', '01', '04', jobId,
+  );
+  await mkdir(jobDir, { recursive: true });
+  await writeFile(
+    path.join(jobDir, 'final.png'),
+    Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII=',
+      'base64',
+    ),
+  );
+  await writeFile(
+    path.join(jobDir, 'meta.json'),
+    JSON.stringify({ job_id: jobId, prompt_original: 'Matte option test', provider: 'openai' }),
+  );
+  await request.post('/settings/tvs', {
+    data: {
+      profile_id: 'e2e_matte_tv',
+      ip: '192.168.50.27',
+      port: 8002,
+      client_name: 'FrameArt E2E',
+      ssl: true,
+    },
+  });
+  let mattePayload = [
+    { matte_type: 'shadowbox' },
+    { matte_id: 'modern_black' },
+    { matteType: 'flexible' },
+    'none',
+    { matte_type: { nested: 'invalid' } },
+    {},
+    null,
+  ];
+  await page.route('**/tv/mattes?**', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify(mattePayload),
+    });
+  });
+
+  try {
+    await page.goto('/');
+    await page.locator('.tabs').getByRole('button', { name: 'Library' }).click();
+    await page.locator(`[data-upload-job-id="${jobId}"]`).click();
+
+    const options = await page.locator('#upload-matte-select option').allTextContents();
+    expect(options).toEqual(['shadowbox', 'modern_black', 'flexible', 'none']);
+    expect(options).not.toContain('[object Object]');
+
+    await page.locator('#btn-upload-cancel').click();
+    mattePayload = [{ matte_type: { nested: 'invalid' } }, {}, null];
+    await page.locator(`[data-upload-job-id="${jobId}"]`).click();
+    await expect(page.locator('#upload-matte-select')).toHaveValue('none');
+    await expect(page.locator('#upload-matte-select option')).toHaveText(['none']);
+  } finally {
+    await request.delete('/settings/tvs/e2e_matte_tv');
+    await rm(jobDir, { recursive: true, force: true });
+  }
+});
+
+test('TV gallery distinguishes loaded, missing, and unavailable thumbnails', async ({ page, request }) => {
+  await request.post('/settings/tvs', {
+    data: {
+      profile_id: 'e2e_thumbnail_tv',
+      ip: '192.168.50.29',
+      port: 8002,
+      client_name: 'FrameArt E2E',
+      ssl: true,
+    },
+  });
+  await page.route('**/tv/art?**', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify([
+        { content_id: 'MY_LOADED', is_favourite: false, local_job_id: null },
+        { content_id: 'MY_MISSING', is_favourite: false, local_job_id: null },
+        { content_id: 'MY_BUSY', is_favourite: false, local_job_id: null },
+      ]),
+    });
+  });
+  await page.route('**/tv/art/thumbnails/warm', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        cached: [],
+        warmed: ['MY_LOADED', 'MY_BUSY'],
+        missing: ['MY_MISSING'],
+      }),
+    });
+  });
+  await page.route('**/tv/art/thumbnail?**', async (route) => {
+    const contentId = new URL(route.request().url()).searchParams.get('content_id');
+    if (contentId === 'MY_LOADED') {
+      await route.fulfill({
+        contentType: 'image/png',
+        body: Buffer.from(
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYPgPAAEDAQAIicLsAAAAAElFTkSuQmCC',
+          'base64',
+        ),
+      });
+    } else if (contentId === 'MY_MISSING') {
+      await route.fulfill({ status: 404, contentType: 'application/json', body: '{}' });
+    } else {
+      await route.fulfill({ status: 503, contentType: 'application/json', body: '{}' });
+    }
+  });
+
+  try {
+    await page.goto('/');
+    await page.locator('.tabs').getByRole('button', { name: 'TVs' }).click();
+    await page.locator('#tv-art-select').selectOption('192.168.50.29');
+    await page.getByRole('button', { name: 'Load Art' }).click();
+
+    const loaded = page.locator('.tv-art-item').filter({ hasText: 'MY_LOADED' });
+    const missing = page.locator('.tv-art-item').filter({ hasText: 'MY_MISSING' });
+    const busy = page.locator('.tv-art-item').filter({ hasText: 'MY_BUSY' });
+    await expect(loaded.locator('.art-thumb-wrap')).toHaveAttribute('data-thumbnail-state', 'loaded');
+    await expect(missing.locator('.art-thumb-fallback')).toHaveText('No thumbnail available');
+    await expect(busy.locator('.art-thumb-fallback')).toHaveText('TV unavailable · Retry');
+    await expect(busy.locator('.art-thumb-fallback')).toBeEnabled();
+  } finally {
+    await request.delete('/settings/tvs/e2e_thumbnail_tv');
   }
 });
 

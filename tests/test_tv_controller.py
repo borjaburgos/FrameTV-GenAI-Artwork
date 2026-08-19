@@ -2,17 +2,391 @@
 
 from __future__ import annotations
 
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import call, patch
 
-from frameart.tv.controller import _run_with_timeout
+import pytest
+
+from frameart.config import TVProfile
+from frameart.tv.controller import (
+    TVOperationBusyError,
+    TVOperationTimeoutError,
+    _run_tv_op,
+    _run_with_timeout,
+    _tv_operation_gate,
+    get_art_thumbnails,
+    get_matte_list,
+    preflight_tv,
+    switch_art,
+    wait_for_art,
+)
+
+
+@patch("frameart.tv.controller._connect")
+def test_preflight_is_short_rest_only_capability_check(mock_connect):
+    tv = mock_connect.return_value
+    tv.rest_device_info.return_value = {
+        "device": {"FrameTVSupport": "true"},
+        "isSupport": '{"FrameTVSupport":"true"}',
+    }
+
+    status = preflight_tv(TVProfile(ip="192.168.1.205"), timeout_sec=0.2)
+
+    assert status.reachable is True
+    assert status.art_mode_supported is True
+    mock_connect.assert_called_once_with(
+        TVProfile(ip="192.168.1.205"),
+        timeout=0.2,
+    )
+    tv.rest_device_info.assert_called_once()
+    tv.close.assert_called_once()
+
+
+@patch("frameart.tv.controller._run_with_timeout", return_value=(None, "timed out"))
+def test_preflight_returns_structured_unreachable_status(mock_timeout):
+    status = preflight_tv(TVProfile(ip="192.168.1.206"), timeout_sec=0.2)
+
+    assert status.reachable is False
+    assert status.art_mode_supported is False
+    assert status.error == "TV preflight timed out"
+    mock_timeout.assert_called_once()
 
 
 def test_run_with_timeout_returns_without_waiting_for_blocked_worker():
+    release = threading.Event()
     started = time.monotonic()
-    result, error = _run_with_timeout(lambda: time.sleep(0.3), timeout_sec=0.02)
+    result, error = _run_with_timeout(release.wait, timeout_sec=0.02)
     elapsed = time.monotonic() - started
 
     assert result is None
     assert error == "timed out"
     assert elapsed < 0.15
+    release.set()
+    deadline = time.monotonic() + 0.5
+    while (
+        any(thread.name == "frameart-tv-op" for thread in threading.enumerate())
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.005)
 
+
+def test_expired_queued_reads_never_execute_after_active_operation_finishes():
+    profile = TVProfile(ip="192.168.1.201")
+    active_started = threading.Event()
+    release_active = threading.Event()
+    calls: list[str] = []
+
+    def active_operation():
+        calls.append("active")
+        active_started.set()
+        assert release_active.wait(1)
+
+    active = threading.Thread(
+        target=lambda: _run_tv_op(profile, active_operation, "active", timeout_sec=1),
+    )
+    active.start()
+    assert active_started.wait(1)
+
+    def expired_read(index: int) -> None:
+        with pytest.raises(TVOperationBusyError):
+            _run_tv_op(
+                profile,
+                lambda: calls.append(f"read-{index}"),
+                f"read-{index}",
+                timeout_sec=0.03,
+                priority="read",
+            )
+
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        list(executor.map(expired_read, range(20)))
+        assert sum(thread.name == "frameart-tv-op" for thread in threading.enumerate()) <= 1
+
+    release_active.set()
+    active.join(1)
+    assert not active.is_alive()
+    assert calls == ["active"]
+
+    _run_tv_op(profile, lambda: calls.append("upload"), "upload", timeout_sec=0.5)
+    assert calls == ["active", "upload"]
+
+
+def test_mutation_waiter_runs_before_queued_read():
+    profile = TVProfile(ip="192.168.1.202")
+    active_started = threading.Event()
+    release_active = threading.Event()
+    order: list[str] = []
+
+    def active_operation():
+        active_started.set()
+        assert release_active.wait(1)
+
+    active = threading.Thread(
+        target=lambda: _run_tv_op(profile, active_operation, "active", timeout_sec=1),
+    )
+    active.start()
+    assert active_started.wait(1)
+
+    reader = threading.Thread(
+        target=lambda: _run_tv_op(
+            profile,
+            lambda: order.append("read"),
+            "read",
+            timeout_sec=1,
+            priority="read",
+        ),
+    )
+    mutation = threading.Thread(
+        target=lambda: _run_tv_op(
+            profile,
+            lambda: order.append("mutation"),
+            "mutation",
+            timeout_sec=1,
+        ),
+    )
+    reader.start()
+    mutation.start()
+
+    gate = _tv_operation_gate(profile)
+    deadline = time.monotonic() + 1
+    while gate._waiting_mutations < 1 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert gate._waiting_mutations == 1
+
+    release_active.set()
+    active.join(1)
+    reader.join(1)
+    mutation.join(1)
+
+    assert order == ["mutation", "read"]
+
+
+def test_timed_out_read_is_quarantined_without_blocking_or_releasing_mutation():
+    profile = TVProfile(ip="192.168.1.203")
+    read_started = threading.Event()
+    release_read = threading.Event()
+    mutation_started = threading.Event()
+    release_mutation = threading.Event()
+    cancelled = threading.Event()
+
+    def blocked_read():
+        read_started.set()
+        assert release_read.wait(1)
+
+    with pytest.raises(TVOperationTimeoutError):
+        _run_tv_op(
+            profile,
+            blocked_read,
+            "blocked read",
+            timeout_sec=0.03,
+            priority="read",
+            cancel=cancelled.set,
+        )
+
+    assert read_started.is_set()
+    assert cancelled.is_set()
+
+    def mutation():
+        mutation_started.set()
+        assert release_mutation.wait(1)
+
+    active_mutation = threading.Thread(
+        target=lambda: _run_tv_op(
+            profile,
+            mutation,
+            "mutation after stale read",
+            timeout_sec=1,
+        )
+    )
+    active_mutation.start()
+    assert mutation_started.wait(0.2)
+
+    # The timed-out worker finishes late while the new mutation owns the gate.
+    # Its cleanup must not release the mutation's newer lease.
+    release_read.set()
+    deadline = time.monotonic() + 0.5
+    gate = _tv_operation_gate(profile)
+    while gate._quarantined_reads and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert not gate._quarantined_reads
+
+    with pytest.raises(TVOperationBusyError):
+        _run_tv_op(
+            profile,
+            lambda: None,
+            "competing mutation",
+            timeout_sec=0.03,
+        )
+
+    release_mutation.set()
+    active_mutation.join(1)
+    assert not active_mutation.is_alive()
+
+
+def test_quarantined_read_rejects_additional_reads_without_starting_workers():
+    profile = TVProfile(ip="192.168.1.204")
+    release_read = threading.Event()
+    calls: list[str] = []
+
+    with pytest.raises(TVOperationTimeoutError):
+        _run_tv_op(
+            profile,
+            release_read.wait,
+            "blocked read",
+            timeout_sec=0.02,
+            priority="read",
+        )
+
+    for index in range(10):
+        with pytest.raises(TVOperationBusyError):
+            _run_tv_op(
+                profile,
+                lambda index=index: calls.append(str(index)),
+                f"extra read {index}",
+                timeout_sec=0.02,
+                priority="read",
+            )
+
+    assert calls == []
+    release_read.set()
+    deadline = time.monotonic() + 0.5
+    gate = _tv_operation_gate(profile)
+    while gate._quarantined_reads and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert not gate._quarantined_reads
+
+
+@patch("frameart.tv.controller._run_art_call")
+def test_thumbnail_batch_normalizes_tv_filenames(mock_call):
+    profile = TVProfile(ip="192.168.1.205")
+
+    def run_callback(_profile, callback, _description, **_kwargs):
+        art = type(
+            "Art",
+            (),
+            {
+                "get_thumbnail_list": lambda self, _ids: {
+                    "MY_F0001.jpg": bytearray(b"one"),
+                    "MY_F0002": b"two",
+                    "unexpected.jpg": b"ignored",
+                }
+            },
+        )()
+        return callback(art)
+
+    mock_call.side_effect = run_callback
+
+    assert get_art_thumbnails(profile, ["MY_F0001", "MY_F0002"]) == {
+        "MY_F0001": b"one",
+        "MY_F0002": b"two",
+    }
+    assert mock_call.call_args.kwargs["priority"] == "read"
+
+
+@patch("frameart.tv.controller._run_art_call")
+def test_matte_list_normalizes_firmware_shapes_and_ignores_malformed_entries(mock_call):
+    profile = TVProfile(ip="192.168.1.206")
+    mock_call.return_value = {
+        "matte_types": [
+            {"matte_type": "shadowbox"},
+            {"matte_id": "modern_black"},
+            {"matteType": "flexible"},
+            {"matteId": "none"},
+            "triptych",
+            {"matte_type": "shadowbox"},
+            {"matte_type": {"nested": "invalid"}},
+            {},
+            None,
+        ]
+    }
+
+    assert get_matte_list(profile) == [
+        {"matte_id": "shadowbox"},
+        {"matte_id": "modern_black"},
+        {"matte_id": "flexible"},
+        {"matte_id": "none"},
+        {"matte_id": "triptych"},
+    ]
+    assert mock_call.call_args.kwargs["priority"] == "read"
+
+
+@patch("frameart.tv.controller._run_art_call")
+def test_switch_art_skips_enable_when_art_mode_is_already_on(mock_call):
+    profile = TVProfile(ip="192.168.1.100")
+    mock_call.side_effect = ["on", None]
+
+    assert switch_art(profile, "MY_F0006") is True
+
+    descriptions = [invocation.args[2] for invocation in mock_call.call_args_list]
+    assert descriptions == ["Get art mode status", "Switch art to MY_F0006"]
+
+
+@patch("frameart.tv.controller._run_art_call")
+def test_switch_art_gives_art_mode_and_selection_independent_calls(mock_call):
+    profile = TVProfile(ip="192.168.1.100")
+    mock_call.side_effect = ["off", None, None]
+
+    assert switch_art(profile, "MY_F0006") is True
+
+    descriptions = [invocation.args[2] for invocation in mock_call.call_args_list]
+    assert descriptions == [
+        "Get art mode status",
+        "Enable art mode",
+        "Switch art to MY_F0006",
+    ]
+
+
+@patch("frameart.tv.controller._run_art_call")
+def test_switch_art_reconciles_selection_timeout_as_success(mock_call):
+    profile = TVProfile(ip="192.168.1.100")
+
+    def operation(_profile, _func, description, **_kwargs):
+        if description == "Get art mode status":
+            return "on"
+        if description == "Switch art to MY_F0006":
+            raise RuntimeError("timed out")
+        if description == "Get current artwork":
+            return {"content_id": "MY_F0006"}
+        raise AssertionError(description)
+
+    mock_call.side_effect = operation
+
+    assert switch_art(profile, "MY_F0006") is True
+
+
+@patch("frameart.tv.controller._run_art_call")
+def test_switch_art_returns_false_when_reconciliation_does_not_match(mock_call):
+    profile = TVProfile(ip="192.168.1.100")
+
+    def operation(_profile, _func, description, **_kwargs):
+        if description == "Get art mode status":
+            return True
+        if description == "Switch art to MY_F0006":
+            raise RuntimeError("timed out")
+        if description == "Get current artwork":
+            return {"content_id": "MY_F0005"}
+        raise AssertionError(description)
+
+    mock_call.side_effect = operation
+
+    assert switch_art(profile, "MY_F0006") is False
+
+
+@patch("frameart.tv.controller._run_art_call")
+def test_wait_for_art_accepts_content_as_soon_as_it_is_listed(mock_call):
+    profile = TVProfile(ip="192.168.1.100")
+
+    def run_callback(_profile, callback, _description, **_kwargs):
+        art = type("Art", (), {"available": lambda self: [{"content_id": "MY_F0006"}]})()
+        return callback(art)
+
+    mock_call.side_effect = run_callback
+
+    assert wait_for_art(profile, "MY_F0006") is True
+    assert mock_call.call_args == call(
+        profile,
+        mock_call.call_args.args[1],
+        "Wait for artwork MY_F0006",
+        timeout_sec=3.0,
+    )

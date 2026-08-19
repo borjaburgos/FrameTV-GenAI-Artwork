@@ -11,6 +11,7 @@
   let managedProviderSettings = null;
   let managedTVSettings = [];
   let managedSettingsBackups = [];
+  let managedAccessSettings = null;
   let managedCollections = [];
   let loadedGalleryJobs = {};
   let automationGroups = [];
@@ -57,22 +58,64 @@
     setTimeout(() => toast.remove(), 3600);
   }
 
+  function defaultDeviceName() {
+    return localStorage.getItem('frameart.device.name') ||
+      navigator.userAgentData?.platform || navigator.platform || 'Browser device';
+  }
+
+  async function completePairingFromUrl() {
+    const url = new URL(window.location.href);
+    const code = url.searchParams.get('pair');
+    if (!code) return;
+    const suggestedName = defaultDeviceName();
+    const deviceName = window.prompt('Name this FrameArt device:', suggestedName);
+    if (!deviceName || !deviceName.trim()) {
+      showToast('Device pairing was cancelled. Reopen the link to try again.', 'warn');
+      return;
+    }
+    try {
+      const response = await window.fetch('/auth/pair', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code, device_name: deviceName.trim() }),
+      });
+      if (!response.ok) {
+        throw new Error(await readApiError(response, 'Pairing failed.'));
+      }
+      localStorage.setItem('frameart.device.name', deviceName.trim());
+      url.searchParams.delete('pair');
+      window.history.replaceState({}, '', url.pathname + url.search + url.hash);
+      showToast('This device is paired and ready to use.', 'done');
+    } catch (error) {
+      showToast(error?.message || 'Pairing failed.', 'error');
+    }
+  }
+
+  const pairingBootstrapPromise = completePairingFromUrl();
+
   async function establishAuthSession() {
-    const token = window.prompt('Enter your FrameArt admin or automation token:');
-    if (!token) return false;
-    const response = await window.fetch('/auth/session', {
+    const credential = window.prompt('Enter a FrameArt token or device pairing code:');
+    if (!credential) return false;
+    const isPairingCode = /^[A-HJ-NP-Z2-9]{5}-?[A-HJ-NP-Z2-9]{5}$/i.test(credential.trim());
+    const endpoint = isPairingCode ? '/auth/pair' : '/auth/session';
+    const payload = isPairingCode
+      ? { code: credential.trim(), device_name: defaultDeviceName() }
+      : { token: credential, remember_device: true, device_name: defaultDeviceName() };
+    const response = await window.fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token }),
+      body: JSON.stringify(payload),
     });
     if (!response.ok) {
-      showToast('Authentication failed. Check the token and try again.', 'error');
+      showToast('Authentication failed. Check the token or pairing code and try again.', 'error');
       return false;
     }
+    if (isPairingCode) showToast('This device is paired and ready to use.', 'done');
     return true;
   }
 
   async function apiFetch(input, init) {
+    await pairingBootstrapPromise;
     let response = await window.fetch(input, init);
     if (response.status !== 401) return response;
     if (!authPromptPromise) {
@@ -87,7 +130,11 @@
   async function parseJSONResponse(response, fallbackMessage) {
     const payload = await response.json().catch(() => null);
     if (!response.ok) {
-      const detail = payload && typeof payload.detail === 'string' ? payload.detail : null;
+      const detail = typeof payload?.detail === 'string'
+        ? payload.detail
+        : (typeof payload?.detail?.message === 'string'
+          ? payload.detail.message
+          : (typeof payload?.detail?.error === 'string' ? payload.detail.error : null));
       throw new Error(detail || fallbackMessage || ('Server returned ' + response.status));
     }
     return payload;
@@ -407,13 +454,21 @@
     }
     container.innerHTML = managedTVSettings.map((tv, index) => {
       const tokenState = tv.token_configured ? 'Paired' : 'Not paired';
+      const conflicts = tv.conflicts_with || [];
+      const conflictText = conflicts.length
+        ? (' · ⚠ Duplicate of ' + conflicts.join(', '))
+        : '';
+      const consolidateButton = conflicts.length
+        ? ('<button class="btn btn-secondary btn-small" data-settings-tv-action="consolidate" data-settings-tv-index="' + index + '">Consolidate</button>')
+        : '';
       return '<div class="settings-item">' +
         '<div class="settings-item-main"><strong>' + esc(tv.profile_id) + '</strong>' +
-        '<span>' + esc(tv.ip) + ':' + tv.port + ' · ' + esc(tokenState) + '</span></div>' +
+        '<span>' + esc(tv.ip) + ':' + tv.port + ' · ' + esc(tokenState + conflictText) + '</span></div>' +
         '<div class="settings-item-actions">' +
         '<button class="btn btn-ghost btn-small" data-settings-tv-action="test" data-settings-tv-index="' + index + '">Test</button>' +
         '<button class="btn btn-ghost btn-small" data-settings-tv-action="pair" data-settings-tv-index="' + index + '">Pair</button>' +
         '<button class="btn btn-secondary btn-small" data-settings-tv-action="edit" data-settings-tv-index="' + index + '">Edit</button>' +
+        consolidateButton +
         '<button class="btn btn-danger btn-small" data-settings-tv-action="delete" data-settings-tv-index="' + index + '">Delete</button>' +
         '</div></div>';
     }).join('');
@@ -688,19 +743,31 @@
       const cardClass = job.status === 'completed' ? ' done' : (job.status === 'failed' ? ' error' : '');
       const prompt = esc(job.prompt || '');
       const errorBlock = job.error ? `<div class="gen-job-meta" style="color:var(--err)">Error: ${esc(job.error)}</div>` : '';
+      const deliveryBlock = job.deliveryStatus && job.deliveryStatus !== 'not_requested'
+        ? `<div class="gen-job-meta">Delivery: ${esc(job.deliveryStatus.replaceAll('_', ' '))}</div>`
+        : '';
       const previewToken = job.previewNonce || '';
       const imageJobId = job.resultJobId || job.jobId;
-      const previewBlock = (job.status === 'completed' && job.imageAvailable)
+      const previewBlock = job.imageAvailable
         ? `<div class="gen-job-thumb-wrap">
              <img src="/jobs/${esc(imageJobId)}/image?${previewToken}" alt="${prompt}" loading="lazy"
                onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
              <div class="gen-job-thumb-fallback">No image available</div>
            </div>`
         : '';
-      const actionsBlock = job.status === 'completed' && job.imageAvailable
-        ? `<div class="gen-job-actions">
-             <button class="btn btn-secondary btn-small btn-gen-open" data-job-id="${esc(imageJobId)}">Open Image</button>
-           </div>`
+      const actions = [];
+      if (job.imageAvailable) {
+        actions.push(`<button class="btn btn-secondary btn-small btn-gen-open" data-job-id="${esc(imageJobId)}">Open Image</button>`);
+      }
+      if (job.errorCode === 'tv_unreachable' || job.errorCode === 'tv_art_mode_unavailable') {
+        if (job.generationSucceeded && job.imageAvailable && job.tvIp) {
+          actions.push(`<button class="btn btn-small btn-gen-retry-tv" data-queue-id="${esc(job.jobId)}">Retry TV</button>`);
+        } else if (!job.generationSucceeded) {
+          actions.push(`<button class="btn btn-small btn-gen-anyway" data-queue-id="${esc(job.jobId)}">Generate Anyway</button>`);
+        }
+      }
+      const actionsBlock = actions.length
+        ? `<div class="gen-job-actions">${actions.join('')}</div>`
         : '';
       return `
         <div class="gen-job-card${cardClass}">
@@ -712,6 +779,7 @@
           <div class="gen-job-meta">Provider: ${esc(providerLabel)} · Model: ${esc(modelLabel)}</div>
           <div class="gen-job-meta">Style: ${esc(styleLabel)} · TV: ${esc(tvLabel)}</div>
           ${errorBlock}
+          ${deliveryBlock}
           ${previewBlock}
           ${actionsBlock}
         </div>
@@ -725,6 +793,86 @@
         window.showPreview(jobId);
       });
     });
+    grid.querySelectorAll('.btn-gen-anyway').forEach((btn) => {
+      btn.addEventListener('click', async (event) => {
+        const job = generationJobs.get(event.currentTarget.dataset.queueId);
+        if (!job) return;
+        setButtonBusy(event.currentTarget, 'Queueing...');
+        try {
+          const queued = await queueGeneration(job, { generateAnyway: true });
+          showStatus('Queued generate-anyway job ' + queued.job_id + '.', '');
+        } catch (error) {
+          showStatus('Failed: ' + error.message, 'error');
+        } finally {
+          clearButtonBusy(event.currentTarget);
+        }
+      });
+    });
+    grid.querySelectorAll('.btn-gen-retry-tv').forEach((btn) => {
+      btn.addEventListener('click', async (event) => {
+        const job = generationJobs.get(event.currentTarget.dataset.queueId);
+        if (!job) return;
+        setButtonBusy(event.currentTarget, 'Retrying...');
+        try {
+          const response = await apiFetch(
+            '/jobs/' + encodeURIComponent(job.resultJobId || job.jobId) + '/apply',
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ tv_ip: job.tvIp, matte: 'none' }),
+            },
+          );
+          const result = await parseJSONResponse(response, 'TV delivery retry failed.');
+          job.status = 'completed';
+          job.error = null;
+          job.errorCode = null;
+          job.deliveryStatus = result.delivery_status || 'displayed';
+          renderGenerationJobs();
+          showStatus('Delivered saved artwork to the TV.', 'done');
+        } catch (error) {
+          showStatus('Delivery failed: ' + error.message, 'error');
+        } finally {
+          clearButtonBusy(event.currentTarget);
+        }
+      });
+    });
+  }
+
+  async function queueGeneration(source, { generateAnyway = false } = {}) {
+    const useTV = Boolean(source.tvIp);
+    const endpoint = useTV ? '/async/generate-and-apply' : '/async/generate';
+    const body = {
+      prompt: source.prompt,
+      style: source.style || undefined,
+      provider: source.provider || undefined,
+      model: source.model || undefined,
+    };
+    if (useTV) body.tv_ip = source.tvIp;
+    if (generateAnyway) body.generate_anyway = true;
+    const response = await apiFetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await parseJSONResponse(response, 'Could not queue generation.');
+    generationJobs.set(data.job_id, {
+      jobId: data.job_id,
+      prompt: source.prompt,
+      provider: source.provider,
+      model: source.model,
+      style: source.style,
+      tvIp: source.tvIp,
+      status: data.status || 'pending',
+      error: null,
+      errorCode: null,
+      generationSucceeded: false,
+      deliveryStatus: generateAnyway ? 'skipped' : 'not_attempted',
+      imageAvailable: false,
+      createdAt: Date.now(),
+    });
+    renderGenerationJobs();
+    ensureGenerationPolling();
+    return data;
   }
 
   function clearFinishedGenerationJobs() {
@@ -773,15 +921,16 @@
         }
         const data = await resp.json();
         const nextStatus = data.status || job.status;
-        const nextError = data.error || null;
+        const result = data.result || null;
+        const nextError = data.error || result?.error || null;
         if (nextStatus !== job.status || nextError !== job.error) {
           changed = true;
           job.status = nextStatus;
           job.error = nextError;
         }
-        if (data.status === 'completed' && data.result) {
-          const nextResultJobId = data.result.job_id || job.jobId;
-          const nextImageAvailable = Boolean(data.result.final_path);
+        if (result) {
+          const nextResultJobId = result.job_id || job.jobId;
+          const nextImageAvailable = Boolean(result.final_path);
           if (job.resultJobId !== nextResultJobId || job.imageAvailable !== nextImageAvailable) {
             changed = true;
             job.resultJobId = nextResultJobId;
@@ -791,6 +940,11 @@
             changed = true;
             job.previewNonce = Date.now();
           }
+          job.errorCode = result.error_code || null;
+          job.generationSucceeded = Boolean(result.generation_succeeded);
+          job.deliveryStatus = result.delivery_status || 'not_requested';
+        }
+        if (data.status === 'completed' && result) {
           showStatus('Done: ' + job.jobId, 'done');
           if (job.imageAvailable) {
             const img = document.getElementById('gen-preview-img');
@@ -798,10 +952,6 @@
             document.getElementById('gen-preview').style.display = 'block';
           }
         } else if (data.status === 'failed') {
-          if (job.imageAvailable) {
-            job.imageAvailable = false;
-            changed = true;
-          }
           showStatus('Failed: ' + (data.error || job.jobId), 'error');
         }
       } catch (e) {
@@ -828,35 +978,11 @@
     const model = document.getElementById('model').value || undefined;
     const tvIp = document.getElementById('tv-select').value || undefined;
 
-    const useTV = !!tvIp;
-    const endpoint = useTV ? '/async/generate-and-apply' : '/async/generate';
-    const body = { prompt, style, provider, model };
-    if (useTV) { body.tv_ip = tvIp; }
-
     setButtonBusy(btnGen, 'Queueing...');
     showStatus('Submitting job...');
 
     try {
-      const resp = await apiFetch(endpoint, {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(body),
-      });
-      if (!resp.ok) { throw new Error('Server returned ' + resp.status); }
-      const data = await resp.json();
-      generationJobs.set(data.job_id, {
-        jobId: data.job_id,
-        prompt,
-        provider,
-        model,
-        style,
-        tvIp,
-        status: data.status || 'pending',
-        error: null,
-        imageAvailable: false,
-        createdAt: Date.now(),
-      });
-      renderGenerationJobs();
-      ensureGenerationPolling();
+      const data = await queueGeneration({ prompt, provider, model, style, tvIp });
       showStatus('Queued job ' + data.job_id + '.', '');
     } catch (e) {
       showStatus('Failed: ' + e.message, 'error');
@@ -889,6 +1015,9 @@
         current.error = item.error || null;
         current.resultJobId = resultJobId;
         current.imageAvailable = Boolean(item.result && item.result.final_path);
+        current.errorCode = item.result?.error_code || null;
+        current.generationSucceeded = Boolean(item.result?.generation_succeeded);
+        current.deliveryStatus = item.result?.delivery_status || 'not_requested';
         if (current.imageAvailable && !current.previewNonce) current.previewNonce = Date.now();
         generationJobs.set(item.job_id, current);
       }
@@ -1159,7 +1288,7 @@
         return `
         <div class="gallery-item">
           <img src="/jobs/${esc(j.job_id)}/image" alt="${promptShort}" loading="lazy"
-               onclick="showPreview('${esc(j.job_id)}')"
+               data-preview-job-id="${esc(j.job_id)}"
                onerror="this.style.display='none'">
           <div class="info">
             <label class="select-row">
@@ -1174,10 +1303,10 @@
           </div>
           <div class="actions">
             <button class="btn btn-secondary btn-small"
-                    onclick="openUploadModal('${esc(j.job_id)}', '${esc(j.prompt || j.job_id)}')">
+                    data-upload-job-id="${esc(j.job_id)}">
               Upload to TV</button>
             <button class="btn btn-secondary btn-small"
-                    onclick="openRemixFromJob('${esc(j.job_id)}', '${esc(j.prompt || j.job_id)}')">
+                    data-remix-job-id="${esc(j.job_id)}">
               Edit / Generate New</button>
             <button class="btn btn-ghost btn-small" data-tag-job-id="${esc(j.job_id)}">Tags</button>
           </div>
@@ -1238,11 +1367,32 @@
   });
   document.getElementById('btn-batch-upload-apply').addEventListener('click', applyBatchUpload);
   document.getElementById('gallery-grid').addEventListener('click', (event) => {
-    const button = event.target.closest('[data-tag-job-id]');
-    if (!button) return;
-    setTagsForJobs([button.dataset.tagJobId]).catch((error) => {
-      showToast(error?.message || 'Could not save tags.', 'error');
-    });
+    const target = event.target;
+    const uploadButton = target.closest('[data-upload-job-id]');
+    if (uploadButton) {
+      const jobId = uploadButton.dataset.uploadJobId;
+      const job = loadedGalleryJobs[jobId];
+      window.openUploadModal(jobId, job?.prompt || jobId);
+      return;
+    }
+    const remixButton = target.closest('[data-remix-job-id]');
+    if (remixButton) {
+      const jobId = remixButton.dataset.remixJobId;
+      const job = loadedGalleryJobs[jobId];
+      window.openRemixFromJob(jobId, job?.prompt || jobId);
+      return;
+    }
+    const preview = target.closest('[data-preview-job-id]');
+    if (preview) {
+      window.showPreview(preview.dataset.previewJobId);
+      return;
+    }
+    const tagButton = target.closest('[data-tag-job-id]');
+    if (tagButton) {
+      setTagsForJobs([tagButton.dataset.tagJobId]).catch((error) => {
+        showToast(error?.message || 'Could not save tags.', 'error');
+      });
+    }
   });
   document.getElementById('btn-gallery-filter').addEventListener('click', loadGallery);
   document.getElementById('gallery-search').addEventListener('keydown', (event) => {
@@ -1324,6 +1474,7 @@
     'remix-modal',
     'provider-settings-modal',
     'tv-settings-modal',
+    'device-pairing-modal',
     'add-tv-modal',
     'shortcuts-modal',
   ];
@@ -1373,6 +1524,101 @@
   // =========================================================================
   // Persistent settings management
   // =========================================================================
+  function accessMethodLabel(method) {
+    return {
+      off: 'Authentication disabled',
+      token: 'API token',
+      token_session: 'Token session',
+      paired_device: 'Paired device',
+      tailscale: 'Tailscale identity',
+      trusted_lan: 'Trusted LAN',
+    }[method] || 'Authenticated';
+  }
+
+  function renderAccessSettings() {
+    const summary = document.getElementById('settings-access-summary');
+    const list = document.getElementById('settings-device-list');
+    const pairButton = document.getElementById('btn-settings-pair-device');
+    if (!managedAccessSettings) {
+      summary.innerHTML = '<div class="settings-item"><strong>Loading...</strong></div>';
+      list.innerHTML = '';
+      return;
+    }
+
+    const authState = managedAccessSettings.auth_enabled
+      ? accessMethodLabel(managedAccessSettings.method)
+      : 'Authentication disabled';
+    const identity = managedAccessSettings.identity
+      ? (' · ' + managedAccessSettings.identity)
+      : '';
+    const tailscale = managedAccessSettings.tailscale_auth_enabled
+      ? 'Enabled'
+      : 'Disabled';
+    const trustedLan = managedAccessSettings.trusted_lan_cidrs?.length
+      ? managedAccessSettings.trusted_lan_cidrs.join(', ')
+      : 'Disabled';
+    summary.innerHTML =
+      '<div class="settings-item"><div class="settings-item-main"><strong>' +
+      esc(authState) + '</strong><span>Current access' + esc(identity) + '</span></div></div>' +
+      '<div class="settings-item"><div class="settings-item-main"><strong>Tailscale</strong><span>' +
+      esc(tailscale) + '</span></div></div>' +
+      '<div class="settings-item"><div class="settings-item-main"><strong>Trusted LAN</strong><span>' +
+      esc(trustedLan) + '</span></div></div>';
+    pairButton.disabled = !managedAccessSettings.auth_enabled;
+
+    const devices = managedAccessSettings.devices || [];
+    if (!devices.length) {
+      list.innerHTML = '<div class="settings-item"><div class="settings-item-main">' +
+        '<strong>No paired devices</strong><span>Pair a browser without sharing the admin token.</span>' +
+        '</div></div>';
+      return;
+    }
+    list.innerHTML = devices.map((device) => {
+      const currentBadge = device.current
+        ? '<span class="badge badge-frame">Current</span>'
+        : '';
+      const lastSeen = new Date(device.last_seen_at * 1000).toLocaleString();
+      const expires = new Date(device.expires_at * 1000).toLocaleDateString();
+      return '<div class="settings-item"><div class="settings-item-main"><strong>' +
+        esc(device.name) + '</strong><span>Last used ' + esc(lastSeen) +
+        ' · expires ' + esc(expires) + '</span></div><div class="settings-item-actions">' +
+        currentBadge + '<button class="btn btn-danger btn-small" data-device-id="' +
+        esc(device.id) + '">Revoke</button></div></div>';
+    }).join('');
+  }
+
+  async function createDevicePairing(button) {
+    setButtonBusy(button, 'Creating...');
+    try {
+      const response = await apiFetch('/auth/pairings', { method: 'POST' });
+      const pairing = await parseJSONResponse(response, 'Could not create pairing link.');
+      document.getElementById('device-pairing-qr').src = pairing.qr_data_url;
+      document.getElementById('device-pairing-code').textContent = pairing.code;
+      document.getElementById('device-pairing-link').value = pairing.pairing_url;
+      document.getElementById('device-pairing-expiry').textContent =
+        'Expires ' + new Date(pairing.expires_at * 1000).toLocaleTimeString();
+      openModal('device-pairing-modal', '#btn-device-pairing-copy');
+    } catch (error) {
+      showToast(error?.message || 'Could not create pairing link.', 'error');
+    } finally {
+      clearButtonBusy(button);
+    }
+  }
+
+  async function revokePairedDevice(deviceId) {
+    if (!window.confirm('Revoke this device? It will need to pair or enter a token again.')) return;
+    try {
+      const response = await apiFetch('/auth/devices/' + encodeURIComponent(deviceId), {
+        method: 'DELETE',
+      });
+      await parseJSONResponse(response, 'Could not revoke device.');
+      await loadManagementSettings();
+      showToast('Device access revoked.', 'done');
+    } catch (error) {
+      showToast(error?.message || 'Could not revoke device.', 'error');
+    }
+  }
+
   function setSettingsModalError(prefix, message) {
     const status = document.getElementById(prefix + '-error');
     const text = document.getElementById(prefix + '-error-text');
@@ -1783,10 +2029,11 @@
   async function loadManagementSettings(triggerButton) {
     if (triggerButton) setButtonBusy(triggerButton, 'Refreshing...');
     try {
-      const [providerResponse, tvResponse, backupResponse] = await Promise.all([
+      const [providerResponse, tvResponse, backupResponse, accessResponse] = await Promise.all([
         apiFetch('/settings/providers'),
         apiFetch('/settings/tvs'),
         apiFetch('/settings/backups'),
+        apiFetch('/auth/access'),
       ]);
       managedProviderSettings = await parseJSONResponse(
         providerResponse,
@@ -1797,11 +2044,16 @@
         backupResponse,
         'Could not load settings backups.',
       );
+      managedAccessSettings = await parseJSONResponse(
+        accessResponse,
+        'Could not load access settings.',
+      );
       managedTVSettings = tvPayload.tvs || [];
       managedSettingsBackups = backupPayload.backups || [];
       renderSettingsProviders();
       renderSettingsTVSummary();
       renderSettingsBackups();
+      renderAccessSettings();
       renderAutomationTVChoices();
     } catch (error) {
       const message = error?.message || 'Settings could not be loaded.';
@@ -1811,6 +2063,9 @@
         '<div class="settings-item"><strong>Unavailable</strong><span>' + esc(message) + '</span></div>';
       document.getElementById('settings-backup-list').innerHTML =
         '<div class="settings-item"><strong>Unavailable</strong><span>' + esc(message) + '</span></div>';
+      document.getElementById('settings-access-summary').innerHTML =
+        '<div class="settings-item"><strong>Unavailable</strong><span>' + esc(message) + '</span></div>';
+      document.getElementById('settings-device-list').innerHTML = '';
       showToast('Settings management: ' + message, 'error');
     } finally {
       if (triggerButton) clearButtonBusy(triggerButton);
@@ -2142,7 +2397,7 @@
   function openTVSettingsEditor(tv, discoveredTV) {
     editingTVProfileId = tv?.profile_id || null;
     const profileId = document.getElementById('tv-settings-profile-id');
-    profileId.disabled = Boolean(editingTVProfileId);
+    profileId.disabled = false;
     profileId.value = editingTVProfileId || suggestedProfileId(discoveredTV?.name);
     document.getElementById('tv-settings-title').textContent =
       editingTVProfileId ? ('Edit ' + editingTVProfileId) : 'Add TV';
@@ -2172,7 +2427,7 @@
       client_name: document.getElementById('tv-settings-client-name').value.trim(),
       ssl: document.getElementById('tv-settings-ssl').checked,
     };
-    if (!editingTVProfileId) payload.profile_id = profileId;
+    payload.profile_id = profileId;
 
     setSettingsModalError('tv-settings', '');
     setButtonBusy(button, 'Saving...');
@@ -2180,11 +2435,31 @@
       const endpoint = editingTVProfileId
         ? ('/settings/tvs/' + encodeURIComponent(editingTVProfileId))
         : '/settings/tvs';
-      const response = await apiFetch(endpoint, {
+      let response = await apiFetch(endpoint, {
         method: editingTVProfileId ? 'PUT' : 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
+      if (response.status === 409 && !editingTVProfileId) {
+        const conflictPayload = await response.json().catch(() => null);
+        const conflict = conflictPayload?.detail;
+        if (conflict?.code === 'tv_profile_conflict' && conflict.existing_profile_id) {
+          const confirmed = window.confirm(
+            conflict.message + ' Update that profile and rename it to ' + profileId + '?',
+          );
+          if (!confirmed) throw new Error(conflict.message);
+          response = await apiFetch(
+            '/settings/tvs/' + encodeURIComponent(conflict.existing_profile_id),
+            {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+            },
+          );
+        } else {
+          throw new Error('A matching TV profile already exists.');
+        }
+      }
       const result = await parseJSONResponse(response, 'Could not save TV.');
       managedTVSettings = result.tvs || [];
       renderSettingsTVSummary();
@@ -2228,6 +2503,29 @@
       }
       return;
     }
+    if (action === 'consolidate') {
+      if (!window.confirm(
+        'Keep ' + tv.profile_id + ' and remove its duplicate aliases? Pairing tokens are retained.',
+      )) return;
+      setButtonBusy(button, 'Consolidating...');
+      try {
+        const response = await apiFetch(
+          '/settings/tvs/' + encodeURIComponent(tv.profile_id) + '/consolidate',
+          { method: 'POST' },
+        );
+        const result = await parseJSONResponse(response, 'Could not consolidate TV profiles.');
+        managedTVSettings = result.tvs || [];
+        renderSettingsTVSummary();
+        await reloadConfiguredTVs();
+        renderAutomationTVChoices();
+        showToast('Duplicate TV profiles consolidated.', 'done');
+      } catch (error) {
+        showToast(error?.message || 'Could not consolidate TV profiles.', 'error');
+      } finally {
+        clearButtonBusy(button);
+      }
+      return;
+    }
     if (action === 'pair' && !window.confirm(
       'Start pairing with ' + tv.profile_id + '? Accept the prompt shown on the TV.',
     )) return;
@@ -2257,6 +2555,26 @@
   document.getElementById('btn-tv-settings-save').addEventListener('click', saveTVSettings);
   document.getElementById('btn-settings-refresh').addEventListener('click', (event) => {
     loadManagementSettings(event.currentTarget);
+  });
+  document.getElementById('btn-settings-pair-device').addEventListener('click', (event) => {
+    createDevicePairing(event.currentTarget);
+  });
+  document.getElementById('settings-device-list').addEventListener('click', (event) => {
+    const button = event.target.closest('[data-device-id]');
+    if (button) revokePairedDevice(button.dataset.deviceId);
+  });
+  document.getElementById('btn-device-pairing-close').addEventListener('click', () => {
+    closeModal('device-pairing-modal');
+  });
+  document.getElementById('btn-device-pairing-copy').addEventListener('click', async () => {
+    const input = document.getElementById('device-pairing-link');
+    try {
+      await navigator.clipboard.writeText(input.value);
+    } catch {
+      input.select();
+      document.execCommand('copy');
+    }
+    showToast('Pairing link copied.', 'done');
   });
 
   // =========================================================================
@@ -2929,6 +3247,98 @@
     updateTVSelectionUI();
   }
 
+  function setTVThumbnailState(wrapper, state, message) {
+    const image = wrapper.querySelector('.art-thumb');
+    const fallback = wrapper.querySelector('.art-thumb-fallback');
+    wrapper.dataset.thumbnailState = state;
+    fallback.textContent = message;
+    fallback.disabled = state !== 'error';
+    fallback.style.display = state === 'loaded' ? 'none' : 'flex';
+    image.style.display = state === 'loaded' ? 'block' : 'none';
+  }
+
+  async function loadTVThumbnail(wrapper, tvIp, contentId, refresh = false) {
+    const image = wrapper.querySelector('.art-thumb');
+    setTVThumbnailState(wrapper, 'loading', 'Loading thumbnail…');
+    const params = new URLSearchParams({ tv_ip: tvIp, content_id: contentId });
+    if (refresh) params.set('refresh', 'true');
+    try {
+      const response = await apiFetch('/tv/art/thumbnail?' + params.toString());
+      if (response.status === 404) {
+        setTVThumbnailState(wrapper, 'missing', 'No thumbnail available');
+        return;
+      }
+      if (!response.ok) {
+        setTVThumbnailState(wrapper, 'error', 'TV unavailable · Retry');
+        return;
+      }
+      const blob = await response.blob();
+      const previousUrl = image.dataset.objectUrl;
+      if (previousUrl) URL.revokeObjectURL(previousUrl);
+      const objectUrl = URL.createObjectURL(blob);
+      image.dataset.objectUrl = objectUrl;
+      image.loading = 'eager';
+      image.onload = () => setTVThumbnailState(wrapper, 'loaded', '');
+      image.onerror = () => setTVThumbnailState(wrapper, 'error', 'Preview unavailable · Retry');
+      image.src = objectUrl;
+    } catch {
+      setTVThumbnailState(wrapper, 'error', 'TV unavailable · Retry');
+    }
+  }
+
+  function loadTVThumbnailQueue(wrappers, tvIp) {
+    const queue = [...wrappers];
+    const worker = async () => {
+      while (queue.length) {
+        const wrapper = queue.shift();
+        await loadTVThumbnail(wrapper, tvIp, wrapper.dataset.contentId);
+      }
+    };
+    Promise.all([worker(), worker()]).catch(() => {});
+  }
+
+  async function warmTVThumbnailQueue(wrappers, tvIp) {
+    const pending = [...wrappers];
+    const available = [];
+
+    try {
+      for (let offset = 0; offset < pending.length; offset += 100) {
+        const chunk = pending.slice(offset, offset + 100);
+        const response = await apiFetch('/tv/art/thumbnails/warm', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            tv_ip: tvIp,
+            content_ids: chunk.map(wrapper => wrapper.dataset.contentId),
+          }),
+        });
+
+        // Some newer TVs do not implement the batch request. Preserve the
+        // individual path as a compatibility fallback when it fails cleanly.
+        if (!response.ok) {
+          loadTVThumbnailQueue(pending, tvIp);
+          return;
+        }
+
+        const result = await response.json();
+        const ready = new Set([...(result.cached || []), ...(result.warmed || [])]);
+        const missing = new Set(result.missing || []);
+        chunk.forEach((wrapper) => {
+          const contentId = wrapper.dataset.contentId;
+          if (ready.has(contentId)) available.push(wrapper);
+          else if (missing.has(contentId)) {
+            setTVThumbnailState(wrapper, 'missing', 'No thumbnail available');
+          } else {
+            setTVThumbnailState(wrapper, 'error', 'TV unavailable · Retry');
+          }
+        });
+      }
+      loadTVThumbnailQueue(available, tvIp);
+    } catch {
+      loadTVThumbnailQueue(pending, tvIp);
+    }
+  }
+
   async function loadTVArt() {
     const tvIp = document.getElementById('tv-art-select').value;
     const grid = document.getElementById('tv-art-grid');
@@ -2962,20 +3372,27 @@
 
       loadedTVArtById = Object.fromEntries(artworks.map(a => [a.content_id, a]));
 
-      grid.innerHTML = artworks.map(a => `
+      grid.innerHTML = artworks.map(a => {
+        const localPreview = a.local_job_id
+          ? '/jobs/' + encodeURIComponent(a.local_job_id) + '/image'
+          : '';
+        return `
         <div class="tv-art-item">
           <label class="art-select-row">
             <input type="checkbox" class="tv-art-select-item" data-content-id="${esc(a.content_id)}">
             <span class="art-id">${esc(a.content_id)}</span>
             ${a.is_favourite ? '<span class="art-fav">\u2665 favourite</span>' : ''}
           </label>
-          <div class="art-thumb-wrap">
+          <div class="art-thumb-wrap" data-content-id="${esc(a.content_id)}"
+               data-thumbnail-state="${localPreview ? 'local' : 'loading'}">
             <img class="art-thumb"
-                 src="/tv/art/thumbnail?tv_ip=${encodeURIComponent(tvIp)}&content_id=${encodeURIComponent(a.content_id)}"
+                 ${localPreview ? `src="${esc(localPreview)}"` : ''}
                  alt="Thumbnail ${esc(a.content_id)}"
-                 loading="lazy"
-                 onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
-            <div class="art-thumb-fallback">No thumbnail</div>
+                 loading="lazy"${localPreview ? '' : ' style="display:none"'}>
+            <button type="button" class="art-thumb-fallback"
+                    ${localPreview ? 'style="display:none" disabled' : 'disabled'}>
+              ${localPreview ? '' : 'Loading thumbnail…'}
+            </button>
           </div>
           <div class="art-actions">
             <button class="btn btn-small"
@@ -2992,8 +3409,29 @@
               Delete</button>
           </div>
         </div>
-      `).join('');
+      `;
+      }).join('');
       animateStaggeredChildren(grid, '.tv-art-item');
+
+      const coldThumbnails = [];
+      grid.querySelectorAll('.art-thumb-wrap').forEach((wrapper) => {
+        const contentId = wrapper.dataset.contentId;
+        const image = wrapper.querySelector('.art-thumb');
+        const fallback = wrapper.querySelector('.art-thumb-fallback');
+        fallback.addEventListener('click', () => {
+          loadTVThumbnail(wrapper, tvIp, contentId, true);
+        });
+        if (wrapper.dataset.thumbnailState === 'local') {
+          image.addEventListener('load', () => setTVThumbnailState(wrapper, 'loaded', ''));
+          image.addEventListener('error', () => loadTVThumbnail(wrapper, tvIp, contentId));
+          if (image.complete && image.naturalWidth > 0) {
+            setTVThumbnailState(wrapper, 'loaded', '');
+          }
+        } else {
+          coldThumbnails.push(wrapper);
+        }
+      });
+      warmTVThumbnailQueue(coldThumbnails, tvIp);
 
       grid.querySelectorAll('.tv-art-select-item').forEach(el => {
         el.addEventListener('change', (e) => {
@@ -3205,6 +3643,23 @@
     loadMattesForSelect('matte-select', tvIp);
   };
 
+  function matteEntryId(entry) {
+    if (typeof entry === 'string') return entry.trim();
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return '';
+    for (const key of ['matte_id', 'matte_type', 'matteId', 'matteType']) {
+      if (typeof entry[key] === 'string' && entry[key].trim()) return entry[key].trim();
+    }
+    return '';
+  }
+
+  function setMatteFallbackOptions(select) {
+    select.innerHTML = '';
+    const option = document.createElement('option');
+    option.value = 'none';
+    option.textContent = 'none';
+    select.appendChild(option);
+  }
+
   async function loadMattesForSelect(selectId, tvIp) {
     const sel = document.getElementById(selectId);
     if (!tvIp) return;
@@ -3215,13 +3670,14 @@
       if (!resp.ok) throw new Error('Failed to load');
       const mattes = await resp.json();
       sel.innerHTML = '';
-      if (!mattes.length) {
-        sel.innerHTML = '<option value="none">none</option>' +
-                        '<option value="shadowbox_polar">shadowbox_polar</option>';
+      const matteIds = Array.isArray(mattes)
+        ? [...new Set(mattes.map(matteEntryId).filter(Boolean))]
+        : [];
+      if (!matteIds.length) {
+        setMatteFallbackOptions(sel);
         return;
       }
-      for (const m of mattes) {
-        const id = m.matte_id || m;
+      for (const id of matteIds) {
         const opt = document.createElement('option');
         opt.value = id;
         opt.textContent = id;
@@ -3236,9 +3692,7 @@
       );
       if (remembered && [...sel.options].some(o => o.value === remembered)) sel.value = remembered;
     } catch {
-      sel.innerHTML = '<option value="none">none</option>' +
-                      '<option value="shadowbox_polar">shadowbox_polar</option>' +
-                      '<option value="shadowbox_noir">shadowbox_noir</option>';
+      setMatteFallbackOptions(sel);
       const remembered = localStorage.getItem(
         selectId === 'public-matte-select' ? storageKeys.mattePublic :
         selectId === 'own-upload-matte-select' ? storageKeys.matteOwnUpload :

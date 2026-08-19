@@ -9,7 +9,7 @@ Config sources (in priority order):
 from __future__ import annotations
 
 import os
-from ipaddress import IPv4Address, IPv4Network, ip_address
+from ipaddress import IPv4Address, IPv4Network, ip_address, ip_network
 from pathlib import Path
 from typing import Any
 
@@ -158,6 +158,37 @@ class Settings(BaseSettings):
     admin_token: SecretStr | None = None
     automation_token: SecretStr | None = None
     api_rate_limit_per_minute: int = Field(60, ge=1, le=10_000)
+    tailscale_auth_enabled: bool = False
+    tailscale_allowed_users: list[str] = Field(default_factory=list)
+    trusted_lan_cidrs: list[str] = Field(default_factory=list)
+    device_session_days: int = Field(365, ge=1, le=3650)
+    pairing_code_minutes: int = Field(10, ge=1, le=60)
+
+    @field_validator("tailscale_allowed_users")
+    @classmethod
+    def normalize_tailscale_users(cls, value: list[str]) -> list[str]:
+        return sorted({item.strip().lower() for item in value if item.strip()})
+
+    @field_validator("trusted_lan_cidrs")
+    @classmethod
+    def validate_trusted_lan_cidrs(cls, value: list[str]) -> list[str]:
+        private_networks = (
+            IPv4Network("10.0.0.0/8"),
+            IPv4Network("172.16.0.0/12"),
+            IPv4Network("192.168.0.0/16"),
+        )
+        normalized: list[str] = []
+        for item in value:
+            try:
+                network = ip_network(item.strip(), strict=False)
+            except ValueError as exc:
+                raise ValueError(f"Invalid trusted LAN CIDR: {item}") from exc
+            if not isinstance(network, IPv4Network) or not any(
+                network.subnet_of(private) for private in private_networks
+            ):
+                raise ValueError("Trusted LAN CIDRs must be RFC1918 IPv4 networks")
+            normalized.append(str(network))
+        return list(dict.fromkeys(normalized))
 
     @classmethod
     def settings_customise_sources(
