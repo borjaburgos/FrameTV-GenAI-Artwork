@@ -85,6 +85,7 @@ from frameart.automation import (
 from frameart.config import STYLE_PRESETS, ProviderConfig, Settings, TVProfile, load_settings
 from frameart.jobs import JobQueueFullError
 from frameart.library import LibraryStore
+from frameart.logging_utils import safe_exception_message
 from frameart.providers.registry import available_providers
 from frameart.settings_store import (
     SETTINGS_SCHEMA_VERSION,
@@ -110,6 +111,7 @@ from frameart.tv.controller import (
     TVOperationBusyError,
     TVOperationError,
     TVOperationTimeoutError,
+    preflight_tv,
 )
 
 logger = logging.getLogger(__name__)
@@ -440,6 +442,10 @@ class GenerateAndApplyRequest(GenerateRequest):
         description="Matte style (e.g., none, shadowbox_polar, shadowbox_noir).",
     )
     no_switch: bool = Field(False, description="Upload but don't switch displayed art.")
+    generate_anyway: bool = Field(
+        False,
+        description="Generate and save the artwork without contacting the selected TV.",
+    )
 
 
 class JobResponse(BaseModel):
@@ -454,6 +460,9 @@ class JobResponse(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     timings: dict[str, float] = Field(default_factory=dict)
     error: str | None = None
+    error_code: str | None = None
+    generation_succeeded: bool = False
+    delivery_status: str = "not_requested"
 
 
 class AsyncJobResponse(BaseModel):
@@ -1545,7 +1554,23 @@ def _pipeline_result_to_response(result) -> JobResponse:
         metadata=value("metadata", {}),
         timings=value("timings", {}),
         error=value("error"),
+        error_code=value("error_code"),
+        generation_succeeded=bool(value("generation_succeeded", False)),
+        delivery_status=value("delivery_status", "not_requested"),
     )
+
+
+def _pipeline_error_status(result) -> int:
+    error_code = (
+        result.get("error_code")
+        if isinstance(result, dict)
+        else getattr(result, "error_code", None)
+    )
+    if error_code == "tv_unreachable":
+        return 503
+    if error_code == "tv_art_mode_unavailable":
+        return 409
+    return 500
 
 
 def _configured_job_store(settings=None):
@@ -1692,7 +1717,10 @@ def _fetch_openai_image_models(openai_cfg) -> list[str]:
                     models.append(model_id)
         return list(dict.fromkeys(models))
     except Exception as e:
-        logger.warning("OpenAI model discovery failed: %s", e)
+        logger.warning(
+            "OpenAI model discovery failed: %s",
+            safe_exception_message(e, secrets=[api_key]),
+        )
         return []
 
 
@@ -1774,7 +1802,10 @@ def _fetch_google_image_models(google_cfg) -> list[str]:
                     models.append(model_name[len("models/") :])
         return list(dict.fromkeys(models))
     except Exception as e:
-        logger.warning("Google model discovery failed: %s", e)
+        logger.warning(
+            "Google model discovery failed: %s",
+            safe_exception_message(e, secrets=[api_key]),
+        )
         return []
 
 
@@ -2495,11 +2526,12 @@ def generate_and_apply(req: GenerateAndApplyRequest):
         tv_name=req.tv,
         tv_ip=req.tv_ip,
         matte=req.matte,
+        no_upload=req.generate_anyway,
         no_switch=req.no_switch,
     )
     resp = _pipeline_result_to_response(result)
     if result.error:
-        raise HTTPException(status_code=500, detail=resp.model_dump())
+        raise HTTPException(status_code=_pipeline_error_status(result), detail=resp.model_dump())
     return resp
 
 
@@ -2895,8 +2927,16 @@ def catalog_search(
         logger.warning("Catalog search bad request source=%s q=%r: %s", source, q, e)
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
-        logger.exception("Catalog search upstream failure source=%s q=%r", source, q)
-        raise HTTPException(status_code=502, detail=f"Catalog search failed: {e}") from e
+        safe_error = safe_exception_message(e)
+        logger.error(
+            "Catalog search upstream failure source=%s q=%r: %s",
+            source,
+            q,
+            safe_error,
+        )
+        raise HTTPException(
+            status_code=502, detail=f"Catalog search failed: {safe_error}"
+        ) from e
 
     validated: list[PublicDomainArtwork] = []
     dropped = 0
@@ -3657,6 +3697,40 @@ def apply_job_to_tv(job_id: str, req: JobApplyRequest):
     except HTTPException:
         profile = None
 
+    if profile is not None:
+        preflight = preflight_tv(profile)
+        if not (preflight.reachable and preflight.art_mode_supported):
+            error_code = (
+                "tv_unreachable" if not preflight.reachable else "tv_art_mode_unavailable"
+            )
+            message = (
+                "TV is unreachable. Wake it or check its network connection, then retry "
+                "this saved artwork; generation will not run again."
+                if error_code == "tv_unreachable"
+                else "The TV is reachable but does not report Frame Art Mode support."
+            )
+            failure = JobResponse(
+                job_id=job_id,
+                job_dir=str(job_dir),
+                final_path=str(selected_image),
+                metadata={
+                    "job_id": job_id,
+                    "tv_ip": profile.ip,
+                    "generation_succeeded": True,
+                    "delivery_status": "failed",
+                    "error_code": error_code,
+                    "tv_preflight_error": preflight.error,
+                },
+                error=message,
+                error_code=error_code,
+                generation_succeeded=True,
+                delivery_status="failed",
+            )
+            raise HTTPException(
+                status_code=503 if error_code == "tv_unreachable" else 409,
+                detail=failure.model_dump(),
+            )
+
     candidate_ids: list[str] = []
     if profile:
         mapped_id = tv_content_ids.get(profile.ip)
@@ -3698,6 +3772,8 @@ def apply_job_to_tv(job_id: str, req: JobApplyRequest):
                 },
                 timings={},
                 error=None,
+                generation_succeeded=True,
+                delivery_status="displayed",
             )
 
     result = run_apply(
@@ -3706,10 +3782,11 @@ def apply_job_to_tv(job_id: str, req: JobApplyRequest):
         tv_name=req.tv,
         tv_ip=req.tv_ip,
         matte=req.matte,
+        skip_preflight=True,
     )
     resp = _pipeline_result_to_response(result)
     if result.error:
-        raise HTTPException(status_code=500, detail=resp.model_dump())
+        raise HTTPException(status_code=_pipeline_error_status(result), detail=resp.model_dump())
 
     # Persist applied content ID back to the original job metadata for dedupe on re-apply.
     try:
@@ -3852,6 +3929,7 @@ def async_generate_and_apply(req: GenerateAndApplyRequest):
             "tv_name": req.tv,
             "tv_ip": req.tv_ip,
             "matte": req.matte,
+            "no_upload": req.generate_anyway,
             "no_switch": req.no_switch,
         },
         request_summary={
@@ -3862,6 +3940,7 @@ def async_generate_and_apply(req: GenerateAndApplyRequest):
             "model": req.model,
             "tv": req.tv,
             "tv_ip": req.tv_ip,
+            "generate_anyway": req.generate_anyway,
         },
     )
 

@@ -35,6 +35,9 @@ class FakePipelineResult:
     metadata: dict[str, Any] = field(default_factory=dict)
     timings: dict[str, float] = field(default_factory=lambda: {"generation_ms": 5000.0})
     error: str | None = None
+    error_code: str | None = None
+    generation_succeeded: bool = True
+    delivery_status: str = "displayed"
 
 
 def _fake_result(**overrides) -> FakePipelineResult:
@@ -699,6 +702,47 @@ class TestGenerateAndApply:
         )
         assert resp.status_code == 200
         assert mock_run.call_args.kwargs["matte"] == "none"
+
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_generate_and_apply")
+    def test_unreachable_tv_returns_structured_503(self, mock_run, mock_settings):
+        mock_settings.return_value = MagicMock()
+        mock_run.return_value = _fake_result(
+            final_path=None,
+            error="TV is unreachable. Choose Generate Anyway.",
+            error_code="tv_unreachable",
+            generation_succeeded=False,
+            delivery_status="not_attempted",
+        )
+
+        response = client.post(
+            "/generate-and-apply",
+            json={"prompt": "flowers", "tv_ip": "192.168.1.100"},
+        )
+
+        assert response.status_code == 503
+        detail = response.json()["detail"]
+        assert detail["error_code"] == "tv_unreachable"
+        assert detail["generation_succeeded"] is False
+        assert detail["delivery_status"] == "not_attempted"
+
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_generate_and_apply")
+    def test_generate_anyway_skips_upload(self, mock_run, mock_settings):
+        mock_settings.return_value = MagicMock()
+        mock_run.return_value = _fake_result(delivery_status="skipped")
+
+        response = client.post(
+            "/generate-and-apply",
+            json={
+                "prompt": "flowers",
+                "tv_ip": "192.168.1.100",
+                "generate_anyway": True,
+            },
+        )
+
+        assert response.status_code == 200
+        assert mock_run.call_args.kwargs["no_upload"] is True
 
     def test_rejects_public_tv_ip(self):
         resp = client.post(
@@ -2232,9 +2276,13 @@ class TestCatalogApply:
 # ---------------------------------------------------------------------------
 
 class TestJobApply:
+    @patch(
+        "frameart.api.preflight_tv",
+        return_value=MagicMock(reachable=True, art_mode_supported=True),
+    )
     @patch("frameart.api._settings")
     @patch("frameart.pipeline.run_apply")
-    def test_success(self, mock_run, mock_settings):
+    def test_success(self, mock_run, mock_settings, mock_preflight):
         import tempfile
 
         settings = MagicMock()
@@ -2253,7 +2301,13 @@ class TestJobApply:
             )
             assert resp.status_code == 200
             assert resp.json()["content_id"] == "MY_ART_001"
+            mock_preflight.assert_called_once()
+            assert mock_run.call_args.kwargs["skip_preflight"] is True
 
+    @patch(
+        "frameart.api.preflight_tv",
+        return_value=MagicMock(reachable=True, art_mode_supported=True),
+    )
     @patch("frameart.api._settings")
     @patch("frameart.pipeline.run_apply")
     @patch("frameart.tv.controller.switch_art")
@@ -2264,6 +2318,7 @@ class TestJobApply:
         mock_switch_art,
         mock_run_apply,
         mock_settings,
+        mock_preflight,
     ):
         import tempfile
 
@@ -2291,10 +2346,20 @@ class TestJobApply:
             assert data["tv_switched"] is True
             assert data["metadata"]["reused_existing_content"] is True
             mock_run_apply.assert_not_called()
+            mock_preflight.assert_called_once()
 
+    @patch(
+        "frameart.api.preflight_tv",
+        return_value=MagicMock(reachable=True, art_mode_supported=True),
+    )
     @patch("frameart.api._settings")
     @patch("frameart.pipeline.run_apply")
-    def test_persists_content_id_after_apply(self, mock_run, mock_settings):
+    def test_persists_content_id_after_apply(
+        self,
+        mock_run,
+        mock_settings,
+        mock_preflight,
+    ):
         import json
         import tempfile
 
@@ -2320,6 +2385,44 @@ class TestJobApply:
             persisted = json.loads((job_dir / "meta.json").read_text())
             assert persisted["content_id"] == "MY_F9000"
             assert persisted["tv_content_ids"]["192.168.1.100"] == "MY_F9000"
+            mock_preflight.assert_called_once()
+
+    @patch("frameart.api.preflight_tv")
+    @patch("frameart.tv.controller.list_art_deduplicated")
+    @patch("frameart.pipeline.run_apply")
+    @patch("frameart.api._settings")
+    def test_offline_tv_fails_before_dedupe_or_upload(
+        self,
+        mock_settings,
+        mock_run_apply,
+        mock_list_art,
+        mock_preflight,
+        tmp_path,
+    ):
+        job_dir = tmp_path / "artifacts" / "2025" / "01" / "01" / "test-job"
+        job_dir.mkdir(parents=True)
+        final_path = job_dir / "final.png"
+        final_path.write_bytes(b"saved")
+        settings = MagicMock(data_dir=tmp_path, tvs={})
+        mock_settings.return_value = settings
+        mock_preflight.return_value = MagicMock(
+            reachable=False,
+            art_mode_supported=False,
+            error="timed out",
+        )
+
+        response = client.post(
+            "/jobs/test-job/apply",
+            json={"tv_ip": "192.168.1.100"},
+        )
+
+        assert response.status_code == 503
+        detail = response.json()["detail"]
+        assert detail["error_code"] == "tv_unreachable"
+        assert detail["generation_succeeded"] is True
+        assert detail["final_path"] == str(final_path)
+        mock_list_art.assert_not_called()
+        mock_run_apply.assert_not_called()
 
     @patch("frameart.api._settings")
     def test_not_found(self, mock_settings):
@@ -2451,6 +2554,35 @@ class TestAsyncGenerateAndApply:
         assert request_summary["provider"] == "openai"
         assert request_summary["model"] == "gpt-image-1"
         assert request_summary["tv_ip"] == "10.0.0.1"
+
+    @patch("frameart.api._settings")
+    @patch("frameart.pipeline.run_generate_and_apply")
+    def test_generate_anyway_is_persisted_in_request_summary(
+        self,
+        mock_run,
+        mock_settings,
+    ):
+        mock_settings.return_value = MagicMock()
+        mock_run.return_value = _fake_result(delivery_status="skipped")
+
+        response = client.post(
+            "/async/generate-and-apply",
+            json={
+                "prompt": "mountains",
+                "tv_ip": "10.0.0.1",
+                "generate_anyway": True,
+            },
+        )
+        job_id = response.json()["job_id"]
+        for _ in range(50):
+            status_response = client.get(f"/jobs/{job_id}/status")
+            if status_response.json()["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.05)
+
+        payload = status_response.json()
+        assert payload["request"]["generate_anyway"] is True
+        assert mock_run.call_args.kwargs["no_upload"] is True
 
 
 class TestAsyncApply:

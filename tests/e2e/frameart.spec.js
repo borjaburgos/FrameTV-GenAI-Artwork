@@ -56,6 +56,142 @@ test('shows hybrid access and paired-device management', async ({ page }) => {
   await expect(accessCard.getByRole('button', { name: 'Pair Device' })).toBeDisabled();
 });
 
+test('offers generate anyway before spending on an offline TV', async ({ page, request }) => {
+  await request.post('/settings/tvs', {
+    data: {
+      profile_id: 'e2e_offline_tv',
+      ip: '192.168.50.31',
+      port: 8002,
+      client_name: 'Offline TV',
+      ssl: true,
+    },
+  });
+  const submissions = [];
+  await page.route('**/async/generate-and-apply', async (route) => {
+    submissions.push(route.request().postDataJSON());
+    const generateAnyway = submissions.at(-1).generate_anyway === true;
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        job_id: generateAnyway ? 'e2e-generate-anyway' : 'e2e-offline-preflight',
+        status: 'pending',
+      }),
+    });
+  });
+  await page.route('**/jobs/e2e-offline-preflight/status', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        job_id: 'e2e-offline-preflight',
+        status: 'failed',
+        request: {},
+        error: 'TV is unreachable. Choose Generate Anyway.',
+        result: {
+          job_id: 'e2e-offline-preflight-result',
+          job_dir: '/tmp/e2e-offline-preflight-result',
+          final_path: null,
+          error: 'TV is unreachable. Choose Generate Anyway.',
+          error_code: 'tv_unreachable',
+          generation_succeeded: false,
+          delivery_status: 'not_attempted',
+        },
+      }),
+    });
+  });
+
+  try {
+    await page.goto('/');
+    await page.getByPlaceholder('A peaceful mountain lake at sunset').fill('Offline TV test');
+    await page.locator('#tv-select').selectOption('192.168.50.31');
+    await page.getByRole('button', { name: 'Generate', exact: true }).click();
+
+    const card = page.locator('.gen-job-card').filter({ hasText: 'Offline TV test' }).first();
+    await expect(card.getByRole('button', { name: 'Generate Anyway' })).toBeVisible();
+    await card.getByRole('button', { name: 'Generate Anyway' }).click();
+    await expect.poll(() => submissions.length).toBe(2);
+    expect(submissions[1].generate_anyway).toBe(true);
+  } finally {
+    await request.delete('/settings/tvs/e2e_offline_tv');
+  }
+});
+
+test('keeps generated artwork and retries only TV delivery', async ({ page, request }) => {
+  await request.post('/settings/tvs', {
+    data: {
+      profile_id: 'e2e_retry_tv',
+      ip: '192.168.50.32',
+      port: 8002,
+      client_name: 'Retry TV',
+      ssl: true,
+    },
+  });
+  let applyPayload = null;
+  await page.route('**/async/generate-and-apply', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ job_id: 'e2e-delivery-failed', status: 'pending' }),
+    });
+  });
+  await page.route('**/jobs/e2e-delivery-failed/status', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        job_id: 'e2e-delivery-failed',
+        status: 'failed',
+        request: {},
+        error: 'Artwork was saved, but the TV became unreachable.',
+        result: {
+          job_id: 'e2e-saved-art',
+          job_dir: '/tmp/e2e-saved-art',
+          final_path: '/tmp/e2e-saved-art/final.png',
+          error: 'Artwork was saved, but the TV became unreachable.',
+          error_code: 'tv_unreachable',
+          generation_succeeded: true,
+          delivery_status: 'failed',
+        },
+      }),
+    });
+  });
+  await page.route('**/jobs/e2e-saved-art/image?**', async (route) => {
+    await route.fulfill({
+      contentType: 'image/png',
+      body: Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII=',
+        'base64',
+      ),
+    });
+  });
+  await page.route('**/jobs/e2e-saved-art/apply', async (route) => {
+    applyPayload = route.request().postDataJSON();
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        job_id: 'e2e-saved-art',
+        job_dir: '/tmp/e2e-saved-art',
+        final_path: '/tmp/e2e-saved-art/final.png',
+        tv_switched: true,
+        delivery_status: 'displayed',
+      }),
+    });
+  });
+
+  try {
+    await page.goto('/');
+    await page.getByPlaceholder('A peaceful mountain lake at sunset').fill('Saved artwork test');
+    await page.locator('#tv-select').selectOption('192.168.50.32');
+    await page.getByRole('button', { name: 'Generate', exact: true }).click();
+
+    const card = page.locator('.gen-job-card').filter({ hasText: 'Saved artwork test' });
+    await expect(card.getByRole('button', { name: 'Open Image' })).toBeVisible();
+    await expect(card.getByRole('button', { name: 'Retry TV' })).toBeVisible();
+    await card.getByRole('button', { name: 'Retry TV' }).click();
+    await expect(card).toContainText('displayed');
+    expect(applyPayload.tv_ip).toBe('192.168.50.32');
+  } finally {
+    await request.delete('/settings/tvs/e2e_retry_tv');
+  }
+});
+
 test('adds and removes a persistent TV profile', async ({ page }) => {
   await openSettings(page);
   await page.getByRole('button', { name: 'Add TV' }).click();

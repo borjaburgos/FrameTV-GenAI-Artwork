@@ -6,6 +6,7 @@ This module orchestrates the full workflow.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -22,6 +23,7 @@ from frameart.artifacts import (
     save_source_image,
 )
 from frameart.config import STYLE_PRESETS, Settings, TVProfile
+from frameart.logging_utils import safe_exception_message
 from frameart.postprocess import postprocess
 from frameart.providers.base import ImageProvider
 from frameart.providers.registry import get_provider
@@ -45,6 +47,88 @@ class PipelineResult:
     metadata: dict[str, Any] = field(default_factory=dict)
     timings: dict[str, float] = field(default_factory=dict)
     error: str | None = None
+    error_code: str | None = None
+    generation_succeeded: bool = False
+    delivery_status: str = "not_requested"
+
+
+def _provider_secret_values(settings: Settings) -> set[str]:
+    secrets = {
+        config.api_key
+        for config in settings.providers.values()
+        if config.api_key
+    }
+    for name in (
+        "OPENAI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GOOGLE_AI_API_KEY",
+        "OLLAMA_API_KEY",
+    ):
+        value = os.environ.get(name)
+        if value:
+            secrets.add(value)
+    return secrets
+
+
+def _safe_pipeline_error(settings: Settings, exc: BaseException) -> str:
+    return safe_exception_message(exc, secrets=_provider_secret_values(settings))
+
+
+def _tv_preflight_failure(
+    result: PipelineResult,
+    profile: TVProfile,
+    status: tv_ctrl.TVStatus,
+    *,
+    after_generation: bool,
+) -> PipelineResult | None:
+    if status.reachable and status.art_mode_supported:
+        return None
+
+    if not status.reachable:
+        result.error_code = "tv_unreachable"
+        if after_generation:
+            result.error = (
+                "Artwork was generated and saved, but the TV became unreachable before "
+                "delivery. Wake the TV or check its network connection, then retry TV "
+                "delivery from this saved artwork; generation will not run again."
+            )
+            result.delivery_status = "failed"
+        else:
+            result.error = (
+                "TV is unreachable. Wake it or check its network connection, then retry. "
+                "Choose Generate Anyway to save the artwork without uploading."
+            )
+            result.delivery_status = "not_attempted"
+    else:
+        result.error_code = "tv_art_mode_unavailable"
+        if after_generation:
+            result.error = (
+                "Artwork was generated and saved, but the TV does not report Frame Art "
+                "Mode support. Choose a compatible TV and retry delivery from this saved "
+                "artwork; generation will not run again."
+            )
+            result.delivery_status = "failed"
+        else:
+            result.error = (
+                "The TV is reachable but does not report Frame Art Mode support. "
+                "Choose Generate Anyway to save the artwork without uploading."
+            )
+            result.delivery_status = "not_attempted"
+
+    result.metadata.update(
+        {
+            "job_id": result.job_id,
+            "tv_ip": profile.ip,
+            "generation_succeeded": result.generation_succeeded,
+            "delivery_status": result.delivery_status,
+            "error_code": result.error_code,
+            "error": result.error,
+            "tv_preflight_error": status.error,
+        }
+    )
+    save_metadata(result.job_dir, result.metadata)
+    logger.warning("TV preflight blocked delivery to %s: %s", profile.ip, result.error_code)
+    return result
 
 
 def _record_display_history(settings: Settings, result: PipelineResult, source: str) -> None:
@@ -71,6 +155,8 @@ def _record_switch_failure(result: PipelineResult) -> None:
         "displayed. Retry without uploading another copy: "
         f"frameart tv display --tv <profile> --content-id {content_id}"
     )
+    result.error_code = "tv_display_failed"
+    result.delivery_status = "failed"
     logger.error(result.error)
 
 
@@ -238,6 +324,7 @@ def run_generate(
 
         # Save final
         result.final_path = save_final_image(job_dir, pp_result.image_bytes)
+        result.generation_succeeded = True
 
         # Build metadata
         result.metadata = {
@@ -254,13 +341,16 @@ def run_generate(
             "postprocess_steps": pp_result.steps,
             "upscaler": upscaler.name,
             "timings": timings,
+            "generation_succeeded": True,
+            "delivery_status": result.delivery_status,
             **gen_result.metadata,
         }
         save_metadata(job_dir, result.metadata)
 
     except Exception as e:
-        result.error = str(e)
-        logger.error("Pipeline generate failed: %s", e)
+        result.error = _safe_pipeline_error(settings, e)
+        result.error_code = "generation_failed"
+        logger.error("Pipeline generate failed: %s", result.error)
 
     return result
 
@@ -272,6 +362,7 @@ def run_apply(
     tv_name: str | None = None,
     tv_ip: str | None = None,
     matte: str = "none",
+    skip_preflight: bool = False,
 ) -> PipelineResult:
     """Upload an existing image to the TV and switch to it.
 
@@ -297,6 +388,12 @@ def run_apply(
             raise RuntimeError(
                 "No TV specified. Use --tv or --tv-ip, or configure a TV in config.yaml"
             )
+
+        result.generation_succeeded = True
+        if not skip_preflight:
+            preflight = tv_ctrl.preflight_tv(profile)
+            if _tv_preflight_failure(result, profile, preflight, after_generation=True):
+                return result
 
         image_bytes = Path(image_path).read_bytes()
 
@@ -326,6 +423,8 @@ def run_apply(
         result.tv_switched = switched
         if not switched:
             _record_switch_failure(result)
+        else:
+            result.delivery_status = "displayed"
 
         result.metadata = {
             "job_id": job_id,
@@ -336,12 +435,17 @@ def run_apply(
             "error": result.error,
             "matte": matte,
             "timings": timings,
+            "generation_succeeded": result.generation_succeeded,
+            "delivery_status": result.delivery_status,
+            "error_code": result.error_code,
         }
         save_metadata(job_dir, result.metadata)
 
     except Exception as e:
-        result.error = str(e)
-        logger.error("Pipeline apply failed: %s", e)
+        result.error = _safe_pipeline_error(settings, e)
+        result.error_code = result.error_code or "tv_delivery_failed"
+        result.delivery_status = "failed"
+        logger.error("Pipeline apply failed: %s", result.error)
 
     _record_display_history(settings, result, "apply")
     return result
@@ -421,8 +525,9 @@ def run_import_and_apply(
         save_metadata(job_dir, result.metadata)
 
     except Exception as e:
-        result.error = str(e)
-        logger.error("Pipeline import+apply failed: %s", e)
+        result.error = _safe_pipeline_error(settings, e)
+        result.error_code = "pipeline_failed"
+        logger.error("Pipeline import+apply failed: %s", result.error)
 
     _record_display_history(settings, result, "import")
     return result
@@ -541,8 +646,9 @@ def run_edit_and_apply(
         save_metadata(job_dir, result.metadata)
 
     except Exception as e:
-        result.error = str(e)
-        logger.error("Pipeline edit+apply failed: %s", e)
+        result.error = _safe_pipeline_error(settings, e)
+        result.error_code = "pipeline_failed"
+        logger.error("Pipeline edit+apply failed: %s", result.error)
 
     _record_display_history(settings, result, "edit")
     return result
@@ -567,6 +673,35 @@ def run_generate_and_apply(
     no_switch: bool = False,
 ) -> PipelineResult:
     """Full pipeline: generate → postprocess → upload → switch display."""
+    profile = None
+    if not no_upload:
+        profile = _resolve_tv_profile(settings, tv_name, tv_ip)
+        if profile is None:
+            job_id = generate_job_id()
+            result = PipelineResult(
+                job_id=job_id,
+                job_dir=get_job_dir(settings.data_dir, job_id),
+                error="No TV specified. Use --tv or --tv-ip, or configure a TV in config.yaml",
+                error_code="tv_not_configured",
+                delivery_status="not_attempted",
+            )
+            save_metadata(result.job_dir, {"job_id": job_id, "error": result.error})
+            return result
+        preflight = tv_ctrl.preflight_tv(profile)
+        if not (preflight.reachable and preflight.art_mode_supported):
+            job_id = generate_job_id()
+            preflight_result = PipelineResult(
+                job_id=job_id,
+                job_dir=get_job_dir(settings.data_dir, job_id),
+                delivery_status="not_attempted",
+            )
+            return _tv_preflight_failure(
+                preflight_result,
+                profile,
+                preflight,
+                after_generation=False,
+            ) or preflight_result
+
     # Generate + postprocess
     result = run_generate(
         settings,
@@ -585,14 +720,21 @@ def run_generate_and_apply(
         return result
 
     if no_upload:
-        logger.info("--no-upload: skipping TV upload")
+        logger.info("Generate anyway: skipping TV upload")
+        result.delivery_status = "skipped"
+        result.metadata["delivery_status"] = result.delivery_status
+        save_metadata(result.job_dir, result.metadata)
         return result
 
     # Upload + switch
-    profile = _resolve_tv_profile(settings, tv_name, tv_ip)
     if profile is None:
         result.error = "No TV specified. Use --tv or --tv-ip, or configure a TV in config.yaml"
-        logger.error(result.error)
+        result.error_code = "tv_not_configured"
+        result.delivery_status = "not_attempted"
+        return result
+
+    preflight = tv_ctrl.preflight_tv(profile)
+    if _tv_preflight_failure(result, profile, preflight, after_generation=True):
         return result
 
     image_bytes = result.final_path.read_bytes()
@@ -604,6 +746,19 @@ def run_generate_and_apply(
 
     if not upload_result.success:
         result.error = f"Upload failed: {upload_result.error}"
+        result.error_code = "tv_delivery_failed"
+        result.delivery_status = "failed"
+        result.metadata.update(
+            {
+                "tv_ip": profile.ip,
+                "error": result.error,
+                "error_code": result.error_code,
+                "generation_succeeded": result.generation_succeeded,
+                "delivery_status": result.delivery_status,
+                "matte": matte,
+            }
+        )
+        save_metadata(result.job_dir, result.metadata)
         logger.error(result.error)
         return result
 
@@ -611,6 +766,7 @@ def run_generate_and_apply(
 
     if no_switch:
         logger.info("--no-switch: skipping art switch")
+        result.delivery_status = "uploaded"
     else:
         t0 = time.monotonic()
         result.tv_switched = tv_ctrl.switch_art(
@@ -621,6 +777,8 @@ def run_generate_and_apply(
         result.timings["switch_ms"] = (time.monotonic() - t0) * 1000
         if not result.tv_switched:
             _record_switch_failure(result)
+        else:
+            result.delivery_status = "displayed"
 
     # Update metadata with TV info
     result.metadata.update({
@@ -628,7 +786,10 @@ def run_generate_and_apply(
         "tv_ip": profile.ip,
         "tv_switched": result.tv_switched,
         "error": result.error,
+        "error_code": result.error_code,
         "matte": matte,
+        "generation_succeeded": result.generation_succeeded,
+        "delivery_status": result.delivery_status,
     })
     result.metadata["timings"] = result.timings
     save_metadata(result.job_dir, result.metadata)

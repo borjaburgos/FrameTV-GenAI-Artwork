@@ -16,6 +16,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from frameart.logging_utils import safe_exception_message
+
 logger = logging.getLogger(__name__)
 
 MAX_COMPLETED_JOBS = 200
@@ -284,8 +286,8 @@ class JobStore:
                 job.status = JobStatus.completed
         except Exception as exc:
             job.status = JobStatus.failed
-            job.error = str(exc)
-            logger.exception("Job %s failed: %s", job.id, exc)
+            job.error = safe_exception_message(exc)
+            logger.error("Job %s failed: %s", job.id, job.error)
         finally:
             with self._lock:
                 job.completed_at = time.time()
