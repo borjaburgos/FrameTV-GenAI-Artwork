@@ -3,7 +3,14 @@
 {$FRAMEART_DOMAIN:frameart.home.arpa} {
 	tls internal
 	encode zstd gzip
-	reverse_proxy 127.0.0.1:8000
+	reverse_proxy 127.0.0.1:8000 {
+		# Never forward client-supplied Tailscale identity headers through the
+		# LAN proxy. Only Tailscale Serve may assert these to FrameArt.
+		header_up -Tailscale-User-Login
+		header_up -Tailscale-User-Name
+		header_up -Tailscale-User-Profile-Pic
+		header_up -Tailscale-App-Capabilities
+	}
 	header {
 		Strict-Transport-Security "max-age=31536000"
 		X-Content-Type-Options "nosniff"

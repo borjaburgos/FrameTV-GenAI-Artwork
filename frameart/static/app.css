@@ -200,6 +200,7 @@
     box-shadow: var(--shadow);
   }
   .settings-card h3 { font-size: 1rem; margin-bottom: .4rem; }
+  .settings-card h4 { font-size: .86rem; }
   .settings-card p { color: var(--muted); font-size: .86rem; line-height: 1.4; }
   .settings-card-wide { grid-column: 1 / -1; }
   .settings-card-header { display: flex; justify-content: space-between; align-items: flex-start;
@@ -225,6 +226,25 @@
   .settings-item-actions { display: flex; align-items: center; justify-content: flex-end;
                            gap: .35rem; flex-wrap: wrap; }
   .settings-item strong { color: var(--text); font-weight: 600; }
+  .settings-subheading { margin-top: 1rem; color: var(--muted); }
+  .access-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+  .pairing-dialog { text-align: center; }
+  .pairing-dialog > p { color: var(--muted); font-size: .86rem; line-height: 1.4; }
+  .pairing-qr {
+    display: block;
+    width: min(240px, 70vw);
+    height: auto;
+    margin: 1rem auto;
+    padding: .55rem;
+    background: #fff;
+    image-rendering: pixelated;
+  }
+  .pairing-code {
+    margin: .5rem 0 1rem;
+    color: var(--text);
+    font: 700 1.4rem ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    letter-spacing: .12em;
+  }
   .inline-check { display: flex; align-items: center; gap: .5rem; margin-bottom: .8rem; }
   .inline-check input { width: auto; margin: 0; }
   .inline-check label { margin: 0; }

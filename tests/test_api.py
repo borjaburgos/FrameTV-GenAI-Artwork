@@ -11,10 +11,11 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from fastapi import Request
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from frameart.api import app
+from frameart.api import _request_client_ip, _trusted_lan_identity, app
 
 client = TestClient(app)
 
@@ -154,10 +155,11 @@ class TestDiagnosticsAndBackups:
 
 
 class TestAuthentication:
-    def test_admin_token_creates_browser_session(self, monkeypatch):
+    def test_admin_token_creates_browser_session(self, monkeypatch, tmp_path):
         token = "admin-token-with-at-least-twenty-characters"
         monkeypatch.setenv("FRAMEART_AUTH_ENABLED", "true")
         monkeypatch.setenv("FRAMEART_ADMIN_TOKEN", token)
+        monkeypatch.setenv("FRAMEART_DATA_DIR", str(tmp_path))
 
         with TestClient(app) as secured_client:
             assert secured_client.get("/health").status_code == 200
@@ -167,7 +169,120 @@ class TestAuthentication:
             login = secured_client.post("/auth/session", json={"token": token})
             assert login.status_code == 200
             assert login.json()["scopes"] == ["admin", "control", "read"]
+            assert login.json()["device_id"]
+            assert secured_client.cookies.get("frameart_device")
             assert secured_client.get("/styles").status_code == 200
+
+            secured_client.cookies.delete("frameart_session")
+            assert secured_client.get("/styles").status_code == 200
+            access = secured_client.get("/auth/access").json()
+            assert access["method"] == "paired_device"
+            assert access["devices"][0]["name"] == "Browser device"
+            assert access["devices"][0]["current"] is True
+
+    def test_pairing_link_creates_and_revokes_a_device(self, monkeypatch, tmp_path):
+        token = "admin-token-with-at-least-twenty-characters"
+        monkeypatch.setenv("FRAMEART_AUTH_ENABLED", "true")
+        monkeypatch.setenv("FRAMEART_ADMIN_TOKEN", token)
+        monkeypatch.setenv("FRAMEART_DATA_DIR", str(tmp_path))
+        admin_headers = {"Authorization": f"Bearer {token}"}
+
+        with TestClient(app) as admin_client, TestClient(app) as new_device:
+            pairing_response = admin_client.post("/auth/pairings", headers=admin_headers)
+            assert pairing_response.status_code == 201
+            pairing = pairing_response.json()
+            assert pairing["pairing_url"].endswith(f"?pair={pairing['code']}")
+            assert pairing["qr_data_url"].startswith("data:image/png;base64,")
+
+            paired = new_device.post(
+                "/auth/pair",
+                json={"code": pairing["code"], "device_name": "Hallway display"},
+            )
+            assert paired.status_code == 200
+            device_id = paired.json()["device_id"]
+            assert new_device.get("/styles").status_code == 200
+
+            replay = admin_client.post(
+                "/auth/pair",
+                json={"code": pairing["code"], "device_name": "Replay"},
+            )
+            assert replay.status_code == 400
+
+            devices = admin_client.get("/auth/access", headers=admin_headers).json()["devices"]
+            assert any(device["name"] == "Hallway display" for device in devices)
+            revoked = admin_client.delete(f"/auth/devices/{device_id}", headers=admin_headers)
+            assert revoked.status_code == 200
+            assert new_device.get("/styles").status_code == 401
+
+    def test_tailscale_identity_can_replace_token_prompt(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("FRAMEART_AUTH_ENABLED", "true")
+        monkeypatch.setenv("FRAMEART_ADMIN_TOKEN", "admin-token-with-twenty-characters")
+        monkeypatch.setenv("FRAMEART_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("FRAMEART_TAILSCALE_AUTH_ENABLED", "true")
+        monkeypatch.setenv("FRAMEART_TAILSCALE_ALLOWED_USERS", '["owner@example.com"]')
+
+        with TestClient(app) as secured_client:
+            allowed = secured_client.get(
+                "/auth/status",
+                headers={"Tailscale-User-Login": "owner@example.com"},
+            )
+            assert allowed.status_code == 200
+            assert allowed.json()["method"] == "tailscale"
+            assert allowed.json()["identity"] == "owner@example.com"
+
+            denied = secured_client.get(
+                "/styles",
+                headers={"Tailscale-User-Login": "someone-else@example.com"},
+            )
+            assert denied.status_code == 401
+
+            cross_origin = secured_client.post(
+                "/jobs/delete",
+                json={"job_ids": ["job-1"]},
+                headers={
+                    "Tailscale-User-Login": "owner@example.com",
+                    "Origin": "https://attacker.example",
+                },
+            )
+            assert cross_origin.status_code == 403
+            assert cross_origin.json()["detail"] == "Origin check failed."
+
+    def test_trusted_lan_cidr_can_replace_token_prompt(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("FRAMEART_AUTH_ENABLED", "true")
+        monkeypatch.setenv("FRAMEART_ADMIN_TOKEN", "admin-token-with-twenty-characters")
+        monkeypatch.setenv("FRAMEART_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("FRAMEART_TRUSTED_LAN_CIDRS", '["192.168.50.0/24"]')
+
+        with TestClient(app, client=("192.168.50.25", 54321)) as lan_client:
+            status = lan_client.get("/auth/status")
+            assert status.status_code == 200
+            assert status.json()["method"] == "trusted_lan"
+            assert status.json()["identity"] == "192.168.50.25"
+
+    def test_trusted_lan_uses_forwarded_ip_only_from_loopback_proxy(self):
+        settings = MagicMock(trusted_lan_cidrs=["192.168.50.0/24"])
+
+        def request_from(client_ip: str) -> Request:
+            return Request(
+                {
+                    "type": "http",
+                    "method": "GET",
+                    "path": "/auth/status",
+                    "headers": [(b"x-forwarded-for", b"192.168.50.25")],
+                    "client": (client_ip, 54321),
+                    "server": ("frameart.home.arpa", 443),
+                    "scheme": "https",
+                    "query_string": b"",
+                }
+            )
+
+        proxied = request_from("127.0.0.1")
+        assert _request_client_ip(proxied) == "192.168.50.25"
+        assert _trusted_lan_identity(settings, proxied) == "192.168.50.25"
+
+        direct = request_from("203.0.113.10")
+        assert _request_client_ip(direct) == "203.0.113.10"
+        assert _trusted_lan_identity(settings, direct) is None
 
     def test_automation_token_cannot_use_admin_scope(self, monkeypatch):
         token = "automation-token-with-twenty-characters"
@@ -212,6 +327,16 @@ class TestServerSecurity:
 
         monkeypatch.setenv("FRAMEART_AUTH_ENABLED", "false")
         with pytest.raises(RuntimeError, match="non-loopback"):
+            run_server(host="0.0.0.0", port=8123)
+        mock_run.assert_not_called()
+
+    @patch("uvicorn.run")
+    def test_tailscale_headers_require_loopback_bind(self, mock_run, monkeypatch):
+        from frameart.api import run_server
+
+        monkeypatch.setenv("FRAMEART_AUTH_ENABLED", "true")
+        monkeypatch.setenv("FRAMEART_TAILSCALE_AUTH_ENABLED", "true")
+        with pytest.raises(RuntimeError, match="loopback bind"):
             run_server(host="0.0.0.0", port=8123)
         mock_run.assert_not_called()
 
@@ -2598,8 +2723,12 @@ class TestWebUI:
         assert 'id="provider-settings-modal"' in resp.text
         assert 'id="btn-settings-add-tv"' in resp.text
         assert 'id="tv-settings-modal"' in resp.text
+        assert 'id="settings-access-summary"' in resp.text
+        assert 'id="device-pairing-modal"' in resp.text
         assert "'/settings/providers'" in script.text
         assert "'/settings/tvs'" in script.text
+        assert "'/auth/pairings'" in script.text
+        assert "'/auth/access'" in script.text
 
     def test_automation_ui_has_groups_playlists_schedules_and_integrations(self):
         page = client.get("/")

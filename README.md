@@ -216,7 +216,29 @@ frameart serve --host 0.0.0.0 --port 8000
 
 Interactive API docs are available at `http://localhost:8000/docs` and the web UI at `http://localhost:8000/` once the server is running.
 
-Loopback-only serving leaves authentication off by default. Non-loopback binds are refused unless authentication is enabled. Admin tokens have `read`, `control`, and `admin` access; the optional `FRAMEART_AUTOMATION_TOKEN` has `read` and `control` access but cannot delete artwork or jobs. API clients can send either `Authorization: Bearer <token>` or `X-FrameArt-Token: <token>`. The web UI prompts for a token and stores it in an HttpOnly session cookie.
+Loopback-only serving leaves authentication off by default. Non-loopback binds are refused unless authentication is enabled. Admin tokens have `read`, `control`, and `admin` access; the optional `FRAMEART_AUTOMATION_TOKEN` has `read` and `control` access but cannot delete artwork or jobs. API clients can send either `Authorization: Bearer <token>` or `X-FrameArt-Token: <token>`.
+
+The web UI remembers a successful token login as a revocable browser device for 365 days by default. Settings > Access & Paired Devices can create a one-time QR/link or short code for another browser, list paired devices, and revoke them individually. A new browser can scan the QR, open the link, or enter the code in the normal authentication prompt. Only hashes of device credentials and pairing codes are stored.
+
+### Hybrid local and Tailscale access
+
+For passwordless Tailscale access while retaining ordinary local browsers, keep FrameArt on loopback and put the two trusted proxies in front of it:
+
+- Tailscale Serve provides the private tailnet HTTPS address and authenticated identity headers.
+- The supplied Caddy configuration provides the local HTTPS address. Local browsers either pair once or, on a fully trusted VLAN, use an explicitly configured RFC1918 subnet.
+
+```bash
+export FRAMEART_AUTH_ENABLED=true
+export FRAMEART_TAILSCALE_AUTH_ENABLED=true
+export FRAMEART_TAILSCALE_ALLOWED_USERS='["owner@example.com"]'
+# Optional; omit this and pair local browsers for the safer default:
+# export FRAMEART_TRUSTED_LAN_CIDRS='["192.168.1.0/24"]'
+
+frameart serve --host 127.0.0.1 --port 8000
+tailscale serve --bg 8000
+```
+
+Use `deploy/Caddyfile.local` for the local hostname. It removes any client-supplied Tailscale identity headers before proxying, while Tailscale Serve connects directly to FrameArt. Tailscale authentication deliberately refuses a non-loopback FrameArt bind. Never use Tailscale Funnel for this deployment.
 
 ### Endpoints
 
@@ -489,6 +511,11 @@ See [`config.example.yaml`](config.example.yaml) for all options.
 | `FRAMEART_ADMIN_TOKEN` | Full-access API token; generated on first authenticated start when omitted |
 | `FRAMEART_AUTOMATION_TOKEN` | Optional read/control token without destructive admin access |
 | `FRAMEART_API_RATE_LIMIT_PER_MINUTE` | Per-client mutation limit (default: `60`) |
+| `FRAMEART_DEVICE_SESSION_DAYS` | Lifetime of revocable browser sessions (default: `365`) |
+| `FRAMEART_PAIRING_CODE_MINUTES` | Lifetime of one-time device pairing links (default: `10`) |
+| `FRAMEART_TAILSCALE_AUTH_ENABLED` | Trust Tailscale Serve identity headers on a loopback-only bind |
+| `FRAMEART_TAILSCALE_ALLOWED_USERS` | Optional JSON list of allowed Tailscale login names |
+| `FRAMEART_TRUSTED_LAN_CIDRS` | Optional JSON list of no-prompt RFC1918 subnets |
 | `FRAMEART_MQTT_BROKER` | Optional MQTT hostname for schedule events |
 | `FRAMEART_MQTT_PORT` | MQTT port (default: `1883`) |
 | `FRAMEART_MQTT_USERNAME` / `FRAMEART_MQTT_PASSWORD` | Optional MQTT credentials |
@@ -548,12 +575,14 @@ The included `Makefile` shortens the common lifecycle to `make build`, `make up`
 published GHCR tag instead of building locally. Tagged releases publish provenance,
 an SBOM, and `linux/amd64` plus `linux/arm64` images.
 
-The `docker-compose.yml` includes three services:
+The `docker-compose.yml` includes four services:
 
 - **`frameart`** — one-shot CLI commands
 - **`frameart-api`** — HTTP API on port 8000 using Docker bridge networking
 - **`frameart-api-lan`** — recommended Linux API deployment with host networking for
   Samsung TV discovery and control
+- **`frameart-api-tailnet`** — loopback-only host networking for Tailscale Serve,
+  local HTTPS proxying, and TV discovery/control
 
 ```bash
 # CLI one-shot
@@ -575,10 +604,18 @@ service binds directly to the host's port 8000 and therefore does not use a `por
 docker compose --profile lan up -d frameart-api-lan
 ```
 
+For the loopback-only hybrid deployment with host-network TV discovery, configure
+`FRAMEART_TAILSCALE_ALLOWED_USERS` in `.env`, then run:
+
+```bash
+docker compose --profile tailscale up -d frameart-api-tailnet
+tailscale serve --bg 8000
+```
+
 #### HTTPS for a home network
 
-Install Caddy on the same Linux host as `frameart-api-lan`, point your local DNS entry at
-that host, and run the supplied local-CA configuration:
+Install Caddy on the same Linux host as `frameart-api-lan` or `frameart-api-tailnet`, point
+your local DNS entry at that host, and run the supplied local-CA configuration:
 
 ```bash
 export FRAMEART_DOMAIN=frameart.home.arpa

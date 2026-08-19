@@ -45,6 +45,17 @@ test('adds and removes an image provider', async ({ page }) => {
   await expect(provider).toHaveCount(0);
 });
 
+test('shows hybrid access and paired-device management', async ({ page }) => {
+  await openSettings(page);
+
+  const accessCard = page.locator('.settings-card').filter({
+    has: page.getByRole('heading', { name: 'Access & Paired Devices' }),
+  });
+  await expect(accessCard).toContainText('Authentication disabled');
+  await expect(accessCard).toContainText('No paired devices');
+  await expect(accessCard.getByRole('button', { name: 'Pair Device' })).toBeDisabled();
+});
+
 test('adds and removes a persistent TV profile', async ({ page }) => {
   await openSettings(page);
   await page.getByRole('button', { name: 'Add TV' }).click();

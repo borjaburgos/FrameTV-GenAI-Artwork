@@ -389,6 +389,20 @@
     <div class="settings-card settings-card-wide">
       <div class="settings-card-header">
         <div>
+          <h3>Access &amp; Paired Devices</h3>
+          <p>Use Tailscale, a trusted LAN, or pair browsers without repeatedly entering the admin token.</p>
+        </div>
+        <button class="btn btn-secondary btn-small" id="btn-settings-pair-device">Pair Device</button>
+      </div>
+      <div class="settings-list access-summary" id="settings-access-summary">
+        <div class="settings-item"><strong>Loading...</strong><span></span></div>
+      </div>
+      <h4 class="settings-subheading">Paired browsers</h4>
+      <div class="settings-list" id="settings-device-list"></div>
+    </div>
+    <div class="settings-card settings-card-wide">
+      <div class="settings-card-header">
+        <div>
           <h3>Providers</h3>
           <p>API keys are masked and stored separately from non-secret settings.</p>
         </div>
@@ -683,6 +697,22 @@
     </div>
     <div class="modal-actions">
       <button class="btn btn-small" id="btn-shortcuts-close">Close</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="device-pairing-modal" role="dialog" aria-modal="true" aria-labelledby="device-pairing-title">
+  <div class="modal-dialog pairing-dialog">
+    <h3 id="device-pairing-title">Pair a Device</h3>
+    <p>Scan this code, copy the link, or enter the displayed code when FrameArt prompts on another device. It works once and expires shortly.</p>
+    <img class="pairing-qr" id="device-pairing-qr" alt="FrameArt device pairing QR code">
+    <div class="pairing-code" id="device-pairing-code"></div>
+    <label for="device-pairing-link">Pairing link</label>
+    <input id="device-pairing-link" readonly>
+    <p id="device-pairing-expiry"></p>
+    <div class="modal-actions">
+      <button class="btn btn-secondary btn-small" id="btn-device-pairing-close">Close</button>
+      <button class="btn btn-small" id="btn-device-pairing-copy">Copy Link</button>
     </div>
   </div>
 </div>

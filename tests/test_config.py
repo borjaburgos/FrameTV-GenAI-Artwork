@@ -26,6 +26,21 @@ class TestSettings:
         assert profile.name == "FrameArt"
         assert profile.ssl is True
 
+    def test_hybrid_access_defaults(self):
+        settings = Settings()
+        assert settings.tailscale_auth_enabled is False
+        assert settings.tailscale_allowed_users == []
+        assert settings.trusted_lan_cidrs == []
+        assert settings.device_session_days == 365
+        assert settings.pairing_code_minutes == 10
+
+    def test_trusted_lan_cidrs_are_normalized_and_public_ranges_rejected(self):
+        settings = Settings(trusted_lan_cidrs=["192.168.1.15/24", "10.0.0.0/8"])
+        assert settings.trusted_lan_cidrs == ["192.168.1.0/24", "10.0.0.0/8"]
+
+        with pytest.raises(ValidationError, match="RFC1918"):
+            Settings(trusted_lan_cidrs=["0.0.0.0/0"])
+
     @pytest.mark.parametrize("ip", ["8.8.8.8", "127.0.0.1", "not-an-ip", "::1"])
     def test_tv_profile_rejects_non_private_ipv4(self, ip):
         with pytest.raises(ValidationError):

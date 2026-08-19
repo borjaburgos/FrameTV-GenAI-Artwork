@@ -52,17 +52,20 @@ import tempfile
 import threading
 import time
 import uuid
+from base64 import b64encode
 from collections import defaultdict, deque
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from email.header import decode_header, make_header
 from io import BytesIO
-from ipaddress import ip_address
+from ipaddress import ip_address, ip_network
 from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urlsplit
 
 import httpx2 as httpx
+import qrcode
 import yaml
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -72,6 +75,7 @@ from pydantic import AfterValidator, BaseModel, Field, SecretStr, field_validato
 
 import frameart.public_domain as public_domain
 from frameart import __version__
+from frameart.access import AccessStore, InvalidPairingCodeError
 from frameart.automation import (
     AutomationScheduler,
     AutomationStore,
@@ -122,6 +126,7 @@ _PUBLIC_PATHS = {
     "/health",
     "/health/ready",
     "/auth/session",
+    "/auth/pair",
     "/docs",
     "/docs/oauth2-redirect",
     "/openapi.json",
@@ -129,7 +134,13 @@ _PUBLIC_PATHS = {
 }
 _PUBLIC_PREFIXES = ("/static/",)
 _ADMIN_PATHS = {"/jobs/delete", "/tv/art/delete", "/tv/art/matte", "/tv/mattes/cache"}
-_ADMIN_PREFIXES = ("/settings", "/automation")
+_ADMIN_PREFIXES = (
+    "/settings",
+    "/automation",
+    "/auth/access",
+    "/auth/devices",
+    "/auth/pairings",
+)
 _rate_limit_events: dict[str, deque[float]] = defaultdict(deque)
 _rate_limit_lock = threading.Lock()
 
@@ -193,6 +204,10 @@ def _presented_token(request: Request) -> tuple[str | None, bool]:
     return (cookie_token, True) if cookie_token else (None, False)
 
 
+def _access_store(settings) -> AccessStore:
+    return AccessStore(Path(settings.data_dir))
+
+
 def _token_scopes(settings, token: str | None) -> set[str]:
     if not token:
         return set()
@@ -203,6 +218,109 @@ def _token_scopes(settings, token: str | None) -> set[str]:
     if automation_token and secrets.compare_digest(token, automation_token):
         return {"read", "control"}
     return set()
+
+
+def _trusted_lan_identity(settings, request: Request) -> str | None:
+    if not settings.trusted_lan_cidrs:
+        return None
+    client_host = _request_client_ip(request)
+    if client_host is None:
+        return None
+    try:
+        client_ip = ip_address(client_host)
+    except ValueError:
+        return None
+    if any(client_ip in ip_network(cidr) for cidr in settings.trusted_lan_cidrs):
+        return str(client_ip)
+    return None
+
+
+def _request_client_ip(request: Request) -> str | None:
+    """Resolve the client IP, trusting proxy headers only from loopback."""
+    if request.client is None:
+        return None
+    immediate_host = request.client.host
+    try:
+        immediate_ip = ip_address(immediate_host)
+    except ValueError:
+        return immediate_host
+    if immediate_ip.is_loopback:
+        forwarded_for = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
+        if forwarded_for:
+            try:
+                return str(ip_address(forwarded_for))
+            except ValueError:
+                return None
+    return str(immediate_ip)
+
+
+def _tailscale_identity(settings, request: Request) -> str | None:
+    if not settings.tailscale_auth_enabled:
+        return None
+    encoded_login = request.headers.get("tailscale-user-login", "").strip()
+    if not encoded_login:
+        return None
+    try:
+        login = str(make_header(decode_header(encoded_login))).strip().lower()
+    except (LookupError, UnicodeError):
+        return None
+    allowed = set(settings.tailscale_allowed_users)
+    if allowed and login not in allowed:
+        return None
+    return login
+
+
+def _authentication_context(request: Request, settings) -> dict[str, object]:
+    token, from_cookie = _presented_token(request)
+    scopes = _token_scopes(settings, token)
+    if scopes:
+        return {
+            "scopes": scopes,
+            "method": "token_session" if from_cookie else "token",
+            "identity": None,
+            "device_id": None,
+        }
+
+    device = _access_store(settings).authenticate_device(
+        request.cookies.get("frameart_device")
+    )
+    if device:
+        return {
+            "scopes": set(device["scopes"]),
+            "method": "paired_device",
+            "identity": device["name"],
+            "device_id": device["id"],
+        }
+
+    tailscale_login = _tailscale_identity(settings, request)
+    if tailscale_login:
+        return {
+            "scopes": {"read", "control", "admin"},
+            "method": "tailscale",
+            "identity": tailscale_login,
+            "device_id": None,
+        }
+
+    trusted_lan_ip = _trusted_lan_identity(settings, request)
+    if trusted_lan_ip:
+        return {
+            "scopes": {"read", "control", "admin"},
+            "method": "trusted_lan",
+            "identity": trusted_lan_ip,
+            "device_id": None,
+        }
+
+    return {"scopes": set(), "method": None, "identity": None, "device_id": None}
+
+
+def _origin_matches_request(request: Request) -> bool:
+    origin = request.headers.get("origin")
+    if not origin:
+        return True
+    try:
+        return urlsplit(origin).netloc == request.headers.get("host")
+    except ValueError:
+        return False
 
 
 def _required_scope(request: Request) -> str:
@@ -250,8 +368,8 @@ async def authenticate_request(
     if not settings.auth_enabled:
         return await call_next(request)
 
-    token, from_cookie = _presented_token(request)
-    scopes = _token_scopes(settings, token)
+    context = _authentication_context(request, settings)
+    scopes = context["scopes"]
     required = _required_scope(request)
     if required not in scopes:
         status_code = 401 if not scopes else 403
@@ -261,13 +379,11 @@ async def authenticate_request(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    if from_cookie and request.method not in {"GET", "HEAD", "OPTIONS"}:
-        origin = request.headers.get("origin")
-        if origin and origin.rstrip("/").split("://")[-1] != request.headers.get("host"):
-            return JSONResponse(status_code=403, content={"detail": "Origin check failed."})
+    if request.method not in {"GET", "HEAD", "OPTIONS"} and not _origin_matches_request(request):
+        return JSONResponse(status_code=403, content={"detail": "Origin check failed."})
 
     if request.method not in {"GET", "HEAD", "OPTIONS"}:
-        client_id = f"{next(iter(sorted(scopes)))}:{request.client.host if request.client else '-'}"
+        client_id = f"{next(iter(sorted(scopes)))}:{_request_client_ip(request) or '-'}"
         if not _within_rate_limit(client_id, settings.api_rate_limit_per_minute):
             return JSONResponse(
                 status_code=429,
@@ -276,6 +392,9 @@ async def authenticate_request(
             )
 
     request.state.frameart_scopes = scopes
+    request.state.frameart_auth_method = context["method"]
+    request.state.frameart_identity = context["identity"]
+    request.state.frameart_device_id = context["device_id"]
     return await call_next(request)
 
 
@@ -472,6 +591,15 @@ class AuthSessionRequest(BaseModel):
     """Token exchange used by the browser UI."""
 
     token: SecretStr = Field(..., min_length=20, max_length=4096)
+    remember_device: bool = True
+    device_name: str = Field("Browser device", min_length=1, max_length=100)
+
+
+class PairDeviceRequest(BaseModel):
+    """Exchange a short-lived code for a durable browser-device session."""
+
+    code: str = Field(..., min_length=10, max_length=20)
+    device_name: str = Field(..., min_length=1, max_length=100)
 
 
 class ProviderOption(BaseModel):
@@ -1149,6 +1277,9 @@ def _diagnostics_payload() -> dict[str, Any]:
             "provider_count": len(settings.providers),
             "tv_count": len(settings.tvs),
             "auth_enabled": settings.auth_enabled,
+            "tailscale_auth_enabled": settings.tailscale_auth_enabled,
+            "trusted_lan_count": len(settings.trusted_lan_cidrs),
+            "paired_device_count": len(_access_store(settings).list_devices()),
             "recovered_pending_transaction": journal_pending,
             "managed_settings_present": managed_settings_path(settings.data_dir).is_file(),
             "provider_secrets_present": provider_secrets_path(settings.data_dir).is_file(),
@@ -1671,8 +1802,28 @@ def readiness(response: Response):
     )
 
 
+def _set_browser_cookie(
+    response: Response,
+    request: Request,
+    *,
+    key: str,
+    value: str,
+    max_age: int,
+) -> None:
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip()
+    response.set_cookie(
+        key=key,
+        value=value,
+        max_age=max_age,
+        httponly=True,
+        secure=request.url.scheme == "https" or forwarded_proto == "https",
+        samesite="strict",
+        path="/",
+    )
+
+
 @app.post("/auth/session")
-def create_auth_session(req: AuthSessionRequest, response: Response):
+def create_auth_session(req: AuthSessionRequest, request: Request, response: Response):
     """Exchange an API token for an HttpOnly browser session cookie."""
     settings = _settings()
     if not settings.auth_enabled:
@@ -1683,34 +1834,149 @@ def create_auth_session(req: AuthSessionRequest, response: Response):
     if not scopes:
         raise HTTPException(status_code=401, detail="Invalid API token.")
 
-    response.set_cookie(
+    _set_browser_cookie(
+        response,
+        request,
         key="frameart_session",
         value=token,
         max_age=7 * 24 * 60 * 60,
-        httponly=True,
-        samesite="strict",
-        path="/",
     )
-    return {"authenticated": True, "auth_enabled": True, "scopes": sorted(scopes)}
+    device_id = None
+    if req.remember_device:
+        device_token, device = _access_store(settings).create_device(
+            device_name=req.device_name.strip(),
+            scopes=scopes,
+            lifetime_seconds=settings.device_session_days * 24 * 60 * 60,
+        )
+        _set_browser_cookie(
+            response,
+            request,
+            key="frameart_device",
+            value=device_token,
+            max_age=settings.device_session_days * 24 * 60 * 60,
+        )
+        device_id = device["id"]
+    return {
+        "authenticated": True,
+        "auth_enabled": True,
+        "scopes": sorted(scopes),
+        "device_id": device_id,
+    }
+
+
+@app.post("/auth/pair")
+def pair_device(req: PairDeviceRequest, request: Request, response: Response):
+    """Exchange a one-time pairing code for a revocable device cookie."""
+    settings = _settings()
+    if not settings.auth_enabled:
+        raise HTTPException(status_code=400, detail="Authentication is disabled.")
+    if not _origin_matches_request(request):
+        raise HTTPException(status_code=403, detail="Origin check failed.")
+    client_host = _request_client_ip(request) or "-"
+    if not _within_rate_limit(f"device-pair:{client_host}", 10):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many pairing attempts; retry in one minute.",
+            headers={"Retry-After": "60"},
+        )
+    try:
+        device_token, device = _access_store(settings).consume_pairing(
+            req.code,
+            device_name=req.device_name.strip(),
+            lifetime_seconds=settings.device_session_days * 24 * 60 * 60,
+        )
+    except InvalidPairingCodeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _set_browser_cookie(
+        response,
+        request,
+        key="frameart_device",
+        value=device_token,
+        max_age=settings.device_session_days * 24 * 60 * 60,
+    )
+    return {"authenticated": True, "scopes": device["scopes"], "device_id": device["id"]}
 
 
 @app.get("/auth/status")
 def auth_status(request: Request):
-    """Return the authenticated token's effective scopes."""
+    """Return the current request's authentication method and effective scopes."""
     settings = _settings()
     scopes = getattr(request.state, "frameart_scopes", {"read", "control", "admin"})
     return {
         "authenticated": True,
         "auth_enabled": settings.auth_enabled,
         "scopes": sorted(scopes),
+        "method": getattr(request.state, "frameart_auth_method", "off"),
+        "identity": getattr(request.state, "frameart_identity", None),
+        "device_id": getattr(request.state, "frameart_device_id", None),
     }
 
 
 @app.post("/auth/logout")
 def logout(response: Response):
-    """Clear the browser session cookie."""
+    """Clear browser token and paired-device cookies."""
     response.delete_cookie("frameart_session", path="/")
+    response.delete_cookie("frameart_device", path="/")
     return {"authenticated": False}
+
+
+@app.get("/auth/access")
+def access_status(request: Request):
+    """Return non-secret access configuration and revocable browser devices."""
+    settings = _settings()
+    current_device_id = getattr(request.state, "frameart_device_id", None)
+    devices = _access_store(settings).list_devices()
+    for device in devices:
+        device["current"] = device["id"] == current_device_id
+    return {
+        "auth_enabled": settings.auth_enabled,
+        "method": getattr(request.state, "frameart_auth_method", "off"),
+        "identity": getattr(request.state, "frameart_identity", None),
+        "tailscale_auth_enabled": settings.tailscale_auth_enabled,
+        "tailscale_allowed_users": settings.tailscale_allowed_users,
+        "trusted_lan_cidrs": settings.trusted_lan_cidrs,
+        "device_session_days": settings.device_session_days,
+        "pairing_code_minutes": settings.pairing_code_minutes,
+        "devices": devices,
+    }
+
+
+@app.post("/auth/pairings", status_code=201)
+def create_device_pairing(request: Request):
+    """Create a short-lived pairing link and QR code for another browser."""
+    settings = _settings()
+    if not settings.auth_enabled:
+        raise HTTPException(status_code=400, detail="Authentication is disabled.")
+    creator = (
+        getattr(request.state, "frameart_identity", None)
+        or getattr(request.state, "frameart_auth_method", None)
+        or "administrator"
+    )
+    pairing = _access_store(settings).create_pairing(
+        created_by=str(creator),
+        lifetime_seconds=settings.pairing_code_minutes * 60,
+    )
+    pairing_url = f"{str(request.base_url).rstrip('/')}?pair={pairing['code']}"
+    qr_image = qrcode.make(pairing_url)
+    qr_bytes = BytesIO()
+    qr_image.save(qr_bytes, format="PNG")
+    return {
+        **pairing,
+        "pairing_url": pairing_url,
+        "qr_data_url": f"data:image/png;base64,{b64encode(qr_bytes.getvalue()).decode('ascii')}",
+    }
+
+
+@app.delete("/auth/devices/{device_id}")
+def revoke_device(device_id: str, request: Request, response: Response):
+    """Revoke one paired browser device."""
+    if not re.fullmatch(r"[a-f0-9]{32}", device_id):
+        raise HTTPException(status_code=404, detail="Paired device not found.")
+    if not _access_store(_settings()).revoke_device(device_id):
+        raise HTTPException(status_code=404, detail="Paired device not found.")
+    if getattr(request.state, "frameart_device_id", None) == device_id:
+        response.delete_cookie("frameart_device", path="/")
+    return {"revoked": True, "device_id": device_id}
 
 
 @app.get("/styles", response_model=dict[str, str])
@@ -3663,6 +3929,15 @@ def run_server(host: str = "127.0.0.1", port: int = 8000) -> None:
     import uvicorn
 
     settings = load_settings()
+    if settings.tailscale_auth_enabled and not settings.auth_enabled:
+        raise RuntimeError(
+            "Tailscale authentication requires FRAMEART_AUTH_ENABLED=true."
+        )
+    if settings.tailscale_auth_enabled and not _is_loopback_host(host):
+        raise RuntimeError(
+            "Tailscale authentication headers are trusted only on a loopback bind. "
+            "Bind to 127.0.0.1 and expose FrameArt with Tailscale Serve."
+        )
     if not _is_loopback_host(host) and not settings.auth_enabled:
         raise RuntimeError(
             "Refusing a non-loopback bind without API authentication. Set "
