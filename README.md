@@ -432,7 +432,7 @@ curl -X POST http://localhost:8000/catalog/apply \
 
 ```bash
 curl http://localhost:8000/health
-# {"status":"ok","version":"0.1.0"}
+# {"status":"ok","version":"0.2.0"}
 ```
 
 ### Home Assistant Integration
