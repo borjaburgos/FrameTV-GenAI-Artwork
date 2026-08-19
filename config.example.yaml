@@ -26,6 +26,23 @@ auth_enabled: true
 # automation_token: "optional-separate-token-for-home-automation"
 api_rate_limit_per_minute: 60
 
+# Durable browser sessions are created automatically after a successful token
+# login and can be paired/revoked from Settings > Access & Paired Devices.
+device_session_days: 365
+pairing_code_minutes: 10
+
+# Passwordless tailnet access through `tailscale serve`. This is accepted only
+# when `frameart serve` binds to loopback. Leave the allowlist empty to accept
+# every Tailscale identity that your tailnet policy permits to reach the host.
+tailscale_auth_enabled: false
+# tailscale_allowed_users:
+#   - owner@example.com
+
+# Optional no-prompt access for explicitly trusted RFC1918 subnets. Prefer
+# device pairing unless every device on the subnet is trusted.
+# trusted_lan_cidrs:
+#   - 192.168.1.0/24
+
 # --- TV profiles -------------------------------------------------------------
 tvs:
   livingroom_frame:

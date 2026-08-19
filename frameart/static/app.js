@@ -11,6 +11,7 @@
   let managedProviderSettings = null;
   let managedTVSettings = [];
   let managedSettingsBackups = [];
+  let managedAccessSettings = null;
   let managedCollections = [];
   let loadedGalleryJobs = {};
   let automationGroups = [];
@@ -56,22 +57,64 @@
     setTimeout(() => toast.remove(), 3600);
   }
 
+  function defaultDeviceName() {
+    return localStorage.getItem('frameart.device.name') ||
+      navigator.userAgentData?.platform || navigator.platform || 'Browser device';
+  }
+
+  async function completePairingFromUrl() {
+    const url = new URL(window.location.href);
+    const code = url.searchParams.get('pair');
+    if (!code) return;
+    const suggestedName = defaultDeviceName();
+    const deviceName = window.prompt('Name this FrameArt device:', suggestedName);
+    if (!deviceName || !deviceName.trim()) {
+      showToast('Device pairing was cancelled. Reopen the link to try again.', 'warn');
+      return;
+    }
+    try {
+      const response = await window.fetch('/auth/pair', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code, device_name: deviceName.trim() }),
+      });
+      if (!response.ok) {
+        throw new Error(await readApiError(response, 'Pairing failed.'));
+      }
+      localStorage.setItem('frameart.device.name', deviceName.trim());
+      url.searchParams.delete('pair');
+      window.history.replaceState({}, '', url.pathname + url.search + url.hash);
+      showToast('This device is paired and ready to use.', 'done');
+    } catch (error) {
+      showToast(error?.message || 'Pairing failed.', 'error');
+    }
+  }
+
+  const pairingBootstrapPromise = completePairingFromUrl();
+
   async function establishAuthSession() {
-    const token = window.prompt('Enter your FrameArt admin or automation token:');
-    if (!token) return false;
-    const response = await window.fetch('/auth/session', {
+    const credential = window.prompt('Enter a FrameArt token or device pairing code:');
+    if (!credential) return false;
+    const isPairingCode = /^[A-HJ-NP-Z2-9]{5}-?[A-HJ-NP-Z2-9]{5}$/i.test(credential.trim());
+    const endpoint = isPairingCode ? '/auth/pair' : '/auth/session';
+    const payload = isPairingCode
+      ? { code: credential.trim(), device_name: defaultDeviceName() }
+      : { token: credential, remember_device: true, device_name: defaultDeviceName() };
+    const response = await window.fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token }),
+      body: JSON.stringify(payload),
     });
     if (!response.ok) {
-      showToast('Authentication failed. Check the token and try again.', 'error');
+      showToast('Authentication failed. Check the token or pairing code and try again.', 'error');
       return false;
     }
+    if (isPairingCode) showToast('This device is paired and ready to use.', 'done');
     return true;
   }
 
   async function apiFetch(input, init) {
+    await pairingBootstrapPromise;
     let response = await window.fetch(input, init);
     if (response.status !== 401) return response;
     if (!authPromptPromise) {
@@ -1351,6 +1394,7 @@
     'remix-modal',
     'provider-settings-modal',
     'tv-settings-modal',
+    'device-pairing-modal',
     'add-tv-modal',
     'shortcuts-modal',
   ];
@@ -1400,6 +1444,101 @@
   // =========================================================================
   // Persistent settings management
   // =========================================================================
+  function accessMethodLabel(method) {
+    return {
+      off: 'Authentication disabled',
+      token: 'API token',
+      token_session: 'Token session',
+      paired_device: 'Paired device',
+      tailscale: 'Tailscale identity',
+      trusted_lan: 'Trusted LAN',
+    }[method] || 'Authenticated';
+  }
+
+  function renderAccessSettings() {
+    const summary = document.getElementById('settings-access-summary');
+    const list = document.getElementById('settings-device-list');
+    const pairButton = document.getElementById('btn-settings-pair-device');
+    if (!managedAccessSettings) {
+      summary.innerHTML = '<div class="settings-item"><strong>Loading...</strong></div>';
+      list.innerHTML = '';
+      return;
+    }
+
+    const authState = managedAccessSettings.auth_enabled
+      ? accessMethodLabel(managedAccessSettings.method)
+      : 'Authentication disabled';
+    const identity = managedAccessSettings.identity
+      ? (' · ' + managedAccessSettings.identity)
+      : '';
+    const tailscale = managedAccessSettings.tailscale_auth_enabled
+      ? 'Enabled'
+      : 'Disabled';
+    const trustedLan = managedAccessSettings.trusted_lan_cidrs?.length
+      ? managedAccessSettings.trusted_lan_cidrs.join(', ')
+      : 'Disabled';
+    summary.innerHTML =
+      '<div class="settings-item"><div class="settings-item-main"><strong>' +
+      esc(authState) + '</strong><span>Current access' + esc(identity) + '</span></div></div>' +
+      '<div class="settings-item"><div class="settings-item-main"><strong>Tailscale</strong><span>' +
+      esc(tailscale) + '</span></div></div>' +
+      '<div class="settings-item"><div class="settings-item-main"><strong>Trusted LAN</strong><span>' +
+      esc(trustedLan) + '</span></div></div>';
+    pairButton.disabled = !managedAccessSettings.auth_enabled;
+
+    const devices = managedAccessSettings.devices || [];
+    if (!devices.length) {
+      list.innerHTML = '<div class="settings-item"><div class="settings-item-main">' +
+        '<strong>No paired devices</strong><span>Pair a browser without sharing the admin token.</span>' +
+        '</div></div>';
+      return;
+    }
+    list.innerHTML = devices.map((device) => {
+      const currentBadge = device.current
+        ? '<span class="badge badge-frame">Current</span>'
+        : '';
+      const lastSeen = new Date(device.last_seen_at * 1000).toLocaleString();
+      const expires = new Date(device.expires_at * 1000).toLocaleDateString();
+      return '<div class="settings-item"><div class="settings-item-main"><strong>' +
+        esc(device.name) + '</strong><span>Last used ' + esc(lastSeen) +
+        ' · expires ' + esc(expires) + '</span></div><div class="settings-item-actions">' +
+        currentBadge + '<button class="btn btn-danger btn-small" data-device-id="' +
+        esc(device.id) + '">Revoke</button></div></div>';
+    }).join('');
+  }
+
+  async function createDevicePairing(button) {
+    setButtonBusy(button, 'Creating...');
+    try {
+      const response = await apiFetch('/auth/pairings', { method: 'POST' });
+      const pairing = await parseJSONResponse(response, 'Could not create pairing link.');
+      document.getElementById('device-pairing-qr').src = pairing.qr_data_url;
+      document.getElementById('device-pairing-code').textContent = pairing.code;
+      document.getElementById('device-pairing-link').value = pairing.pairing_url;
+      document.getElementById('device-pairing-expiry').textContent =
+        'Expires ' + new Date(pairing.expires_at * 1000).toLocaleTimeString();
+      openModal('device-pairing-modal', '#btn-device-pairing-copy');
+    } catch (error) {
+      showToast(error?.message || 'Could not create pairing link.', 'error');
+    } finally {
+      clearButtonBusy(button);
+    }
+  }
+
+  async function revokePairedDevice(deviceId) {
+    if (!window.confirm('Revoke this device? It will need to pair or enter a token again.')) return;
+    try {
+      const response = await apiFetch('/auth/devices/' + encodeURIComponent(deviceId), {
+        method: 'DELETE',
+      });
+      await parseJSONResponse(response, 'Could not revoke device.');
+      await loadManagementSettings();
+      showToast('Device access revoked.', 'done');
+    } catch (error) {
+      showToast(error?.message || 'Could not revoke device.', 'error');
+    }
+  }
+
   function setSettingsModalError(prefix, message) {
     const status = document.getElementById(prefix + '-error');
     const text = document.getElementById(prefix + '-error-text');
@@ -1647,10 +1786,11 @@
   async function loadManagementSettings(triggerButton) {
     if (triggerButton) setButtonBusy(triggerButton, 'Refreshing...');
     try {
-      const [providerResponse, tvResponse, backupResponse] = await Promise.all([
+      const [providerResponse, tvResponse, backupResponse, accessResponse] = await Promise.all([
         apiFetch('/settings/providers'),
         apiFetch('/settings/tvs'),
         apiFetch('/settings/backups'),
+        apiFetch('/auth/access'),
       ]);
       managedProviderSettings = await parseJSONResponse(
         providerResponse,
@@ -1661,11 +1801,16 @@
         backupResponse,
         'Could not load settings backups.',
       );
+      managedAccessSettings = await parseJSONResponse(
+        accessResponse,
+        'Could not load access settings.',
+      );
       managedTVSettings = tvPayload.tvs || [];
       managedSettingsBackups = backupPayload.backups || [];
       renderSettingsProviders();
       renderSettingsTVSummary();
       renderSettingsBackups();
+      renderAccessSettings();
       renderAutomationTVChoices();
     } catch (error) {
       const message = error?.message || 'Settings could not be loaded.';
@@ -1675,6 +1820,9 @@
         '<div class="settings-item"><strong>Unavailable</strong><span>' + esc(message) + '</span></div>';
       document.getElementById('settings-backup-list').innerHTML =
         '<div class="settings-item"><strong>Unavailable</strong><span>' + esc(message) + '</span></div>';
+      document.getElementById('settings-access-summary').innerHTML =
+        '<div class="settings-item"><strong>Unavailable</strong><span>' + esc(message) + '</span></div>';
+      document.getElementById('settings-device-list').innerHTML = '';
       showToast('Settings management: ' + message, 'error');
     } finally {
       if (triggerButton) clearButtonBusy(triggerButton);
@@ -2164,6 +2312,26 @@
   document.getElementById('btn-tv-settings-save').addEventListener('click', saveTVSettings);
   document.getElementById('btn-settings-refresh').addEventListener('click', (event) => {
     loadManagementSettings(event.currentTarget);
+  });
+  document.getElementById('btn-settings-pair-device').addEventListener('click', (event) => {
+    createDevicePairing(event.currentTarget);
+  });
+  document.getElementById('settings-device-list').addEventListener('click', (event) => {
+    const button = event.target.closest('[data-device-id]');
+    if (button) revokePairedDevice(button.dataset.deviceId);
+  });
+  document.getElementById('btn-device-pairing-close').addEventListener('click', () => {
+    closeModal('device-pairing-modal');
+  });
+  document.getElementById('btn-device-pairing-copy').addEventListener('click', async () => {
+    const input = document.getElementById('device-pairing-link');
+    try {
+      await navigator.clipboard.writeText(input.value);
+    } catch {
+      input.select();
+      document.execCommand('copy');
+    }
+    showToast('Pairing link copied.', 'done');
   });
 
   // =========================================================================
