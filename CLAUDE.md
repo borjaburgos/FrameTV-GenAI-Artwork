@@ -31,7 +31,7 @@ frameart serve --host 127.0.0.1 --port 8000
 
 ```
 frameart/                       # Main package
-├── __init__.py                 # __version__ = "0.1.0"
+├── __init__.py                 # __version__ = "0.2.0"
 ├── cli.py                      # Click CLI — top-level group + subcommands
 ├── api.py                      # FastAPI HTTP server — sync + async endpoints
 ├── pipeline.py                 # Core orchestration: generate → postprocess → upload → switch
