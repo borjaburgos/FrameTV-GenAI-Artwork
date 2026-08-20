@@ -206,8 +206,12 @@ test('adds and removes a persistent TV profile', async ({ page }) => {
   });
   await expect(tv).toContainText('192.168.50.25:8002');
 
+  const removalRequest = page.waitForRequest((request) =>
+    new URL(request.url()).pathname === '/settings/tvs/e2e_living_room/remove',
+  );
   page.once('dialog', (dialog) => dialog.accept());
   await tv.getByRole('button', { name: 'Delete' }).click();
+  expect((await removalRequest).method()).toBe('POST');
   await expect(tv).toHaveCount(0);
 });
 

@@ -2467,8 +2467,7 @@ def update_managed_tv(profile_id: ProfileId, req: TVSettingsRequest):
     return _managed_tvs_response(load_settings())
 
 
-@app.delete("/settings/tvs/{profile_id}", response_model=ManagedTVsResponse)
-def delete_managed_tv(profile_id: ProfileId):
+def _remove_managed_tv(profile_id: ProfileId) -> ManagedTVsResponse:
     """Remove a persisted TV profile without deleting its recoverable pairing token."""
     settings = _settings()
     if profile_id not in settings.tvs:
@@ -2480,6 +2479,18 @@ def delete_managed_tv(profile_id: ProfileId):
 
     _persist_management(settings, update)
     return _managed_tvs_response(load_settings())
+
+
+@app.delete("/settings/tvs/{profile_id}", response_model=ManagedTVsResponse)
+def delete_managed_tv(profile_id: ProfileId):
+    """Remove a TV profile through the legacy API-compatible DELETE action."""
+    return _remove_managed_tv(profile_id)
+
+
+@app.post("/settings/tvs/{profile_id}/remove", response_model=ManagedTVsResponse)
+def remove_managed_tv(profile_id: ProfileId):
+    """Remove a TV profile without an HTTP DELETE that may trigger network IPS rules."""
+    return _remove_managed_tv(profile_id)
 
 
 @app.post(
