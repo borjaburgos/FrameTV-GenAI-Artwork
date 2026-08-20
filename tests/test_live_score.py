@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -15,6 +16,7 @@ from frameart.live_score import (
     LiveScoreStore,
     ScoreEvent,
     TheSportsDBClient,
+    _load_team_logo,
     render_scoreboard,
     sportsdb_api_key,
     sportsdb_api_key_source,
@@ -171,6 +173,8 @@ def test_sportsdb_adapter_normalizes_and_filters_team(mock_get):
                 "idAwayTeam": "133610",
                 "strHomeTeam": "Arsenal",
                 "strAwayTeam": "Chelsea",
+                "strHomeTeamBadge": "https://r2.thesportsdb.com/arsenal.png",
+                "strAwayTeamBadge": "https://r2.thesportsdb.com/chelsea.png",
                 "intHomeScore": "2",
                 "intAwayScore": "1",
                 "strStatus": "2H",
@@ -183,8 +187,51 @@ def test_sportsdb_adapter_normalizes_and_filters_team(mock_get):
 
     assert event.home_team == "Arsenal"
     assert event.home_score == "2"
+    assert event.home_logo_url == "https://r2.thesportsdb.com/arsenal.png"
+    assert event.away_logo_url == "https://r2.thesportsdb.com/chelsea.png"
     assert mock_get.call_args.args[0].endswith("/livescore/all")
     assert mock_get.call_args.kwargs["headers"]["X-API-KEY"] == "premium"
+    assert mock_get.call_count == 1
+
+
+@patch("frameart.live_score.httpx.get")
+def test_sportsdb_adapter_looks_up_and_caches_missing_team_badges(mock_get):
+    live_response = MagicMock()
+    live_response.json.return_value = {
+        "livescores": [
+            {
+                "idEvent": "game-1",
+                "strLeague": "Premier League",
+                "strSport": "Soccer",
+                "idHomeTeam": "133604",
+                "idAwayTeam": "133610",
+                "strHomeTeam": "Arsenal",
+                "strAwayTeam": "Chelsea",
+                "strStatus": "2H",
+            }
+        ]
+    }
+    home_response = MagicMock()
+    home_response.json.return_value = {
+        "teams": [{"strBadge": "https://r2.thesportsdb.com/arsenal.png"}]
+    }
+    away_response = MagicMock()
+    away_response.json.return_value = {
+        "lookup": [{"strBadge": "https://r2.thesportsdb.com/chelsea.png"}]
+    }
+    mock_get.side_effect = [live_response, home_response, away_response, live_response]
+    client = TheSportsDBClient("premium")
+
+    first = client.fetch("team", "133604")
+    second = client.fetch("team", "133604")
+
+    assert first is not None
+    assert second is not None
+    assert first.home_logo_url == "https://r2.thesportsdb.com/arsenal.png"
+    assert first.away_logo_url == "https://r2.thesportsdb.com/chelsea.png"
+    assert mock_get.call_count == 4
+    assert mock_get.call_args_list[1].args[0].endswith("/lookup/team/133604")
+    assert mock_get.call_args_list[2].args[0].endswith("/lookup/team/133610")
 
 
 @patch("frameart.live_score.httpx.get")
@@ -249,6 +296,80 @@ def test_scoreboard_renderer_outputs_private_4k_image(tmp_path: Path):
         assert image.size == (3840, 2160)
         assert image.mode == "RGB"
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+@patch("frameart.live_score._load_team_logo")
+def test_scoreboard_renderer_displays_both_team_logos(mock_load_logo, tmp_path: Path):
+    mock_load_logo.side_effect = [
+        Image.new("RGBA", (120, 120), "red"),
+        Image.new("RGBA", (120, 120), "green"),
+    ]
+    event = _event(
+        home_logo_url="https://r2.thesportsdb.com/arsenal.png",
+        away_logo_url="https://r2.thesportsdb.com/chelsea.png",
+    )
+
+    path = render_scoreboard(
+        event,
+        tmp_path / "logos.png",
+        logo_cache_dir=tmp_path / "cache",
+    )
+
+    with Image.open(path) as image:
+        assert image.getpixel((980, 500)) == (255, 0, 0)
+        assert image.getpixel((2860, 500)) == (0, 128, 0)
+
+
+@patch("frameart.live_score._load_team_logo")
+def test_scoreboard_renderer_displays_one_logo_and_falls_back_for_the_other(
+    mock_load_logo,
+    tmp_path: Path,
+):
+    mock_load_logo.side_effect = [Image.new("RGBA", (120, 120), "blue"), None]
+    event = _event(
+        home_logo_url="https://r2.thesportsdb.com/arsenal.png",
+        away_logo_url="https://r2.thesportsdb.com/missing.png",
+    )
+
+    path = render_scoreboard(event, tmp_path / "one-logo.png")
+
+    with Image.open(path) as image:
+        assert image.size == (3840, 2160)
+        assert image.getpixel((980, 500)) == (0, 0, 255)
+
+
+@patch("frameart.live_score.httpx.get")
+def test_team_logo_loader_validates_and_reuses_disk_cache(mock_get, tmp_path: Path):
+    content = BytesIO()
+    Image.new("RGBA", (96, 48), "purple").save(content, format="PNG")
+    response = MagicMock()
+    response.headers = {"content-type": "image/png"}
+    response.content = content.getvalue()
+    mock_get.return_value = response
+    cache_dir = tmp_path / "logos"
+    logo_url = "https://r2.thesportsdb.com/images/media/team/badge/test.png"
+
+    first = _load_team_logo(logo_url, cache_dir)
+    second = _load_team_logo(logo_url, cache_dir)
+
+    assert first is not None
+    assert second is not None
+    assert first.size == (96, 48)
+    assert second.size == (96, 48)
+    assert mock_get.call_count == 1
+    assert len(list(cache_dir.glob("*.png"))) == 1
+
+
+@patch("frameart.live_score.httpx.get")
+def test_team_logo_loader_rejects_non_images_and_untrusted_hosts(mock_get, tmp_path: Path):
+    response = MagicMock()
+    response.headers = {"content-type": "text/plain"}
+    response.content = b"not an image"
+    mock_get.return_value = response
+
+    assert _load_team_logo("https://r2.thesportsdb.com/not-image", tmp_path) is None
+    assert _load_team_logo("https://example.com/logo.png", tmp_path) is None
+    assert mock_get.call_count == 1
 
 
 @patch("frameart.live_score.IntegrationPublisher.publish", return_value=[])

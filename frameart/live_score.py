@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -13,8 +14,10 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx2 as httpx
 from PIL import Image, ImageDraw, ImageFont
@@ -27,6 +30,13 @@ logger = logging.getLogger(__name__)
 _SPORTSDB_BASE_URL = "https://www.thesportsdb.com/api/v2/json"
 _SPORTSDB_INTEGRATION_NAME = "thesportsdb"
 _SPORTSDB_ENVIRONMENT_KEYS = ("FRAMEART_THESPORTSDB_API_KEY", "THESPORTSDB_API_KEY")
+_TEAM_LOGO_CACHE_MAX_BYTES = 64 * 1024 * 1024
+_TEAM_LOGO_CACHE_MAX_ENTRIES = 128
+_TEAM_LOGO_DOWNLOAD_MAX_BYTES = 5 * 1024 * 1024
+_TEAM_LOGO_MAX_DIMENSION = 4096
+_TEAM_LOGO_RENDER_SIZE = 360
+_TEAM_LOGO_LOOKUP_FAILURE_TTL_SECONDS = 300
+_TEAM_LOGO_LOOKUP_TTL_SECONDS = 86_400
 _NON_ACTIVE_EVENT_STATUSES = {
     "NS",
     "NOT STARTED",
@@ -90,6 +100,8 @@ class ScoreEvent:
     home_team_id: str | None = None
     away_team_id: str | None = None
     league_id: str | None = None
+    home_logo_url: str | None = None
+    away_logo_url: str | None = None
     highlights: list[str] = field(default_factory=list)
     provider_updated_at: str | None = None
 
@@ -407,6 +419,7 @@ class TheSportsDBClient:
             raise ValueError("TheSportsDB live scores require a premium API key.")
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
+        self._team_logo_urls: dict[str, tuple[float, str | None]] = {}
 
     def fetch(self, tracking_kind: str, tracking_value: str) -> ScoreEvent | None:
         if tracking_kind == "league" and tracking_value.isdigit():
@@ -429,11 +442,14 @@ class TheSportsDBClient:
             for event in events
             if event_matches(event, tracking_kind, tracking_value)
         ]
-        return min(
+        event = min(
             matches,
             key=self._event_live_priority,
             default=None,
         )
+        if event is not None:
+            self._resolve_missing_team_logos(event)
+        return event
 
     @staticmethod
     def _payload_rows(payload: Any) -> list[Any]:
@@ -454,14 +470,76 @@ class TheSportsDBClient:
         normalized = " ".join(normalized.split())
         return int(normalized in _NON_ACTIVE_EVENT_STATUSES)
 
+    def _resolve_missing_team_logos(self, event: ScoreEvent) -> None:
+        """Fill missing livescore badge URLs without making logo failures fatal."""
+        if not event.home_logo_url and event.home_team_id:
+            event.home_logo_url = self._lookup_team_logo(event.home_team_id)
+        if not event.away_logo_url and event.away_team_id:
+            event.away_logo_url = self._lookup_team_logo(event.away_team_id)
+
+    def _lookup_team_logo(self, team_id: str) -> str | None:
+        cached = self._team_logo_urls.get(team_id)
+        if cached is not None and cached[0] > time.monotonic():
+            return cached[1]
+
+        logo_url: str | None = None
+        try:
+            response = httpx.get(
+                f"{self.base_url}/lookup/team/{team_id}",
+                headers={"X-API-KEY": self.api_key, "Accept": "application/json"},
+                timeout=10,
+            )
+            response.raise_for_status()
+            for row in self._team_lookup_rows(response.json()):
+                logo_url = self._text(
+                    row,
+                    "strBadge",
+                    "strTeamBadge",
+                    "strLogo",
+                    "team_badge",
+                    "badge",
+                    "logo",
+                ) or None
+                if logo_url:
+                    break
+        except Exception as exc:
+            logger.warning("Could not resolve TheSportsDB logo for team %s: %s", team_id, exc)
+        ttl = (
+            _TEAM_LOGO_LOOKUP_TTL_SECONDS
+            if logo_url
+            else _TEAM_LOGO_LOOKUP_FAILURE_TTL_SECONDS
+        )
+        self._team_logo_urls[team_id] = (time.monotonic() + ttl, logo_url)
+        return logo_url
+
+    @staticmethod
+    def _team_lookup_rows(payload: Any) -> list[dict[str, Any]]:
+        if isinstance(payload, list):
+            return [row for row in payload if isinstance(row, dict)]
+        if not isinstance(payload, dict):
+            return []
+        for key in ("teams", "team", "lookup", "data"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [row for row in value if isinstance(row, dict)]
+            if isinstance(value, dict):
+                return [value]
+        if any(key in payload for key in ("strBadge", "strTeamBadge", "strLogo")):
+            return [payload]
+        return []
+
+    @staticmethod
+    def _text(row: dict[str, Any], *keys: str, default: str = "") -> str:
+        for key in keys:
+            value = row.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return default
+
     @staticmethod
     def _normalize(row: dict[str, Any]) -> ScoreEvent:
         def text(*keys: str, default: str = "") -> str:
-            for key in keys:
-                value = row.get(key)
-                if value is not None and str(value).strip():
-                    return str(value).strip()
-            return default
+            return TheSportsDBClient._text(row, *keys, default=default)
 
         progress = text("strProgress", "progress", "strStatus", "status", default="Live")
         status = text("strStatus", "status", default=progress)
@@ -479,6 +557,18 @@ class TheSportsDBClient:
             home_team_id=text("idHomeTeam", "home_team_id") or None,
             away_team_id=text("idAwayTeam", "away_team_id") or None,
             league_id=text("idLeague", "league_id") or None,
+            home_logo_url=text(
+                "strHomeTeamBadge",
+                "strHomeBadge",
+                "home_team_badge",
+                "home_logo_url",
+            ) or None,
+            away_logo_url=text(
+                "strAwayTeamBadge",
+                "strAwayBadge",
+                "away_team_badge",
+                "away_logo_url",
+            ) or None,
             highlights=[],
             provider_updated_at=text("updated", "updated_at") or None,
         )
@@ -501,6 +591,125 @@ def event_matches(event: ScoreEvent, tracking_kind: str, tracking_value: str) ->
         }
         return needle in candidates
     return False
+
+
+def _is_sportsdb_logo_url(value: str) -> bool:
+    """Only fetch HTTPS artwork hosted by TheSportsDB."""
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return False
+    hostname = (parsed.hostname or "").lower()
+    return (
+        parsed.scheme == "https"
+        and not parsed.username
+        and not parsed.password
+        and bool(parsed.path)
+        and (hostname == "thesportsdb.com" or hostname.endswith(".thesportsdb.com"))
+    )
+
+
+def _read_cached_team_logo(cache_path: Path) -> Image.Image | None:
+    if not cache_path.is_file():
+        return None
+    try:
+        with Image.open(cache_path) as cached:
+            width, height = cached.size
+            if not width or not height or max(width, height) > _TEAM_LOGO_MAX_DIMENSION:
+                raise ValueError("cached logo dimensions are invalid")
+            cached.load()
+            logo = cached.convert("RGBA")
+        os.utime(cache_path, None)
+        return logo
+    except Exception:
+        with contextlib.suppress(OSError):
+            cache_path.unlink()
+        return None
+
+
+def _prune_team_logo_cache(cache_dir: Path) -> None:
+    try:
+        entries = sorted(
+            (path for path in cache_dir.glob("*.png") if path.is_file()),
+            key=lambda path: path.stat().st_mtime,
+        )
+        total_bytes = sum(path.stat().st_size for path in entries)
+        while entries and (
+            len(entries) > _TEAM_LOGO_CACHE_MAX_ENTRIES
+            or total_bytes > _TEAM_LOGO_CACHE_MAX_BYTES
+        ):
+            path = entries.pop(0)
+            size = path.stat().st_size
+            path.unlink()
+            total_bytes -= size
+    except OSError:
+        logger.debug("Could not prune the live-score logo cache", exc_info=True)
+
+
+def _load_team_logo(logo_url: str | None, cache_dir: Path | None) -> Image.Image | None:
+    """Load and normalize a team logo, returning None for any unsafe or invalid input."""
+    if not logo_url or not _is_sportsdb_logo_url(logo_url):
+        return None
+
+    cache_path: Path | None = None
+    if cache_dir is not None:
+        cache_key = hashlib.sha256(logo_url.encode()).hexdigest()
+        cache_path = Path(cache_dir) / f"{cache_key}.png"
+        cached = _read_cached_team_logo(cache_path)
+        if cached is not None:
+            return cached
+
+    temporary: Path | None = None
+    try:
+        response = httpx.get(
+            logo_url,
+            headers={"Accept": "image/png,image/webp,image/jpeg"},
+            timeout=8,
+        )
+        response.raise_for_status()
+        content_type = str(response.headers.get("content-type", "")).split(";", 1)[0].lower()
+        if not content_type.startswith("image/"):
+            raise ValueError("logo response is not an image")
+        content = bytes(response.content)
+        if not content or len(content) > _TEAM_LOGO_DOWNLOAD_MAX_BYTES:
+            raise ValueError("logo response size is invalid")
+        with Image.open(BytesIO(content)) as source:
+            width, height = source.size
+            if not width or not height or max(width, height) > _TEAM_LOGO_MAX_DIMENSION:
+                raise ValueError("logo dimensions are invalid")
+            source.load()
+            logo = source.convert("RGBA")
+        logo.thumbnail(
+            (_TEAM_LOGO_RENDER_SIZE, _TEAM_LOGO_RENDER_SIZE),
+            Image.Resampling.LANCZOS,
+        )
+        if cache_path is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(cache_path.parent, 0o700)
+            temporary = cache_path.with_name(f".{cache_path.name}.{uuid.uuid4().hex}.tmp")
+            logo.save(temporary, format="PNG", optimize=True)
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, cache_path)
+            _prune_team_logo_cache(cache_path.parent)
+        return logo
+    except Exception as exc:
+        if temporary is not None:
+            with contextlib.suppress(OSError):
+                temporary.unlink()
+        logger.warning("Could not load TheSportsDB team logo: %s", exc)
+        return None
+
+
+def _paste_team_logo(image: Image.Image, logo: Image.Image | None, center_x: int, top: int) -> None:
+    if logo is None:
+        return
+    rendered = logo.convert("RGBA")
+    rendered.thumbnail(
+        (_TEAM_LOGO_RENDER_SIZE, _TEAM_LOGO_RENDER_SIZE),
+        Image.Resampling.LANCZOS,
+    )
+    left = round(center_x - rendered.width / 2)
+    image.paste(rendered, (left, top), rendered)
 
 
 def _font(size: int, *, bold: bool = False):
@@ -533,7 +742,13 @@ def _fit_text(draw: ImageDraw.ImageDraw, text: str, max_width: int, start_size: 
     return _font(48, bold=bold)
 
 
-def render_scoreboard(event: ScoreEvent, output_path: Path, *, theme: str = "dark") -> Path:
+def render_scoreboard(
+    event: ScoreEvent,
+    output_path: Path,
+    *,
+    theme: str = "dark",
+    logo_cache_dir: Path | None = None,
+) -> Path:
     """Render a TV-safe 4K still without calling a generative image provider."""
     palettes = {
         "dark": ("#07111f", "#101f35", "#f7fbff", "#60a5fa", "#8ea4bf"),
@@ -546,10 +761,14 @@ def render_scoreboard(event: ScoreEvent, output_path: Path, *, theme: str = "dar
     draw.rounded_rectangle((190, 160, 3650, 1995), radius=60, fill=panel)
     draw.rectangle((190, 160, 3650, 182), fill=accent)
 
+    home_logo = _load_team_logo(event.home_logo_url, logo_cache_dir)
+    away_logo = _load_team_logo(event.away_logo_url, logo_cache_dir)
+    logo_layout = home_logo is not None or away_logo is not None
+
     league_font = _font(66, bold=True)
     status_font = _font(58, bold=True)
-    team_font_home = _fit_text(draw, event.home_team, 1180, 128)
-    team_font_away = _fit_text(draw, event.away_team, 1180, 128)
+    team_font_home = _fit_text(draw, event.home_team, 1180, 112 if logo_layout else 128)
+    team_font_away = _fit_text(draw, event.away_team, 1180, 112 if logo_layout else 128)
     score_font = _font(270, bold=True)
     progress_font = _font(82, bold=True)
     highlight_font = _font(52)
@@ -565,29 +784,56 @@ def render_scoreboard(event: ScoreEvent, output_path: Path, *, theme: str = "dar
     status_box = draw.textbbox((0, 0), status_label, font=status_font)
     draw.text((3560 - status_box[2], 255), status_label, fill=text_color, font=status_font)
 
-    draw.text((330, 650), event.home_team, fill=text_color, font=team_font_home)
-    away_box = draw.textbbox((0, 0), event.away_team, font=team_font_away)
-    draw.text((3510 - away_box[2], 650), event.away_team, fill=text_color, font=team_font_away)
+    if logo_layout:
+        _paste_team_logo(image, home_logo, 980, 450)
+        _paste_team_logo(image, away_logo, 2860, 450)
+        home_team_box = draw.textbbox((0, 0), event.home_team, font=team_font_home)
+        away_team_box = draw.textbbox((0, 0), event.away_team, font=team_font_away)
+        draw.text(
+            (980 - home_team_box[2] / 2, 830),
+            event.home_team,
+            fill=text_color,
+            font=team_font_home,
+        )
+        draw.text(
+            (2860 - away_team_box[2] / 2, 830),
+            event.away_team,
+            fill=text_color,
+            font=team_font_away,
+        )
+        score_y = 1015
+        progress_y = 1355
+    else:
+        draw.text((330, 650), event.home_team, fill=text_color, font=team_font_home)
+        away_box = draw.textbbox((0, 0), event.away_team, font=team_font_away)
+        draw.text((3510 - away_box[2], 650), event.away_team, fill=text_color, font=team_font_away)
+        score_y = 910
+        progress_y = 1325
 
     home_score_box = draw.textbbox((0, 0), event.home_score, font=score_font)
     away_score_box = draw.textbbox((0, 0), event.away_score, font=score_font)
     draw.text(
-        (980 - home_score_box[2] / 2, 910),
+        (980 - home_score_box[2] / 2, score_y),
         event.home_score,
         fill=text_color,
         font=score_font,
     )
     draw.text(
-        (2860 - away_score_box[2] / 2, 910),
+        (2860 - away_score_box[2] / 2, score_y),
         event.away_score,
         fill=text_color,
         font=score_font,
     )
-    draw.text((1835, 955), "-", fill=accent, font=score_font)
+    draw.text((1835, score_y + 45), "-", fill=accent, font=score_font)
 
     progress = event.status if event.status != status_label else "LIVE"
     progress_box = draw.textbbox((0, 0), progress, font=progress_font)
-    draw.text((1920 - progress_box[2] / 2, 1325), progress, fill=accent, font=progress_font)
+    draw.text(
+        (1920 - progress_box[2] / 2, progress_y),
+        progress,
+        fill=accent,
+        font=progress_font,
+    )
 
     highlights = event.highlights[-4:] or ["Score and status update"]
     draw.line((330, 1585, 3510, 1585), fill=muted, width=3)
@@ -620,6 +866,7 @@ class LiveScoreService:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._sportsdb_clients: dict[str, TheSportsDBClient] = {}
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -662,11 +909,9 @@ class LiveScoreService:
                 event = ScoreEvent(**event_data)
             else:
                 try:
-                    event = TheSportsDBClient(
-                        sportsdb_api_key(settings.data_dir, tracker.get("api_key")) or ""
-                    ).fetch(
-                        tracker["tracking_kind"], tracker["tracking_value"]
-                    )
+                    api_key = sportsdb_api_key(settings.data_dir, tracker.get("api_key")) or ""
+                    client = self._sportsdb_client(api_key)
+                    event = client.fetch(tracker["tracking_kind"], tracker["tracking_value"])
                 except Exception as exc:
                     store.update_runtime(
                         tracker_id,
@@ -728,7 +973,12 @@ class LiveScoreService:
         event.highlights = list(dict.fromkeys(highlights))[-8:]
 
         image_path = Path(settings.data_dir) / "modes" / "live-score" / tracker_id / "current.png"
-        render_scoreboard(event, image_path, theme=tracker["theme"])
+        render_scoreboard(
+            event,
+            image_path,
+            theme=tracker["theme"],
+            logo_cache_dir=Path(settings.data_dir) / "cache" / "live-score-logos",
+        )
         current, stale, display_results, display_errors = self._display(
             settings,
             tracker,
@@ -762,6 +1012,17 @@ class LiveScoreService:
             f"live_score.{status}", payload
         )
         return payload
+
+    def _sportsdb_client(self, api_key: str) -> TheSportsDBClient:
+        """Reuse provider metadata caches across tracker polling cycles."""
+        cache_key = hashlib.sha256(api_key.encode()).hexdigest()
+        client = self._sportsdb_clients.get(cache_key)
+        if client is None:
+            client = TheSportsDBClient(api_key)
+            self._sportsdb_clients[cache_key] = client
+            while len(self._sportsdb_clients) > 4:
+                self._sportsdb_clients.pop(next(iter(self._sportsdb_clients)))
+        return client
 
     @staticmethod
     def _target_profile_ids(settings, tracker) -> tuple[list[str], str | None]:
