@@ -9,14 +9,17 @@ import yaml
 from frameart.settings_store import (
     SETTINGS_SCHEMA_VERSION,
     create_settings_backup,
+    integration_secrets_path,
     list_settings_backups,
     load_managed_overlay,
     managed_settings_path,
     management_transaction_path,
     provider_secrets_path,
+    read_integration_secrets,
     read_managed_settings,
     read_provider_secrets,
     restore_settings_backup,
+    update_integration_secret,
     update_management_state,
 )
 
@@ -98,3 +101,19 @@ def test_backup_restore_preserves_settings_and_secrets(tmp_path):
     assert read_managed_settings(tmp_path)["default_provider"] == "openai"
     assert read_provider_secrets(tmp_path)["openai"] == "first-key"
     assert any(item["backup_id"] == backup["backup_id"] for item in list_settings_backups(tmp_path))
+
+
+def test_integration_key_is_restricted_and_included_in_backup_restore(tmp_path):
+    update_integration_secret(tmp_path, "thesportsdb", "first-sports-key")
+
+    assert read_integration_secrets(tmp_path) == {"thesportsdb": "first-sports-key"}
+    assert stat.S_IMODE(integration_secrets_path(tmp_path).stat().st_mode) == 0o600
+
+    backup = create_settings_backup(tmp_path)
+    update_integration_secret(tmp_path, "thesportsdb", "second-sports-key")
+    restore_settings_backup(tmp_path, backup["backup_id"])
+
+    assert read_integration_secrets(tmp_path) == {"thesportsdb": "first-sports-key"}
+
+    update_integration_secret(tmp_path, "thesportsdb", None)
+    assert read_integration_secrets(tmp_path) == {}

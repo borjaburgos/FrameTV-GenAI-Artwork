@@ -71,7 +71,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps, UnidentifiedImageError
-from pydantic import AfterValidator, BaseModel, Field, SecretStr, field_validator
+from pydantic import AfterValidator, BaseModel, Field, SecretStr, field_validator, model_validator
 
 import frameart.public_domain as public_domain
 from frameart import __version__
@@ -85,20 +85,29 @@ from frameart.automation import (
 from frameart.config import STYLE_PRESETS, ProviderConfig, Settings, TVProfile, load_settings
 from frameart.jobs import JobQueueFullError
 from frameart.library import LibraryStore
-from frameart.live_score import LiveScoreService, LiveScoreStore, ScoreEvent
+from frameart.live_score import (
+    LiveScoreService,
+    LiveScoreStore,
+    ScoreEvent,
+    sportsdb_api_key,
+    sportsdb_api_key_source,
+)
 from frameart.logging_utils import safe_exception_message
 from frameart.providers.registry import available_providers
 from frameart.settings_store import (
     SETTINGS_SCHEMA_VERSION,
     create_settings_backup,
+    integration_secrets_path,
     list_settings_backups,
     managed_settings_path,
     management_transaction_path,
     provider_secrets_path,
+    read_integration_secrets,
     read_managed_settings,
     read_provider_secrets,
     replace_management_state,
     restore_settings_backup,
+    update_integration_secret,
     update_management_state,
 )
 from frameart.tv.cache import (
@@ -708,6 +717,31 @@ class ManagedProvidersResponse(BaseModel):
     providers: list[ManagedProviderResponse] = Field(default_factory=list)
 
 
+class SportsIntegrationSettingsRequest(BaseModel):
+    """Rotate or clear the shared TheSportsDB key."""
+
+    api_key: SecretStr | None = Field(None, min_length=1, max_length=4096)
+    clear_api_key: bool = False
+
+    @model_validator(mode="after")
+    def validate_key_action(self):
+        if self.api_key is not None and self.clear_api_key:
+            raise ValueError("Set api_key or clear_api_key, not both.")
+        if self.api_key is not None and not self.api_key.get_secret_value().strip():
+            raise ValueError("api_key must not be blank.")
+        if self.api_key is None and not self.clear_api_key:
+            raise ValueError("Provide api_key or set clear_api_key.")
+        return self
+
+
+class SportsIntegrationSettingsResponse(BaseModel):
+    """Secret-free status for the shared sports data integration."""
+
+    provider: str = "thesportsdb"
+    has_api_key: bool = False
+    api_key_source: str | None = None
+
+
 class DefaultsSettingsRequest(BaseModel):
     """Default provider/model selection."""
 
@@ -944,7 +978,8 @@ class LiveScoreCreateRequest(BaseModel):
     api_key: SecretStr | None = Field(None, min_length=1, max_length=4096)
     tracking_kind: str = Field(..., pattern=r"^(league|team|game|sport)$")
     tracking_value: str = Field(..., min_length=1, max_length=200)
-    group_id: AutomationId
+    group_id: AutomationId | None = None
+    tv_profile_id: ProfileId | None = None
     poll_seconds: int = Field(60, ge=30, le=300)
     refresh_seconds: int = Field(300, ge=30, le=3600)
     theme: str = Field("dark", pattern=r"^(dark|light|stadium)$")
@@ -954,6 +989,12 @@ class LiveScoreCreateRequest(BaseModel):
     @classmethod
     def strip_live_score_text(cls, value: str) -> str:
         return _strip_nonempty(value)
+
+    @model_validator(mode="after")
+    def validate_display_target(self):
+        if (self.group_id is None) == (self.tv_profile_id is None):
+            raise ValueError("Choose exactly one TV or TV group target.")
+        return self
 
 
 class LiveScoreEnabledRequest(BaseModel):
@@ -1331,6 +1372,7 @@ def _diagnostics_payload() -> dict[str, Any]:
     checks, details = _probe_readiness(settings)
     managed = _redact_settings_value(read_managed_settings(settings.data_dir))
     managed_keys = read_provider_secrets(settings.data_dir)
+    integration_keys = read_integration_secrets(settings.data_dir)
     provider_sources = {
         name: (
             "managed"
@@ -1353,6 +1395,7 @@ def _diagnostics_payload() -> dict[str, Any]:
         "configuration": {
             "managed_schema_version": managed.get("schema_version", SETTINGS_SCHEMA_VERSION),
             "provider_key_sources": provider_sources,
+            "sportsdb_key_source": sportsdb_api_key_source(settings.data_dir),
             "provider_count": len(settings.providers),
             "tv_count": len(settings.tvs),
             "auth_enabled": settings.auth_enabled,
@@ -1362,6 +1405,10 @@ def _diagnostics_payload() -> dict[str, Any]:
             "recovered_pending_transaction": journal_pending,
             "managed_settings_present": managed_settings_path(settings.data_dir).is_file(),
             "provider_secrets_present": provider_secrets_path(settings.data_dir).is_file(),
+            "integration_secrets_present": integration_secrets_path(
+                settings.data_dir
+            ).is_file(),
+            "integration_key_count": len(integration_keys),
         },
         "managed_settings": managed,
         **details,
@@ -1467,6 +1514,15 @@ def _managed_providers_response(settings=None) -> ManagedProvidersResponse:
         default_model=settings.default_model,
         available_types=available_providers(),
         providers=providers,
+    )
+
+
+def _sports_integration_response(settings=None) -> SportsIntegrationSettingsResponse:
+    settings = settings or _settings()
+    source = sportsdb_api_key_source(settings.data_dir)
+    return SportsIntegrationSettingsResponse(
+        has_api_key=bool(source),
+        api_key_source=source,
     )
 
 
@@ -2182,6 +2238,38 @@ def get_managed_providers():
     return _managed_providers_response()
 
 
+@app.get(
+    "/settings/integrations/sports",
+    response_model=SportsIntegrationSettingsResponse,
+)
+def get_sports_integration_settings():
+    """Return shared TheSportsDB key status without exposing its value."""
+    return _sports_integration_response()
+
+
+@app.put(
+    "/settings/integrations/sports",
+    response_model=SportsIntegrationSettingsResponse,
+)
+def update_sports_integration_settings(req: SportsIntegrationSettingsRequest):
+    """Persist or clear the shared TheSportsDB key."""
+    settings = _settings()
+    value = req.api_key.get_secret_value().strip() if req.api_key else None
+    try:
+        update_integration_secret(
+            settings.data_dir,
+            "thesportsdb",
+            None if req.clear_api_key else value,
+        )
+    except OSError as exc:
+        logger.exception("Could not persist TheSportsDB key")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not save the key. Check the FrameArt data-directory permissions.",
+        ) from exc
+    return _sports_integration_response()
+
+
 @app.get("/settings/diagnostics")
 def get_diagnostics():
     """Return administrator-facing local deployment diagnostics."""
@@ -2461,9 +2549,9 @@ def update_managed_tv(profile_id: ProfileId, req: TVSettingsRequest):
 
     _persist_management(settings, update)
     if target_profile_id != profile_id:
-        AutomationStore(settings.data_dir).replace_tv_profile_ids(
-            {profile_id: target_profile_id}
-        )
+        replacements = {profile_id: target_profile_id}
+        AutomationStore(settings.data_dir).replace_tv_profile_ids(replacements)
+        LiveScoreStore(settings.data_dir).replace_tv_profile_ids(replacements)
     return _managed_tvs_response(load_settings())
 
 
@@ -2519,9 +2607,9 @@ def consolidate_managed_tv(profile_id: ProfileId):
             tvs.pop(duplicate_id, None)
 
     _persist_management(settings, update)
-    AutomationStore(settings.data_dir).replace_tv_profile_ids(
-        {duplicate_id: profile_id for duplicate_id in duplicate_ids}
-    )
+    replacements = {duplicate_id: profile_id for duplicate_id in duplicate_ids}
+    AutomationStore(settings.data_dir).replace_tv_profile_ids(replacements)
+    LiveScoreStore(settings.data_dir).replace_tv_profile_ids(replacements)
     return _managed_tvs_response(load_settings())
 
 
@@ -3443,22 +3531,30 @@ def list_live_score_trackers():
 @app.post("/modes/live-score", status_code=201)
 def create_live_score_tracker(req: LiveScoreCreateRequest):
     settings = _settings()
-    if _automation_store(settings).get_group(req.group_id) is None:
+    if req.group_id is not None and _automation_store(settings).get_group(req.group_id) is None:
         raise HTTPException(status_code=422, detail="TV group was not found.")
-    api_key = _secret_value(req.api_key)
-    if req.provider == "thesportsdb" and not api_key:
+    if req.tv_profile_id is not None and req.tv_profile_id not in settings.tvs:
+        raise HTTPException(status_code=422, detail="TV profile was not found.")
+    tracker_api_key = _secret_value(req.api_key)
+    if req.provider == "thesportsdb" and not sportsdb_api_key(
+        settings.data_dir, tracker_api_key
+    ):
         raise HTTPException(
             status_code=422,
-            detail="TheSportsDB live scores require a premium v2 API key.",
+            detail=(
+                "TheSportsDB live scores require a premium v2 API key. "
+                "Save one in Settings or provide it with this tracker."
+            ),
         )
     try:
         return _live_score_store(settings).create_tracker(
             name=req.name,
             provider=req.provider,
-            api_key=api_key,
+            api_key=tracker_api_key,
             tracking_kind=req.tracking_kind,
             tracking_value=req.tracking_value,
             group_id=req.group_id,
+            tv_profile_id=req.tv_profile_id,
             poll_seconds=req.poll_seconds,
             refresh_seconds=req.refresh_seconds,
             theme=req.theme,

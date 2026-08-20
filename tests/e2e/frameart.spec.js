@@ -56,6 +56,40 @@ test('shows hybrid access and paired-device management', async ({ page }) => {
   await expect(accessCard.getByRole('button', { name: 'Pair Device' })).toBeDisabled();
 });
 
+test('stores a shared sports key without password-manager prompts', async ({ page, request }) => {
+    await request.put('/settings/integrations/sports', { data: { clear_api_key: true } });
+  try {
+    await openSettings(page);
+    await expect(page.locator('body')).toHaveAttribute('data-1p-ignore', 'true');
+    await expect(page.getByLabel('TheSportsDB API key')).toHaveAttribute(
+      'data-1p-ignore',
+      'true',
+    );
+
+    const keyInput = page.getByLabel('TheSportsDB API key');
+    const saveButton = page.getByRole('button', { name: 'Save Sports Key' });
+    await keyInput.fill('e2e-shared-sports-key');
+    await saveButton.click();
+
+    await expect(page.locator('#settings-sportsdb-key-state')).toContainText(
+      'configured via managed',
+    );
+    await expect(keyInput).toHaveValue('');
+    await expect(saveButton).toBeEnabled();
+    await expect(saveButton).toHaveText('Save Sports Key');
+    const status = await request.get('/settings/integrations/sports');
+    expect(await status.text()).not.toContain('e2e-shared-sports-key');
+
+    await page.locator('#settings-sportsdb-clear-key').check();
+    await saveButton.click();
+    await expect(page.locator('#settings-sportsdb-key-state')).toHaveText(
+      'No shared key is configured.',
+    );
+  } finally {
+    await request.put('/settings/integrations/sports', { data: { clear_api_key: true } });
+  }
+});
+
 test('offers generate anyway before spending on an offline TV', async ({ page, request }) => {
   await request.post('/settings/tvs', {
     data: {
@@ -551,20 +585,29 @@ test('creates TV groups, playlists, and durable schedules', async ({ page, reque
 
     await page.getByLabel('Group name').fill('E2E Group');
     await page.locator('#automation-group-tvs input[value="e2e_automation_tv"]').check();
-    await page.getByRole('button', { name: 'Create Group' }).click();
+    const createGroupButton = page.getByRole('button', { name: 'Create Group' });
+    await createGroupButton.click();
     await expect(page.locator('#automation-group-list')).toContainText('E2E Group');
+    await expect(createGroupButton).toBeEnabled();
+    await expect(createGroupButton).toHaveText('Create Group');
 
     await page.getByLabel('Playlist name').fill('E2E Playlist');
     await page.getByLabel('Artwork').selectOption(jobId);
-    await page.getByRole('button', { name: 'Create Playlist' }).click();
+    const createPlaylistButton = page.getByRole('button', { name: 'Create Playlist' });
+    await createPlaylistButton.click();
     await expect(page.locator('#automation-playlist-list')).toContainText('E2E Playlist');
+    await expect(createPlaylistButton).toBeEnabled();
+    await expect(createPlaylistButton).toHaveText('Create Playlist');
 
     await page.getByLabel('Schedule name').fill('E2E Schedule');
-    await page.getByRole('button', { name: 'Create Schedule' }).click();
+    const createScheduleButton = page.getByRole('button', { name: 'Create Schedule' });
+    await createScheduleButton.click();
     const schedule = page.locator('#automation-schedule-list .settings-item').filter({
       hasText: 'E2E Schedule',
     });
     await expect(schedule).toContainText('E2E Playlist');
+    await expect(createScheduleButton).toBeEnabled();
+    await expect(createScheduleButton).toHaveText('Create Schedule');
     await schedule.getByRole('button', { name: 'Pause' }).click();
     await expect(schedule.getByRole('button', { name: 'Resume' })).toBeVisible();
     await schedule.getByRole('button', { name: 'Delete' }).click();
@@ -580,7 +623,17 @@ test('creates TV groups, playlists, and durable schedules', async ({ page, reque
   }
 });
 
-test('creates, pauses, and deletes a live-score mode', async ({ page, request }) => {
+test('creates live-score modes for a TV group or individual TV', async ({ page, request }) => {
+  const staleTrackers = await (await request.get('/modes/live-score')).json();
+  for (const tracker of staleTrackers.filter((item) =>
+    ['E2E Live Score', 'E2E TV Score'].includes(item.name))) {
+    await request.delete('/modes/live-score/' + tracker.id);
+  }
+  const staleGroups = await (await request.get('/automation/groups')).json();
+  for (const group of staleGroups.filter((item) => item.name === 'E2E Score Group')) {
+    await request.delete('/automation/groups/' + group.id);
+  }
+  await request.delete('/settings/tvs/e2e_score_tv');
   await request.post('/settings/tvs', {
     data: {
       profile_id: 'e2e_score_tv',
@@ -603,18 +656,37 @@ test('creates, pauses, and deletes a live-score mode', async ({ page, request })
     await page.getByLabel('Score provider').selectOption('manual');
     await page.getByLabel('Track by').selectOption('game');
     await page.getByLabel('League, team, game, or sport').fill('e2e-game');
-    await page.locator('#live-score-group').selectOption(group.id);
-    await page.getByRole('button', { name: 'Create Live Score' }).click();
+    await page.getByLabel('Display on', { exact: true }).selectOption('group:' + group.id);
+    const createLiveScoreButton = page.getByRole('button', { name: 'Create Live Score' });
+    await createLiveScoreButton.click();
 
     const tracker = page.locator('#live-score-list .settings-item').filter({
       hasText: 'E2E Live Score',
     });
     await expect(tracker).toContainText('manual');
+    await expect(tracker).toContainText('Group · E2E Score Group');
+    await expect(createLiveScoreButton).toBeEnabled();
+    await expect(createLiveScoreButton).toHaveText('Create Live Score');
     await tracker.getByRole('button', { name: 'Pause' }).click();
     await expect(tracker.getByRole('button', { name: 'Resume' })).toBeVisible();
     page.once('dialog', (dialog) => dialog.accept());
     await tracker.getByRole('button', { name: 'Delete' }).click();
     await expect(tracker).toHaveCount(0);
+
+    await page.getByLabel('Tracker name').fill('E2E TV Score');
+    await page.getByLabel('League, team, game, or sport').fill('e2e-tv-game');
+    await page.getByLabel('Display on', { exact: true }).selectOption('tv:e2e_score_tv');
+    await createLiveScoreButton.click();
+
+    const directTracker = page.locator('#live-score-list .settings-item').filter({
+      hasText: 'E2E TV Score',
+    });
+    await expect(directTracker).toContainText('TV · e2e_score_tv');
+    await expect(createLiveScoreButton).toBeEnabled();
+    await expect(createLiveScoreButton).toHaveText('Create Live Score');
+    page.once('dialog', (dialog) => dialog.accept());
+    await directTracker.getByRole('button', { name: 'Delete' }).click();
+    await expect(directTracker).toHaveCount(0);
   } finally {
     await request.delete('/automation/groups/' + group.id);
     await request.delete('/settings/tvs/e2e_score_tv');

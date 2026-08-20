@@ -6,7 +6,7 @@
 <title>FrameArt</title>
 <link rel="stylesheet" href="/static/app.css">
 </head>
-<body>
+<body data-1p-ignore="true">
 
 <div class="header">
   <h1>Frame<span>Art</span></h1>
@@ -322,8 +322,9 @@
           </select>
         </div>
         <div>
-          <label for="live-score-key">TheSportsDB premium key</label>
-          <input id="live-score-key" type="password" maxlength="4096" autocomplete="new-password" placeholder="Required for TheSportsDB">
+          <label for="live-score-key">TheSportsDB key override (optional)</label>
+          <input id="live-score-key" type="password" maxlength="4096" autocomplete="off" data-1p-ignore="true" placeholder="Uses the key saved in Settings">
+          <p>Leave blank to use the shared key from Settings.</p>
         </div>
       </div>
       <div class="row">
@@ -341,8 +342,8 @@
           <input id="live-score-value" maxlength="200" placeholder="4328">
         </div>
         <div>
-          <label for="live-score-group">TV group</label>
-          <select id="live-score-group"></select>
+          <label for="live-score-target">Display on</label>
+          <select id="live-score-target"></select>
         </div>
         <div>
           <label for="live-score-poll">Poll provider</label>
@@ -528,6 +529,20 @@
       </div>
     </div>
     <div class="settings-card">
+      <h3>Sports Data</h3>
+      <p>Save one TheSportsDB premium v2 key for all Live Score trackers.</p>
+      <div style="margin-top:.7rem;">
+        <label for="settings-sportsdb-key">TheSportsDB API key</label>
+        <input id="settings-sportsdb-key" type="password" maxlength="4096" autocomplete="off" data-1p-ignore="true" placeholder="Leave blank to keep the saved key">
+        <p id="settings-sportsdb-key-state" style="margin-top:-.45rem; margin-bottom:.8rem; font-size:.8rem; color:var(--muted);">Loading key status...</p>
+        <div class="check-row" style="margin-bottom:.8rem;">
+          <input id="settings-sportsdb-clear-key" type="checkbox" data-1p-ignore="true">
+          <label for="settings-sportsdb-clear-key">Clear the managed key</label>
+        </div>
+        <button class="btn btn-small" id="btn-settings-save-sportsdb">Save Sports Key</button>
+      </div>
+    </div>
+    <div class="settings-card">
       <h3>Generation Defaults</h3>
       <p>Choose the provider and optional model preselected in Create.</p>
       <div style="margin-top:.7rem;">
@@ -602,7 +617,7 @@
     <label for="provider-settings-models">Additional selectable models</label>
     <textarea id="provider-settings-models" placeholder="One model per line"></textarea>
     <label for="provider-settings-api-key">API key</label>
-    <input id="provider-settings-api-key" type="password" maxlength="8192" autocomplete="new-password" placeholder="Leave blank to keep the current key">
+    <input id="provider-settings-api-key" type="password" maxlength="8192" autocomplete="off" data-1p-ignore="true" placeholder="Leave blank to keep the current key">
     <p id="provider-settings-key-state" style="margin-top:-.45rem; margin-bottom:.8rem; font-size:.8rem; color:var(--muted);"></p>
     <div class="inline-check">
       <input id="provider-settings-clear-key" type="checkbox">

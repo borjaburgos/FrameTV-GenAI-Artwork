@@ -72,6 +72,8 @@ def managed_config_env(tmp_path, monkeypatch):
     monkeypatch.setenv("FRAMEART_CONFIG", str(config_file))
     monkeypatch.setenv("FRAMEART_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("FRAMEART_AUTH_ENABLED", "false")
+    monkeypatch.delenv("FRAMEART_THESPORTSDB_API_KEY", raising=False)
+    monkeypatch.delenv("THESPORTSDB_API_KEY", raising=False)
     return tmp_path
 
 
@@ -2970,6 +2972,119 @@ class TestLiveScoreMode:
             },
         )
         assert response.status_code == 422
+
+    def test_shared_sportsdb_key_can_be_managed_and_reused(self, managed_config_env):
+        initial = client.get("/settings/integrations/sports")
+        assert initial.status_code == 200
+        assert initial.json() == {
+            "provider": "thesportsdb",
+            "has_api_key": False,
+            "api_key_source": None,
+        }
+
+        saved = client.put(
+            "/settings/integrations/sports",
+            json={"api_key": "shared-sports-secret"},
+        )
+        assert saved.status_code == 200
+        assert saved.json()["has_api_key"] is True
+        assert saved.json()["api_key_source"] == "managed"
+        assert "shared-sports-secret" not in saved.text
+
+        group_id = self.create_group()
+        tracker = client.post(
+            "/modes/live-score",
+            json={
+                "name": "Shared key tracker",
+                "provider": "thesportsdb",
+                "tracking_kind": "league",
+                "tracking_value": "4328",
+                "group_id": group_id,
+            },
+        )
+        assert tracker.status_code == 201
+        assert tracker.json()["has_api_key"] is False
+        assert "shared-sports-secret" not in tracker.text
+
+        cleared = client.put(
+            "/settings/integrations/sports",
+            json={"clear_api_key": True},
+        )
+        assert cleared.status_code == 200
+        assert cleared.json()["has_api_key"] is False
+        assert client.delete(f"/modes/live-score/{tracker.json()['id']}").status_code == 200
+
+    def test_sportsdb_environment_key_is_reported_without_exposure(
+        self,
+        managed_config_env,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("THESPORTSDB_API_KEY", "environment-sports-secret")
+
+        response = client.get("/settings/integrations/sports")
+
+        assert response.status_code == 200
+        assert response.json()["api_key_source"] == "environment"
+        assert "environment-sports-secret" not in response.text
+
+    def test_individual_tv_target_and_target_validation(self, managed_config_env):
+        group_id = self.create_group()
+        created = client.post(
+            "/modes/live-score",
+            json={
+                "name": "Living room score",
+                "provider": "manual",
+                "tracking_kind": "game",
+                "tracking_value": "game-1",
+                "tv_profile_id": "score_tv",
+            },
+        )
+
+        assert created.status_code == 201
+        assert created.json()["target_type"] == "tv"
+        assert created.json()["target_id"] == "score_tv"
+        assert created.json()["group_id"] is None
+        assert created.json()["tv_profile_id"] == "score_tv"
+
+        both_targets = client.post(
+            "/modes/live-score",
+            json={
+                "name": "Ambiguous score",
+                "provider": "manual",
+                "tracking_kind": "game",
+                "tracking_value": "game-2",
+                "group_id": group_id,
+                "tv_profile_id": "score_tv",
+            },
+        )
+        assert both_targets.status_code == 422
+
+        missing_tv = client.post(
+            "/modes/live-score",
+            json={
+                "name": "Missing TV score",
+                "provider": "manual",
+                "tracking_kind": "game",
+                "tracking_value": "game-3",
+                "tv_profile_id": "missing_tv",
+            },
+        )
+        assert missing_tv.status_code == 422
+        assert missing_tv.json()["detail"] == "TV profile was not found."
+
+        renamed = client.put(
+            "/settings/tvs/score_tv",
+            json={
+                "profile_id": "Score-TV",
+                "ip": "192.168.1.61",
+                "port": 8002,
+                "client_name": "FrameArt",
+                "ssl": True,
+            },
+        )
+        assert renamed.status_code == 200
+        tracker = client.get("/modes/live-score").json()[0]
+        assert tracker["tv_profile_id"] == "Score-TV"
 
 
 # ---------------------------------------------------------------------------

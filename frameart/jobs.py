@@ -276,23 +276,27 @@ class JobStore:
             job.status = JobStatus.running
             job.started_at = time.time()
             self._persist_job(job)
+        result: Any | None = None
+        status = JobStatus.completed
+        error: str | None = None
         try:
             result = func(*args, **kwargs)
-            job.result = result
             if hasattr(result, "error") and result.error:
-                job.status = JobStatus.failed
-                job.error = result.error
-            else:
-                job.status = JobStatus.completed
+                status = JobStatus.failed
+                error = result.error
         except Exception as exc:
-            job.status = JobStatus.failed
-            job.error = safe_exception_message(exc)
-            logger.error("Job %s failed: %s", job.id, job.error)
-        finally:
-            with self._lock:
-                job.completed_at = time.time()
-                self._persist_job(job)
-                self._evict_old_jobs()
+            status = JobStatus.failed
+            error = safe_exception_message(exc)
+            logger.error("Job %s failed: %s", job.id, error)
+        with self._lock:
+            # Publish the terminal in-memory state and its durable row atomically.
+            # Readers must never observe completion before restart recovery can.
+            job.result = result
+            job.status = status
+            job.error = error
+            job.completed_at = time.time()
+            self._persist_job(job)
+            self._evict_old_jobs()
 
 
 job_store = JobStore()
