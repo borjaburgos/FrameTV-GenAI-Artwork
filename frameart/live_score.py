@@ -20,6 +20,7 @@ import httpx2 as httpx
 from PIL import Image, ImageDraw, ImageFont
 
 from frameart.automation import AutomationStore, IntegrationPublisher
+from frameart.display_modes import delete_mode_tv_images, replace_group_image
 
 logger = logging.getLogger(__name__)
 
@@ -594,58 +595,7 @@ class LiveScoreService:
 
     @staticmethod
     def _display(settings, tracker, image_path: Path):
-        from frameart.tv.controller import delete_art, switch_art, upload_image
-
-        group = AutomationStore(settings.data_dir).get_group(tracker["group_id"])
-        if not group:
-            return tracker["current_content_ids"], tracker["stale_content_ids"], [], [
-                "Configured TV group no longer exists."
-            ]
-        current = dict(tracker["current_content_ids"])
-        stale = {key: list(value) for key, value in tracker["stale_content_ids"].items()}
-        results: list[dict[str, Any]] = []
-        errors: list[str] = []
-        image_bytes = image_path.read_bytes()
-        for profile_id in group["tv_profile_ids"]:
-            profile = settings.tvs.get(profile_id)
-            if profile is None:
-                errors.append(f"{profile_id}: TV profile is no longer configured")
-                continue
-            retry_ids = stale.pop(profile_id, [])
-            if retry_ids:
-                try:
-                    if not delete_art(profile, retry_ids):
-                        stale[profile_id] = retry_ids[-10:]
-                except Exception:
-                    stale[profile_id] = retry_ids[-10:]
-            new_content_id: str | None = None
-            try:
-                uploaded = upload_image(profile, image_bytes, file_type="PNG", matte="none")
-                if not uploaded.success or not uploaded.content_id:
-                    raise RuntimeError(uploaded.error or "TV upload failed")
-                new_content_id = uploaded.content_id
-                if not switch_art(profile, new_content_id):
-                    raise RuntimeError("TV did not switch to the new scoreboard")
-                old_id = current.get(profile_id)
-                current[profile_id] = new_content_id
-                if old_id and old_id != new_content_id:
-                    try:
-                        if not delete_art(profile, [old_id]):
-                            stale.setdefault(profile_id, []).append(old_id)
-                    except Exception:
-                        stale.setdefault(profile_id, []).append(old_id)
-                results.append({"tv_profile_id": profile_id, "content_id": new_content_id})
-            except Exception as exc:
-                if new_content_id and current.get(profile_id) != new_content_id:
-                    try:
-                        if not delete_art(profile, [new_content_id]):
-                            stale.setdefault(profile_id, []).append(new_content_id)
-                    except Exception:
-                        stale.setdefault(profile_id, []).append(new_content_id)
-                errors.append(f"{profile_id}: {exc}")
-        for profile_id in list(stale):
-            stale[profile_id] = list(dict.fromkeys(stale[profile_id]))[-10:]
-        return current, stale, results, errors
+        return replace_group_image(settings, tracker, image_path)
 
     def delete_tracker(self, tracker_id: str) -> bool:
         settings = self.settings_loader()
@@ -653,20 +603,7 @@ class LiveScoreService:
         tracker = store.get_tracker(tracker_id, include_secret=True)
         if tracker is None:
             return False
-        from frameart.tv.controller import delete_art
-
-        group = AutomationStore(settings.data_dir).get_group(tracker["group_id"])
-        profile_ids = group["tv_profile_ids"] if group else []
-        for profile_id in profile_ids:
-            profile = settings.tvs.get(profile_id)
-            ids = [tracker["current_content_ids"].get(profile_id)]
-            ids.extend(tracker["stale_content_ids"].get(profile_id, []))
-            content_ids = list(dict.fromkeys(content_id for content_id in ids if content_id))
-            if profile and content_ids:
-                try:
-                    delete_art(profile, content_ids)
-                except Exception:
-                    logger.warning("Could not clean up live-score TV art for %s", profile_id)
+        delete_mode_tv_images(settings, tracker)
         deleted = store.delete_tracker(tracker_id)
         mode_dir = Path(settings.data_dir) / "modes" / "live-score" / tracker_id
         if mode_dir.is_dir():

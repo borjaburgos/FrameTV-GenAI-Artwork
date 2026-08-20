@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -2921,6 +2922,111 @@ class TestLiveScoreMode:
         assert response.status_code == 422
 
 
+class TestLiveAlbumMode:
+    @staticmethod
+    def create_group():
+        client.post(
+            "/settings/tvs",
+            json={
+                "profile_id": "album_tv",
+                "ip": "192.168.1.62",
+                "port": 8002,
+                "client_name": "FrameArt",
+                "ssl": True,
+            },
+        )
+        response = client.post(
+            "/automation/groups",
+            json={"name": "Album TVs", "tv_profile_ids": ["album_tv"]},
+        )
+        return response.json()["id"]
+
+    @patch("frameart.live_album.delete_mode_tv_images")
+    @patch("frameart.live_album.IntegrationPublisher.publish", return_value=[])
+    @patch("frameart.live_album.replace_group_image")
+    @patch("frameart.live_album.download_album_image")
+    @patch("frameart.live_album.load_album_items")
+    def test_create_advance_preview_pause_and_delete(
+        self,
+        mock_load,
+        mock_download,
+        mock_display,
+        _publish,
+        _delete_tv,
+        managed_config_env,
+    ):
+        group_id = self.create_group()
+        mock_load.return_value = [
+            SimpleNamespace(
+                item_id="photo-1",
+                image_url="https://cdn.example/photo.jpg",
+                title="Beach day",
+                headers={},
+                fallback_url=None,
+            )
+        ]
+        mock_download.return_value = _jpeg_bytes()
+        mock_display.return_value = (
+            {"album_tv": "content-album"},
+            {},
+            [{"tv_profile_id": "album_tv", "content_id": "content-album"}],
+            [],
+        )
+        created = client.post(
+            "/modes/live-album",
+            json={
+                "name": "Family rotation",
+                "provider": "manifest",
+                "source_url": "https://photos.example/album.json?token=never-return",
+                "group_id": group_id,
+                "interval_seconds": 300,
+                "shuffle": True,
+            },
+        )
+        assert created.status_code == 201
+        assert "never-return" not in created.text
+        album_id = created.json()["id"]
+
+        advanced = client.post(f"/modes/live-album/{album_id}/next")
+        assert advanced.status_code == 200
+        assert advanced.json()["item"]["title"] == "Beach day"
+        preview = client.get(f"/modes/live-album/{album_id}/image")
+        assert preview.status_code == 200
+        assert preview.headers["content-type"] == "image/png"
+        listed = client.get("/modes/live-album").json()[0]
+        assert listed["last_item_id"] == "photo-1"
+        assert "source_url" not in listed
+
+        paused = client.put(
+            f"/modes/live-album/{album_id}/enabled", json={"enabled": False}
+        )
+        assert paused.status_code == 200
+        assert paused.json()["enabled"] is False
+        assert client.delete(f"/modes/live-album/{album_id}").status_code == 200
+
+    def test_rejects_invalid_source_url_and_missing_group(self, managed_config_env):
+        invalid = client.post(
+            "/modes/live-album",
+            json={
+                "name": "Invalid",
+                "provider": "public_page",
+                "source_url": "file:///etc/passwd",
+                "group_id": "a" * 32,
+            },
+        )
+        assert invalid.status_code == 422
+        missing_group = client.post(
+            "/modes/live-album",
+            json={
+                "name": "No group",
+                "provider": "manifest",
+                "source_url": "https://photos.example/album.json",
+                "group_id": "a" * 32,
+            },
+        )
+        assert missing_group.status_code == 422
+
+
 # ---------------------------------------------------------------------------
 # GET / — Web UI
 # ---------------------------------------------------------------------------
@@ -2982,3 +3088,12 @@ class TestWebUI:
         assert 'id="btn-live-score-create"' in page.text
         assert 'id="btn-live-score-feed"' in page.text
         assert "'/modes/live-score'" in script.text
+
+    def test_modes_ui_has_live_album_management(self):
+        page = client.get("/")
+        script = client.get("/static/app.js")
+
+        assert 'id="live-album-list"' in page.text
+        assert 'id="btn-live-album-create"' in page.text
+        assert 'id="live-album-private"' in page.text
+        assert "'/modes/live-album'" in script.text

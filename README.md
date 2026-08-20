@@ -19,6 +19,7 @@ FrameArt is a self-hosted tool that accepts a text description, generates an ima
 - **TV groups and playlists**: Fan out to named groups and rotate ordered library artwork
 - **Durable schedules and integrations**: Restart-safe intervals, signed webhooks, optional MQTT, and Home Assistant-compatible control endpoints
 - **Live Score mode**: League/team/game tracking, 4K scoreboard stills, highlight feeds, and bounded host/TV storage
+- **Live Album mode**: Public manifest, web album, and Immich slideshows with bounded one-at-a-time caching
 - **Public domain artwork support**: Search and apply art from major open-access museum collections
 - **Style presets**: abstract, oil_painting, watercolor, kid_drawing, and more
 - **Pluggable upscalers**: Built-in Pillow LANCZOS, local HTTP (Real-ESRGAN), or remote services
@@ -314,6 +315,16 @@ Use `deploy/Caddyfile.local` for the local hostname. It removes any client-suppl
 | `PUT` | `/modes/live-score/{id}/enabled` | Pause or resume tracking |
 | `GET` | `/modes/live-score/{id}/image` | Preview the current 4K scoreboard still |
 
+**Live Album mode**:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET/POST` | `/modes/live-album` | List or create public-photo slideshows |
+| `POST` | `/modes/live-album/{id}/next` | Fetch, process, and display the next photo |
+| `PUT` | `/modes/live-album/{id}/enabled` | Pause or resume automatic rotation |
+| `GET` | `/modes/live-album/{id}/image` | Preview the current processed 4K photo |
+| `DELETE` | `/modes/live-album/{id}` | Remove a slideshow and its bounded TV state |
+
 **Public domain catalog**:
 
 | Method | Path | Description |
@@ -565,6 +576,35 @@ for a generative image on every update. Each tracker atomically overwrites one h
 the TV, FrameArt uploads and switches to the new still before deleting the previous content ID;
 failed deletions are retained in a small retry list rather than allowing unbounded state.
 
+### Live Album sources, security, and retention
+
+Live Album supports three public-source adapters:
+
+- `manifest`: a portable JSON document containing a `photos`, `items`, or `images` array.
+  Entries can be image URL strings or objects such as
+  `{"id":"photo-1","url":"https://cdn.example/photo.jpg","title":"Beach"}`.
+- `immich`: an [Immich public share](https://docs.immich.app/features/sharing/). FrameArt
+  uses Immich's stable shared-link authentication and image endpoints, preferring the original
+  and falling back to a preview when downloads are disabled.
+- `public_page`: best-effort extraction of image metadata and still-image URLs from a public
+  web album, including Apple Shared Album and Google Photos-style public pages. Page markup can
+  change without notice, so use a manifest when reliability matters.
+
+Google's current Photos Library API is limited to app-created content; selecting existing user
+photos requires the interactive [Google Photos Picker API](https://developers.google.com/photos/picker/guides/get-started-picker),
+so FrameArt does not ask for or store a Google account refresh token. Apple supports publishing
+[Shared Albums as public websites](https://support.apple.com/en-us/108314) but does not document
+an anonymous album API. Those platform constraints are why public-page ingestion is explicitly
+best effort rather than presented as a stable provider integration.
+
+Remote source URLs are resolved and rejected when they point to loopback, link-local, private,
+reserved, or otherwise non-public addresses. Enable **Allow trusted private/LAN source** only
+for a server you control, such as a local Immich instance. Responses are capped at 5 MB for
+manifests/pages and 30 MB/50 megapixels for photos. Each advance atomically overwrites one local
+`current.png`; the new TV image is switched into place before the old content ID is deleted, and
+failed deletes are kept in a ten-item-per-TV retry queue. Source URLs and Immich share keys are
+masked from API responses.
+
 ### Multiple TVs
 
 ```yaml
@@ -706,14 +746,20 @@ docker run --rm \
     -v frameart_data:/data/frameart \
     frameart generate --prompt "a sunset"
 
-# API server mode
+# API server mode (the image starts the secure web service by default)
 docker run -d --name frameart-api \
     -e OPENAI_API_KEY="$OPENAI_API_KEY" \
-    -e FRAMEART_AUTH_ENABLED=true \
     -v frameart_data:/data/frameart \
     -p 8000:8000 \
+    frameart
+docker logs frameart-api  # first start prints the generated admin token
+
+# Linux alternative for SSDP discovery and direct TV control:
+docker run -d --name frameart-api-lan \
+    -e OPENAI_API_KEY="$OPENAI_API_KEY" \
+    -v frameart_data:/data/frameart \
     --network host \
-    frameart serve --host 0.0.0.0 --port 8000
+    frameart
 ```
 
 ### Proxmox VM
@@ -851,6 +897,8 @@ frameart/
   library.py          # Tags, collections, and TV display history
   automation.py       # TV groups, playlists, scheduler, webhooks, and MQTT
   backup.py           # Consistent private backups and recoverable restore
+  display_modes.py    # Shared upload/switch/delete lifecycle for bounded modes
+  live_album.py       # Public album adapters, safe downloads, and slideshow loop
   live_score.py       # Sports feeds, 4K scoreboard rendering, bounded display loop
   pipeline.py         # Core orchestration: generate -> postprocess -> upload -> switch
   config.py           # Configuration management (YAML + env vars + CLI flags)
