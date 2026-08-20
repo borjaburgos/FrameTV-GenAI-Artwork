@@ -9,6 +9,7 @@
   let selectedGalleryJobIds = new Set();
   let configuredProviders = [];
   let managedProviderSettings = null;
+  let managedSportsSettings = null;
   let managedTVSettings = [];
   let managedSettingsBackups = [];
   let managedAccessSettings = null;
@@ -795,24 +796,26 @@
     });
     grid.querySelectorAll('.btn-gen-anyway').forEach((btn) => {
       btn.addEventListener('click', async (event) => {
-        const job = generationJobs.get(event.currentTarget.dataset.queueId);
+        const button = event.currentTarget;
+        const job = generationJobs.get(button.dataset.queueId);
         if (!job) return;
-        setButtonBusy(event.currentTarget, 'Queueing...');
+        setButtonBusy(button, 'Queueing...');
         try {
           const queued = await queueGeneration(job, { generateAnyway: true });
           showStatus('Queued generate-anyway job ' + queued.job_id + '.', '');
         } catch (error) {
           showStatus('Failed: ' + error.message, 'error');
         } finally {
-          clearButtonBusy(event.currentTarget);
+          clearButtonBusy(button);
         }
       });
     });
     grid.querySelectorAll('.btn-gen-retry-tv').forEach((btn) => {
       btn.addEventListener('click', async (event) => {
-        const job = generationJobs.get(event.currentTarget.dataset.queueId);
+        const button = event.currentTarget;
+        const job = generationJobs.get(button.dataset.queueId);
         if (!job) return;
-        setButtonBusy(event.currentTarget, 'Retrying...');
+        setButtonBusy(button, 'Retrying...');
         try {
           const response = await apiFetch(
             '/jobs/' + encodeURIComponent(job.resultJobId || job.jobId) + '/apply',
@@ -832,7 +835,7 @@
         } catch (error) {
           showStatus('Delivery failed: ' + error.message, 'error');
         } finally {
-          clearButtonBusy(event.currentTarget);
+          clearButtonBusy(button);
         }
       });
     });
@@ -1631,9 +1634,16 @@
   // =========================================================================
   function renderLiveScores() {
     const groups = automationGroups || [];
-    document.getElementById('live-score-group').innerHTML = groups.map((group) =>
-      '<option value="' + esc(group.id) + '">' + esc(group.name) + '</option>'
+    const tvOptions = managedTVSettings.map((tv) =>
+      '<option value="tv:' + esc(tv.profile_id) + '">' + esc(tv.profile_id) +
+      ' (' + esc(tv.ip) + ')</option>'
     ).join('');
+    const groupOptions = groups.map((group) =>
+      '<option value="group:' + esc(group.id) + '">' + esc(group.name) + '</option>'
+    ).join('');
+    document.getElementById('live-score-target').innerHTML =
+      (tvOptions ? '<optgroup label="Individual TVs">' + tvOptions + '</optgroup>' : '') +
+      (groupOptions ? '<optgroup label="TV groups">' + groupOptions + '</optgroup>' : '');
     document.getElementById('live-score-feed-tracker').innerHTML = liveScoreTrackers.map((tracker) =>
       '<option value="' + esc(tracker.id) + '">' + esc(tracker.name) + '</option>'
     ).join('');
@@ -1644,6 +1654,10 @@
     }
     list.innerHTML = liveScoreTrackers.map((tracker) => {
       const group = groups.find((item) => item.id === tracker.group_id);
+      const tv = managedTVSettings.find((item) => item.profile_id === tracker.tv_profile_id);
+      const target = tracker.tv_profile_id
+        ? ('TV · ' + (tv?.profile_id || tracker.tv_profile_id))
+        : ('Group · ' + (group?.name || tracker.group_id));
       const event = tracker.last_event || {};
       const score = event.home_team
         ? (event.home_team + ' ' + event.home_score + ' – ' + event.away_score + ' ' + event.away_team)
@@ -1655,7 +1669,7 @@
       return '<div class="settings-item"><div class="settings-item-main"><strong>' +
         esc(tracker.name) + '</strong><span>' + esc(score) + '</span><span>' +
         esc(tracker.provider) + ' · ' + esc(tracker.tracking_kind) + ': ' +
-        esc(tracker.tracking_value) + ' · ' + esc(group?.name || tracker.group_id) +
+        esc(tracker.tracking_value) + ' · ' + esc(target) +
         ' · ' + esc(tracker.last_status || 'new') +
         (tracker.last_error ? ' · ' + esc(tracker.last_error) : '') + '</span>' + preview +
         '</div><div class="settings-item-actions">' +
@@ -1672,15 +1686,18 @@
   async function loadLiveScores(triggerButton) {
     if (triggerButton) setButtonBusy(triggerButton, 'Refreshing...');
     try {
-      const [trackerResponse, groupResponse] = await Promise.all([
+      const [trackerResponse, groupResponse, tvResponse] = await Promise.all([
         apiFetch('/modes/live-score'),
         apiFetch('/automation/groups'),
+        apiFetch('/settings/tvs'),
       ]);
       liveScoreTrackers = await parseJSONResponse(
         trackerResponse,
         'Could not load live-score trackers.',
       );
       automationGroups = await parseJSONResponse(groupResponse, 'Could not load TV groups.');
+      const tvPayload = await parseJSONResponse(tvResponse, 'Could not load TV settings.');
+      managedTVSettings = tvPayload.tvs || [];
       renderLiveScores();
     } finally {
       if (triggerButton) clearButtonBusy(triggerButton);
@@ -1695,27 +1712,32 @@
     keyInput.disabled = event.target.value === 'manual';
     keyInput.placeholder = event.target.value === 'manual'
       ? 'Not used for a manual feed'
-      : 'Required for TheSportsDB';
+      : (managedSportsSettings?.has_api_key
+        ? 'Uses the key saved in Settings'
+        : 'Save a key in Settings or enter an override');
   });
   document.getElementById('btn-live-score-create').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
     const provider = document.getElementById('live-score-provider').value;
+    const target = document.getElementById('live-score-target').value;
     const body = {
       name: document.getElementById('live-score-name').value.trim(),
       provider,
       tracking_kind: document.getElementById('live-score-kind').value,
       tracking_value: document.getElementById('live-score-value').value.trim(),
-      group_id: document.getElementById('live-score-group').value,
       poll_seconds: Number(document.getElementById('live-score-poll').value),
       refresh_seconds: Number(document.getElementById('live-score-refresh').value),
       theme: document.getElementById('live-score-theme').value,
       enabled: true,
     };
+    if (target.startsWith('group:')) body.group_id = target.slice('group:'.length);
+    if (target.startsWith('tv:')) body.tv_profile_id = target.slice('tv:'.length);
     const apiKey = document.getElementById('live-score-key').value.trim();
     if (apiKey) body.api_key = apiKey;
-    if (!body.name || !body.tracking_value || !body.group_id) {
-      showToast('Enter a name and target, and choose a TV group.', 'warn'); return;
+    if (!body.name || !body.tracking_value || !target) {
+      showToast('Enter a name and target, and choose a TV or TV group.', 'warn'); return;
     }
-    setButtonBusy(event.currentTarget, 'Creating...');
+    setButtonBusy(button, 'Creating...');
     try {
       const response = await apiFetch('/modes/live-score', {
         method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
@@ -1726,9 +1748,10 @@
       await loadLiveScores();
       showToast('Live-score tracker created.', 'done');
     } catch (error) { showToast(error.message, 'error'); }
-    finally { clearButtonBusy(event.currentTarget); }
+    finally { clearButtonBusy(button); }
   });
   document.getElementById('btn-live-score-feed').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
     const trackerId = document.getElementById('live-score-feed-tracker').value;
     const progress = document.getElementById('live-score-feed-progress').value.trim() || 'Live';
     const body = {
@@ -1747,7 +1770,7 @@
     if (!trackerId || !body.event_id || !body.league || !body.home_team || !body.away_team) {
       showToast('Choose a tracker and complete event, league, and team names.', 'warn'); return;
     }
-    setButtonBusy(event.currentTarget, 'Sending...');
+    setButtonBusy(button, 'Sending...');
     try {
       const response = await apiFetch('/modes/live-score/' + trackerId + '/feed', {
         method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
@@ -1756,7 +1779,7 @@
       await loadLiveScores();
       showToast('Score update ' + result.status + '.', result.status === 'error' ? 'error' : 'done');
     } catch (error) { showToast(error.message, 'error'); }
-    finally { clearButtonBusy(event.currentTarget); }
+    finally { clearButtonBusy(button); }
   });
   document.getElementById('live-score-list').addEventListener('click', async (event) => {
     const refresh = event.target.closest('[data-live-score-refresh]');
@@ -1909,34 +1932,37 @@
     loadAutomations(event.currentTarget).catch((error) => showToast(error.message, 'error'));
   });
   document.getElementById('btn-automation-group-create').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
     const name = document.getElementById('automation-group-name').value.trim();
     const ids = [...document.querySelectorAll('#automation-group-tvs input:checked')]
       .map((input) => input.value);
     if (!name || !ids.length) { showToast('Enter a group name and select at least one TV.', 'warn'); return; }
-    setButtonBusy(event.currentTarget, 'Creating...');
+    setButtonBusy(button, 'Creating...');
     try {
       await writeAutomation('/automation/groups', 'POST', {name, tv_profile_ids: ids}, 'Could not create group.');
       document.getElementById('automation-group-name').value = '';
       await loadAutomations();
       showToast('TV group created.', 'done');
     } catch (error) { showToast(error.message, 'error'); }
-    finally { clearButtonBusy(event.currentTarget); }
+    finally { clearButtonBusy(button); }
   });
   document.getElementById('btn-automation-playlist-create').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
     const name = document.getElementById('automation-playlist-name').value.trim();
     const jobIds = [...document.getElementById('automation-playlist-jobs').selectedOptions]
       .map((option) => option.value);
     if (!name || !jobIds.length) { showToast('Enter a playlist name and select artwork.', 'warn'); return; }
-    setButtonBusy(event.currentTarget, 'Creating...');
+    setButtonBusy(button, 'Creating...');
     try {
       await writeAutomation('/automation/playlists', 'POST', {name, job_ids: jobIds}, 'Could not create playlist.');
       document.getElementById('automation-playlist-name').value = '';
       await loadAutomations();
       showToast('Playlist created.', 'done');
     } catch (error) { showToast(error.message, 'error'); }
-    finally { clearButtonBusy(event.currentTarget); }
+    finally { clearButtonBusy(button); }
   });
   document.getElementById('btn-automation-schedule-create').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
     const body = {
       name: document.getElementById('automation-schedule-name').value.trim(),
       playlist_id: document.getElementById('automation-schedule-playlist').value,
@@ -1947,20 +1973,21 @@
     if (!body.name || !body.playlist_id || !body.group_id) {
       showToast('Enter a name and create a playlist and TV group first.', 'warn'); return;
     }
-    setButtonBusy(event.currentTarget, 'Creating...');
+    setButtonBusy(button, 'Creating...');
     try {
       await writeAutomation('/automation/schedules', 'POST', body, 'Could not create schedule.');
       document.getElementById('automation-schedule-name').value = '';
       await loadAutomations();
       showToast('Schedule created.', 'done');
     } catch (error) { showToast(error.message, 'error'); }
-    finally { clearButtonBusy(event.currentTarget); }
+    finally { clearButtonBusy(button); }
   });
   document.getElementById('btn-automation-webhook-create').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
     const name = document.getElementById('automation-webhook-name').value.trim();
     const url = document.getElementById('automation-webhook-url').value.trim();
     if (!name || !url) { showToast('Enter a webhook name and URL.', 'warn'); return; }
-    setButtonBusy(event.currentTarget, 'Adding...');
+    setButtonBusy(button, 'Adding...');
     try {
       const created = await writeAutomation('/automation/webhooks', 'POST', {
         name, url, events: [
@@ -1973,16 +2000,17 @@
       document.getElementById('automation-webhook-url').value = '';
       await loadAutomations();
     } catch (error) { showToast(error.message, 'error'); }
-    finally { clearButtonBusy(event.currentTarget); }
+    finally { clearButtonBusy(button); }
   });
   document.getElementById('btn-automation-webhook-test').addEventListener('click', async (event) => {
-    setButtonBusy(event.currentTarget, 'Sending...');
+    const button = event.currentTarget;
+    setButtonBusy(button, 'Sending...');
     try {
       const result = await writeAutomation('/automation/webhooks/test', 'POST', null, 'Webhook test failed.');
       const failed = result.deliveries.filter((item) => !item.ok).length;
       showToast(failed ? (failed + ' webhook delivery(s) failed.') : 'Webhook test delivered.', failed ? 'error' : 'done');
     } catch (error) { showToast(error.message, 'error'); }
-    finally { clearButtonBusy(event.currentTarget); }
+    finally { clearButtonBusy(button); }
   });
   document.getElementById('panel-automations').addEventListener('click', async (event) => {
     const run = event.target.closest('[data-automation-run]');
@@ -2029,12 +2057,14 @@
   async function loadManagementSettings(triggerButton) {
     if (triggerButton) setButtonBusy(triggerButton, 'Refreshing...');
     try {
-      const [providerResponse, tvResponse, backupResponse, accessResponse] = await Promise.all([
-        apiFetch('/settings/providers'),
-        apiFetch('/settings/tvs'),
-        apiFetch('/settings/backups'),
-        apiFetch('/auth/access'),
-      ]);
+      const [providerResponse, tvResponse, backupResponse, accessResponse, sportsResponse] =
+        await Promise.all([
+          apiFetch('/settings/providers'),
+          apiFetch('/settings/tvs'),
+          apiFetch('/settings/backups'),
+          apiFetch('/auth/access'),
+          apiFetch('/settings/integrations/sports'),
+        ]);
       managedProviderSettings = await parseJSONResponse(
         providerResponse,
         'Could not load provider settings.',
@@ -2048,12 +2078,17 @@
         accessResponse,
         'Could not load access settings.',
       );
+      managedSportsSettings = await parseJSONResponse(
+        sportsResponse,
+        'Could not load sports integration settings.',
+      );
       managedTVSettings = tvPayload.tvs || [];
       managedSettingsBackups = backupPayload.backups || [];
       renderSettingsProviders();
       renderSettingsTVSummary();
       renderSettingsBackups();
       renderAccessSettings();
+      renderSportsIntegrationSettings();
       renderAutomationTVChoices();
     } catch (error) {
       const message = error?.message || 'Settings could not be loaded.';
@@ -2066,10 +2101,31 @@
       document.getElementById('settings-access-summary').innerHTML =
         '<div class="settings-item"><strong>Unavailable</strong><span>' + esc(message) + '</span></div>';
       document.getElementById('settings-device-list').innerHTML = '';
+      document.getElementById('settings-sportsdb-key-state').textContent =
+        'Key status unavailable: ' + message;
       showToast('Settings management: ' + message, 'error');
     } finally {
       if (triggerButton) clearButtonBusy(triggerButton);
     }
+  }
+
+  function renderSportsIntegrationSettings() {
+    const state = document.getElementById('settings-sportsdb-key-state');
+    const clearKey = document.getElementById('settings-sportsdb-clear-key');
+    const liveScoreKey = document.getElementById('live-score-key');
+    if (!managedSportsSettings) {
+      state.textContent = 'Loading key status...';
+      return;
+    }
+    const source = managedSportsSettings.api_key_source;
+    state.textContent = managedSportsSettings.has_api_key
+      ? ('A shared key is configured via ' + source + '. Leave blank to keep it.')
+      : 'No shared key is configured.';
+    clearKey.checked = false;
+    clearKey.disabled = source === 'environment' || !managedSportsSettings.has_api_key;
+    liveScoreKey.placeholder = managedSportsSettings.has_api_key
+      ? 'Uses the key saved in Settings'
+      : 'Save a key in Settings or enter an override';
   }
 
   function renderSettingsBackups() {
@@ -2361,6 +2417,48 @@
   document.getElementById('btn-provider-settings-save').addEventListener(
     'click',
     saveProviderSettings,
+  );
+
+  document.getElementById('btn-settings-save-sportsdb').addEventListener(
+    'click',
+    async (event) => {
+      const button = event.currentTarget;
+      const keyInput = document.getElementById('settings-sportsdb-key');
+      const clearInput = document.getElementById('settings-sportsdb-clear-key');
+      const apiKey = keyInput.value.trim();
+      if (!apiKey && !clearInput.checked) {
+        showToast('Enter a TheSportsDB key or choose to clear the managed key.', 'warn');
+        return;
+      }
+      if (apiKey && clearInput.checked) {
+        showToast('Enter a key or clear it, not both.', 'warn');
+        return;
+      }
+      setButtonBusy(button, 'Saving...');
+      try {
+        const response = await apiFetch('/settings/integrations/sports', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(apiKey ? { api_key: apiKey } : { clear_api_key: true }),
+        });
+        managedSportsSettings = await parseJSONResponse(
+          response,
+          'Could not save TheSportsDB key.',
+        );
+        keyInput.value = '';
+        renderSportsIntegrationSettings();
+        showToast(
+          managedSportsSettings.has_api_key
+            ? 'TheSportsDB key saved.'
+            : 'TheSportsDB key cleared.',
+          'done',
+        );
+      } catch (error) {
+        showToast(error?.message || 'Could not save TheSportsDB key.', 'error');
+      } finally {
+        clearButtonBusy(button);
+      }
+    },
   );
 
   document.getElementById('btn-settings-save-defaults').addEventListener('click', async () => {

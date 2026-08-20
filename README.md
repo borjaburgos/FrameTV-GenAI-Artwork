@@ -63,13 +63,16 @@ export OPENAI_API_KEY="sk-..."
 ### Manage providers and TVs in the web UI
 
 Open **Settings** to add, edit, test, and remove image providers; update API keys;
-choose the default provider/model; and manage persistent TV profiles. Provider keys are
-never returned to the browser after saving: the UI only shows whether a key is configured.
+store the shared TheSportsDB key; choose the default provider/model; and manage persistent
+TV profiles. Keys are never returned to the browser after saving: the UI only shows whether
+a key is configured.
 
 Web-managed settings are stored below FrameArt's `data_dir`:
 
 - `settings/managed.yaml` contains non-secret provider, default, and TV configuration.
 - `secrets/provider-keys.yaml` contains provider API keys with owner-only file permissions.
+- `secrets/integration-keys.yaml` contains keys for sports and other non-generation services
+  with owner-only file permissions.
 - `backups/settings/` contains up to 20 owner-only recovery snapshots created automatically
   before managed changes and on demand from the UI.
 - `frameart.sqlite3` contains persistent async job state, library tags/collections, and display
@@ -524,6 +527,7 @@ See [`config.example.yaml`](config.example.yaml) for all options.
 |----------|-------------|
 | `OPENAI_API_KEY` | OpenAI API key for DALL-E |
 | `GOOGLE_API_KEY` | Google API key for Gemini image models |
+| `FRAMEART_THESPORTSDB_API_KEY` / `THESPORTSDB_API_KEY` | Optional TheSportsDB premium v2 key; overrides the key saved in Settings |
 | `GOOGLE_BASE_URL` | Override Google API base URL (default: `https://generativelanguage.googleapis.com/v1beta`) |
 | `OLLAMA_BASE_URL` | Ollama server URL (default: `http://localhost:11434`) |
 | `FRAMEART_DATA_DIR` | Data directory (default: `/data/frameart` or `~/.local/share/frameart`) |
@@ -555,7 +559,10 @@ endpoint with `Authorization: Bearer <FRAMEART_AUTOMATION_TOKEN>`.
 
 The built-in [TheSportsDB v2 livescore API](https://www.thesportsdb.com/docs_api_guide)
 requires a premium API key. Trackers can filter its live feed by sport, league, exact team,
-or event ID. The `manual` provider accepts the normalized `/feed` payload, which makes it
+or event ID. Save the key once in **Settings → Sports Data**; tracker-level keys remain an
+optional API-compatible override when no shared key is configured. Each tracker can display
+on one persistent TV profile or fan out across a TV group. The `manual` provider accepts the
+normalized `/feed` payload, which makes it
 possible to connect another sports API or push goals, fouls, key plays, and other highlights
 from Home Assistant, Node-RED, or a small webhook translator.
 
@@ -740,6 +747,8 @@ See [docs/LXC.md](docs/LXC.md) for running FrameArt in a Proxmox LXC container. 
     frameart.log
   secrets/
     192_168_1_100.token  # Samsung TV auth tokens
+    provider-keys.yaml   # Image-provider API keys (mode 0600)
+    integration-keys.yaml # Sports and other integration keys (mode 0600)
 ```
 
 ---

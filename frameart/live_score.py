@@ -20,10 +20,57 @@ import httpx2 as httpx
 from PIL import Image, ImageDraw, ImageFont
 
 from frameart.automation import AutomationStore, IntegrationPublisher
+from frameart.settings_store import read_integration_secrets
 
 logger = logging.getLogger(__name__)
 
 _SPORTSDB_BASE_URL = "https://www.thesportsdb.com/api/v2/json"
+_SPORTSDB_INTEGRATION_NAME = "thesportsdb"
+_SPORTSDB_ENVIRONMENT_KEYS = ("FRAMEART_THESPORTSDB_API_KEY", "THESPORTSDB_API_KEY")
+_NON_ACTIVE_EVENT_STATUSES = {
+    "NS",
+    "NOT STARTED",
+    "TBD",
+    "SCHEDULED",
+    "FT",
+    "AET",
+    "FINAL",
+    "FINISHED",
+    "COMPLETE",
+    "COMPLETED",
+    "PST",
+    "POSTPONED",
+    "CANC",
+    "CANCELLED",
+    "ABD",
+    "ABANDONED",
+    "AWD",
+    "WO",
+    "SUSP",
+    "SUSPENDED",
+    "INT",
+    "INTERRUPTED",
+    "DELAYED",
+}
+
+
+def sportsdb_api_key(data_dir: Path, tracker_key: str | None = None) -> str | None:
+    """Resolve the shared SportsDB key while retaining per-tracker compatibility."""
+    for name in _SPORTSDB_ENVIRONMENT_KEYS:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    managed = read_integration_secrets(data_dir).get(_SPORTSDB_INTEGRATION_NAME, "").strip()
+    return managed or (tracker_key.strip() if tracker_key else None)
+
+
+def sportsdb_api_key_source(data_dir: Path) -> str | None:
+    """Return the active shared SportsDB key source without exposing the key."""
+    if any(os.environ.get(name, "").strip() for name in _SPORTSDB_ENVIRONMENT_KEYS):
+        return "environment"
+    if read_integration_secrets(data_dir).get(_SPORTSDB_INTEGRATION_NAME, "").strip():
+        return "managed"
+    return None
 
 
 @dataclass
@@ -71,6 +118,8 @@ class LiveScoreStore:
                     tracking_kind TEXT NOT NULL,
                     tracking_value TEXT NOT NULL,
                     group_id TEXT NOT NULL,
+                    target_type TEXT NOT NULL DEFAULT 'group',
+                    target_id TEXT NOT NULL,
                     poll_seconds INTEGER NOT NULL,
                     refresh_seconds INTEGER NOT NULL,
                     theme TEXT NOT NULL,
@@ -90,6 +139,20 @@ class LiveScoreStore:
                     ON live_score_trackers(enabled, next_poll);
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(live_score_trackers)")
+            }
+            if "target_type" not in columns:
+                connection.execute(
+                    "ALTER TABLE live_score_trackers "
+                    "ADD COLUMN target_type TEXT NOT NULL DEFAULT 'group'"
+                )
+            if "target_id" not in columns:
+                connection.execute("ALTER TABLE live_score_trackers ADD COLUMN target_id TEXT")
+            connection.execute(
+                "UPDATE live_score_trackers SET target_id = group_id WHERE target_id IS NULL"
+            )
         os.chmod(self.database_path, 0o600)
 
     def _connect(self) -> sqlite3.Connection:
@@ -107,6 +170,12 @@ class LiveScoreStore:
         if include_secret:
             item["api_key"] = api_key
         item["enabled"] = bool(item["enabled"])
+        target_type = item.get("target_type") or "group"
+        target_id = item.get("target_id") or item["group_id"]
+        item["target_type"] = target_type
+        item["target_id"] = target_id
+        item["group_id"] = target_id if target_type == "group" else None
+        item["tv_profile_id"] = target_id if target_type == "tv" else None
         for field_name, fallback in (
             ("last_event", None),
             ("current_content_ids", {}),
@@ -143,12 +212,18 @@ class LiveScoreStore:
         api_key: str | None,
         tracking_kind: str,
         tracking_value: str,
-        group_id: str,
         poll_seconds: int,
         refresh_seconds: int,
         theme: str,
         enabled: bool,
+        group_id: str | None = None,
+        tv_profile_id: str | None = None,
     ) -> dict[str, Any]:
+        if (group_id is None) == (tv_profile_id is None):
+            raise ValueError("Choose exactly one live-score TV or TV group target.")
+        target_type = "group" if group_id is not None else "tv"
+        target_id = group_id or tv_profile_id
+        assert target_id is not None
         now = time.time()
         values = {
             "id": uuid.uuid4().hex,
@@ -158,6 +233,9 @@ class LiveScoreStore:
             "tracking_kind": tracking_kind,
             "tracking_value": tracking_value.strip(),
             "group_id": group_id,
+            "tv_profile_id": tv_profile_id,
+            "target_type": target_type,
+            "target_id": target_id,
             "poll_seconds": poll_seconds,
             "refresh_seconds": refresh_seconds,
             "theme": theme,
@@ -170,17 +248,85 @@ class LiveScoreStore:
                 """
                 INSERT INTO live_score_trackers (
                     id, name, provider, api_key, tracking_kind, tracking_value,
-                    group_id, poll_seconds, refresh_seconds, theme, enabled,
+                    group_id, target_type, target_id, poll_seconds, refresh_seconds, theme, enabled,
                     next_poll, current_content_ids, stale_content_ids, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', '{}', ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', '{}', ?)
                 """,
                 (
                     values["id"], values["name"], provider, api_key, tracking_kind,
-                    values["tracking_value"], group_id, poll_seconds, refresh_seconds,
-                    theme, int(enabled), now, now,
+                    values["tracking_value"], target_id, target_type, target_id,
+                    poll_seconds, refresh_seconds, theme, int(enabled), now, now,
                 ),
             )
         return self.get_tracker(values["id"]) or values
+
+    def replace_tv_profile_ids(self, replacements: dict[str, str]) -> int:
+        """Rewrite direct-TV tracker targets after profile renames or consolidation."""
+        normalized = {
+            source: target
+            for source, target in replacements.items()
+            if source and target and source != target
+        }
+        if not normalized:
+            return 0
+
+        updated = 0
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, group_id, target_type, target_id,
+                       current_content_ids, stale_content_ids
+                FROM live_score_trackers
+                """
+            ).fetchall()
+            for row in rows:
+                target_id = row["target_id"] or row["group_id"]
+                replacement = (
+                    normalized.get(target_id)
+                    if row["target_type"] == "tv"
+                    else None
+                )
+                current_content_ids = json.loads(row["current_content_ids"] or "{}")
+                stale_content_ids = json.loads(row["stale_content_ids"] or "{}")
+                remapped_current: dict[str, str] = {}
+                remapped_stale: dict[str, list[str]] = {}
+                for profile_id, content_ids in stale_content_ids.items():
+                    remapped_id = normalized.get(profile_id, profile_id)
+                    remapped_stale.setdefault(remapped_id, []).extend(content_ids)
+                for profile_id, content_id in current_content_ids.items():
+                    remapped_id = normalized.get(profile_id, profile_id)
+                    existing = remapped_current.get(remapped_id)
+                    if existing and existing != content_id:
+                        remapped_stale.setdefault(remapped_id, []).append(content_id)
+                    else:
+                        remapped_current[remapped_id] = content_id
+                remapped_stale = {
+                    profile_id: list(dict.fromkeys(content_ids))[-10:]
+                    for profile_id, content_ids in remapped_stale.items()
+                }
+                maps_changed = (
+                    remapped_current != current_content_ids
+                    or remapped_stale != stale_content_ids
+                )
+                if replacement is None and not maps_changed:
+                    continue
+                connection.execute(
+                    """
+                    UPDATE live_score_trackers
+                    SET group_id = ?, target_id = ?,
+                        current_content_ids = ?, stale_content_ids = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        replacement or row["group_id"],
+                        replacement or target_id,
+                        json.dumps(remapped_current),
+                        json.dumps(remapped_stale),
+                        row["id"],
+                    ),
+                )
+                updated += 1
+        return updated
 
     def delete_tracker(self, tracker_id: str) -> bool:
         with self._connect() as connection:
@@ -276,14 +422,37 @@ class TheSportsDBClient:
         )
         response.raise_for_status()
         payload = response.json()
-        rows = payload if isinstance(payload, list) else (
-            payload.get("livescores") or payload.get("events") or payload.get("data") or []
-        )
+        rows = self._payload_rows(payload)
         events = [self._normalize(row) for row in rows if isinstance(row, dict)]
-        return next(
-            (event for event in events if event_matches(event, tracking_kind, tracking_value)),
-            None,
+        matches = [
+            event
+            for event in events
+            if event_matches(event, tracking_kind, tracking_value)
+        ]
+        return min(
+            matches,
+            key=self._event_live_priority,
+            default=None,
         )
+
+    @staticmethod
+    def _payload_rows(payload: Any) -> list[Any]:
+        if isinstance(payload, list):
+            return payload
+        if not isinstance(payload, dict):
+            return []
+        for key in ("livescore", "livescores", "events", "data"):
+            rows = payload.get(key)
+            if isinstance(rows, list) and rows:
+                return rows
+        return []
+
+    @staticmethod
+    def _event_live_priority(event: ScoreEvent) -> int:
+        """Prefer in-play/unknown statuses over terminal or not-started events."""
+        normalized = event.status.strip().upper().replace("_", " ").replace("-", " ")
+        normalized = " ".join(normalized.split())
+        return int(normalized in _NON_ACTIVE_EVENT_STATUSES)
 
     @staticmethod
     def _normalize(row: dict[str, Any]) -> ScoreEvent:
@@ -493,7 +662,9 @@ class LiveScoreService:
                 event = ScoreEvent(**event_data)
             else:
                 try:
-                    event = TheSportsDBClient(tracker.get("api_key") or "").fetch(
+                    event = TheSportsDBClient(
+                        sportsdb_api_key(settings.data_dir, tracker.get("api_key")) or ""
+                    ).fetch(
                         tracker["tracking_kind"], tracker["tracking_value"]
                     )
                 except Exception as exc:
@@ -593,20 +764,30 @@ class LiveScoreService:
         return payload
 
     @staticmethod
+    def _target_profile_ids(settings, tracker) -> tuple[list[str], str | None]:
+        tv_profile_id = tracker.get("tv_profile_id")
+        if tv_profile_id:
+            return [tv_profile_id], None
+        group = AutomationStore(settings.data_dir).get_group(tracker.get("group_id"))
+        if not group:
+            return [], "Configured TV group no longer exists."
+        return group["tv_profile_ids"], None
+
+    @staticmethod
     def _display(settings, tracker, image_path: Path):
         from frameart.tv.controller import delete_art, switch_art, upload_image
 
-        group = AutomationStore(settings.data_dir).get_group(tracker["group_id"])
-        if not group:
+        profile_ids, target_error = LiveScoreService._target_profile_ids(settings, tracker)
+        if target_error:
             return tracker["current_content_ids"], tracker["stale_content_ids"], [], [
-                "Configured TV group no longer exists."
+                target_error
             ]
         current = dict(tracker["current_content_ids"])
         stale = {key: list(value) for key, value in tracker["stale_content_ids"].items()}
         results: list[dict[str, Any]] = []
         errors: list[str] = []
         image_bytes = image_path.read_bytes()
-        for profile_id in group["tv_profile_ids"]:
+        for profile_id in profile_ids:
             profile = settings.tvs.get(profile_id)
             if profile is None:
                 errors.append(f"{profile_id}: TV profile is no longer configured")
@@ -655,8 +836,7 @@ class LiveScoreService:
             return False
         from frameart.tv.controller import delete_art
 
-        group = AutomationStore(settings.data_dir).get_group(tracker["group_id"])
-        profile_ids = group["tv_profile_ids"] if group else []
+        profile_ids, _target_error = self._target_profile_ids(settings, tracker)
         for profile_id in profile_ids:
             profile = settings.tvs.get(profile_id)
             ids = [tracker["current_content_ids"].get(profile_id)]

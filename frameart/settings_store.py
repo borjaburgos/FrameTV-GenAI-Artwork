@@ -24,6 +24,7 @@ SETTINGS_SCHEMA_VERSION = 1
 _MAX_SETTINGS_BACKUPS = 20
 _MANAGED_SETTINGS_RELATIVE_PATH = Path("settings") / "managed.yaml"
 _PROVIDER_SECRETS_RELATIVE_PATH = Path("secrets") / "provider-keys.yaml"
+_INTEGRATION_SECRETS_RELATIVE_PATH = Path("secrets") / "integration-keys.yaml"
 _TRANSACTION_RELATIVE_PATH = Path("settings") / ".management-transaction.yaml"
 _BACKUPS_RELATIVE_PATH = Path("backups") / "settings"
 _BACKUP_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}$")
@@ -37,6 +38,11 @@ def managed_settings_path(data_dir: Path) -> Path:
 def provider_secrets_path(data_dir: Path) -> Path:
     """Return the provider API-key store path."""
     return Path(data_dir) / _PROVIDER_SECRETS_RELATIVE_PATH
+
+
+def integration_secrets_path(data_dir: Path) -> Path:
+    """Return the non-generation integration-key store path."""
+    return Path(data_dir) / _INTEGRATION_SECRETS_RELATIVE_PATH
 
 
 def management_transaction_path(data_dir: Path) -> Path:
@@ -75,6 +81,21 @@ def read_provider_secrets(data_dir: Path) -> dict[str, str]:
         return {
             str(name): value
             for name, value in providers.items()
+            if isinstance(name, str) and isinstance(value, str) and value
+        }
+
+
+def read_integration_secrets(data_dir: Path) -> dict[str, str]:
+    """Read managed keys for integrations such as TheSportsDB."""
+    with _STORE_LOCK:
+        recover_management_state(data_dir)
+        payload = _read_yaml_mapping(integration_secrets_path(data_dir))
+        integrations = payload.get("integrations")
+        if not isinstance(integrations, dict):
+            return {}
+        return {
+            str(name): value
+            for name, value in integrations.items()
             if isinstance(name, str) and isinstance(value, str) and value
         }
 
@@ -141,14 +162,32 @@ def _provider_mapping(payload: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def _journal_payload(settings: dict[str, Any], secrets: dict[str, str]) -> dict[str, Any]:
+def _integration_mapping(payload: dict[str, Any]) -> dict[str, str]:
+    integrations = payload.get("integrations")
+    if not isinstance(integrations, dict):
+        return {}
+    return {
+        str(name): value
+        for name, value in integrations.items()
+        if isinstance(name, str) and isinstance(value, str) and value
+    }
+
+
+def _journal_payload(
+    settings: dict[str, Any],
+    secrets: dict[str, str],
+    integration_secrets: dict[str, str] | None = None,
+) -> dict[str, Any]:
     normalized_settings = dict(settings)
     normalized_settings["schema_version"] = SETTINGS_SCHEMA_VERSION
-    return {
+    payload = {
         "schema_version": SETTINGS_SCHEMA_VERSION,
         "settings": normalized_settings,
         "provider_keys": {"providers": dict(secrets)},
     }
+    if integration_secrets is not None:
+        payload["integration_keys"] = {"integrations": dict(integration_secrets)}
+    return payload
 
 
 def recover_management_state(data_dir: Path) -> bool:
@@ -166,14 +205,18 @@ def recover_management_state(data_dir: Path) -> bool:
         journal = _read_yaml_mapping(journal_path)
         settings = journal.get("settings")
         provider_keys = journal.get("provider_keys")
+        integration_keys = journal.get("integration_keys")
         if (
             journal.get("schema_version") != SETTINGS_SCHEMA_VERSION
             or not isinstance(settings, dict)
             or not isinstance(provider_keys, dict)
+            or (integration_keys is not None and not isinstance(integration_keys, dict))
         ):
             raise ValueError("Managed settings recovery journal is invalid or unsupported.")
         _atomic_write_yaml(managed_settings_path(data_dir), settings)
         _atomic_write_yaml(provider_secrets_path(data_dir), provider_keys)
+        if integration_keys is not None:
+            _atomic_write_yaml(integration_secrets_path(data_dir), integration_keys)
         journal_path.unlink()
         return True
 
@@ -191,19 +234,24 @@ def _prune_settings_backups(data_dir: Path) -> None:
 
 
 def create_settings_backup(data_dir: Path, *, reason: str = "manual") -> dict[str, str]:
-    """Create a restricted server-side snapshot of settings and provider keys."""
+    """Create a restricted snapshot of settings and all managed API keys."""
     with _STORE_LOCK:
         recover_management_state(data_dir)
         created_at = datetime.now(timezone.utc).replace(microsecond=0)
         backup_id = f"{created_at:%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}"
         settings = _read_yaml_mapping(managed_settings_path(data_dir))
         secrets_payload = _read_yaml_mapping(provider_secrets_path(data_dir))
+        integration_payload = _read_yaml_mapping(integration_secrets_path(data_dir))
         payload = {
             "schema_version": SETTINGS_SCHEMA_VERSION,
             "backup_id": backup_id,
             "created_at": created_at.isoformat(),
             "reason": reason[:100],
-            "state": _journal_payload(settings, _provider_mapping(secrets_payload)),
+            "state": _journal_payload(
+                settings,
+                _provider_mapping(secrets_payload),
+                _integration_mapping(integration_payload),
+            ),
         }
         _atomic_write_yaml(_backup_path(data_dir, backup_id), payload)
         _prune_settings_backups(data_dir)
@@ -238,20 +286,26 @@ def replace_management_state(
     settings: dict[str, Any],
     provider_keys: dict[str, str],
     *,
+    integration_keys: dict[str, str] | None = None,
     backup_reason: str | None = "before-update",
 ) -> None:
-    """Replace the managed settings pair using a replayable transaction journal."""
+    """Replace managed settings and secrets using a replayable journal."""
     with _STORE_LOCK:
         recover_management_state(data_dir)
+        if integration_keys is None:
+            integration_keys = read_integration_secrets(data_dir)
         if backup_reason and (
-            managed_settings_path(data_dir).is_file() or provider_secrets_path(data_dir).is_file()
+            managed_settings_path(data_dir).is_file()
+            or provider_secrets_path(data_dir).is_file()
+            or integration_secrets_path(data_dir).is_file()
         ):
             create_settings_backup(data_dir, reason=backup_reason)
-        transaction = _journal_payload(settings, provider_keys)
+        transaction = _journal_payload(settings, provider_keys, integration_keys)
         journal_path = management_transaction_path(data_dir)
         _atomic_write_yaml(journal_path, transaction)
         _atomic_write_yaml(managed_settings_path(data_dir), transaction["settings"])
         _atomic_write_yaml(provider_secrets_path(data_dir), transaction["provider_keys"])
+        _atomic_write_yaml(integration_secrets_path(data_dir), transaction["integration_keys"])
         journal_path.unlink()
 
 
@@ -266,12 +320,20 @@ def restore_settings_backup(data_dir: Path, backup_id: str) -> dict[str, str]:
             raise ValueError("Settings backup is invalid.")
         settings = state.get("settings")
         provider_keys = state.get("provider_keys")
+        integration_keys = state.get("integration_keys")
         if not isinstance(settings, dict) or not isinstance(provider_keys, dict):
+            raise ValueError("Settings backup is invalid.")
+        if integration_keys is not None and not isinstance(integration_keys, dict):
             raise ValueError("Settings backup is invalid.")
         replace_management_state(
             data_dir,
             settings,
             _provider_mapping(provider_keys),
+            integration_keys=(
+                _integration_mapping(integration_keys)
+                if integration_keys is not None
+                else read_integration_secrets(data_dir)
+            ),
             backup_reason="before-restore",
         )
         return {
@@ -292,3 +354,22 @@ def update_management_state(
         secrets = read_provider_secrets(data_dir)
         updater(settings, secrets)
         replace_management_state(data_dir, settings, secrets)
+
+
+def update_integration_secret(data_dir: Path, name: str, value: str | None) -> None:
+    """Atomically set or clear one managed integration secret."""
+    with _STORE_LOCK:
+        recover_management_state(data_dir)
+        settings = _read_yaml_mapping(managed_settings_path(data_dir))
+        provider_keys = read_provider_secrets(data_dir)
+        integration_keys = read_integration_secrets(data_dir)
+        if value:
+            integration_keys[name] = value
+        else:
+            integration_keys.pop(name, None)
+        replace_management_state(
+            data_dir,
+            settings,
+            provider_keys,
+            integration_keys=integration_keys,
+        )
