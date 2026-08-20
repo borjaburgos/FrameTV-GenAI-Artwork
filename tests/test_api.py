@@ -183,6 +183,44 @@ class TestAuthentication:
             assert access["devices"][0]["name"] == "Browser device"
             assert access["devices"][0]["current"] is True
 
+    def test_tv_remove_action_requires_admin_and_same_origin(self, monkeypatch, tmp_path):
+        admin_token = "admin-token-with-at-least-twenty-characters"
+        automation_token = "automation-token-with-at-least-twenty-characters"
+        monkeypatch.setenv("FRAMEART_AUTH_ENABLED", "true")
+        monkeypatch.setenv("FRAMEART_ADMIN_TOKEN", admin_token)
+        monkeypatch.setenv("FRAMEART_AUTOMATION_TOKEN", automation_token)
+        monkeypatch.setenv("FRAMEART_DATA_DIR", str(tmp_path))
+        admin_headers = {"Authorization": f"Bearer {admin_token}"}
+
+        with TestClient(app) as secured_client:
+            created = secured_client.post(
+                "/settings/tvs",
+                json={"profile_id": "living_room", "ip": "192.168.50.25"},
+                headers=admin_headers,
+            )
+            assert created.status_code == 201
+
+            assert secured_client.post("/settings/tvs/living_room/remove").status_code == 401
+            insufficient_scope = secured_client.post(
+                "/settings/tvs/living_room/remove",
+                headers={"Authorization": f"Bearer {automation_token}"},
+            )
+            assert insufficient_scope.status_code == 403
+
+            cross_origin = secured_client.post(
+                "/settings/tvs/living_room/remove",
+                headers={**admin_headers, "Origin": "https://attacker.example"},
+            )
+            assert cross_origin.status_code == 403
+            assert cross_origin.json()["detail"] == "Origin check failed."
+
+            removed = secured_client.post(
+                "/settings/tvs/living_room/remove",
+                headers={**admin_headers, "Origin": "http://testserver"},
+            )
+            assert removed.status_code == 200
+            assert removed.json() == {"tvs": [], "warnings": []}
+
     def test_pairing_link_creates_and_revokes_a_device(self, monkeypatch, tmp_path):
         token = "admin-token-with-at-least-twenty-characters"
         monkeypatch.setenv("FRAMEART_AUTH_ENABLED", "true")
@@ -1339,6 +1377,19 @@ class TestManagedTVs:
         deleted = client.delete("/settings/tvs/living_room")
         assert deleted.status_code == 200
         assert deleted.json() == {"tvs": [], "warnings": []}
+
+    def test_removes_tv_through_post_action(self, managed_config_env):
+        created = client.post(
+            "/settings/tvs",
+            json={"profile_id": "living_room", "ip": "192.168.50.25"},
+        )
+        assert created.status_code == 201
+
+        removed = client.post("/settings/tvs/living_room/remove")
+
+        assert removed.status_code == 200
+        assert removed.json() == {"tvs": [], "warnings": []}
+        assert client.get("/settings/tvs").json() == {"tvs": [], "warnings": []}
 
     def test_rejects_physical_and_normalized_profile_duplicates(self, managed_config_env):
         created = client.post(

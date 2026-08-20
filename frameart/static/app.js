@@ -2488,8 +2488,8 @@
       setButtonBusy(button, 'Deleting...');
       try {
         const response = await apiFetch(
-          '/settings/tvs/' + encodeURIComponent(tv.profile_id),
-          { method: 'DELETE' },
+          '/settings/tvs/' + encodeURIComponent(tv.profile_id) + '/remove',
+          { method: 'POST' },
         );
         const result = await parseJSONResponse(response, 'Could not delete TV.');
         managedTVSettings = result.tvs || [];
