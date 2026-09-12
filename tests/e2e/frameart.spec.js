@@ -90,6 +90,51 @@ test('stores a shared sports key without password-manager prompts', async ({ pag
   }
 });
 
+test('creates, edits, pauses, and removes a public photo album sync', async ({ page, request }) => {
+  await request.post('/settings/tvs', {
+    data: {
+      profile_id: 'e2e_album_tv',
+      ip: '192.168.50.41',
+      port: 8002,
+      client_name: 'Album TV',
+      ssl: true,
+    },
+  });
+  try {
+    await page.goto('/');
+    await page.locator('.tabs').getByRole('button', { name: 'Modes' }).click();
+    await page.getByLabel('Album name').fill('E2E family album');
+    await page.getByLabel('Public shared-album URL').fill(
+      'https://www.icloud.com/sharedalbum/#D2EpublicE2EAlbum',
+    );
+    await page.getByLabel('Synchronize to').selectOption('tv:e2e_album_tv');
+    await page.getByRole('button', { name: 'Create Live Album' }).click();
+
+    let album = page.locator('#live-album-list .settings-item').filter({
+      hasText: 'E2E family album',
+    });
+    await expect(album).toContainText('Apple Photos / iCloud');
+    await expect(page.getByLabel('Public shared-album URL')).toHaveValue('');
+
+    await album.getByRole('button', { name: 'Edit' }).click();
+    await page.getByLabel('Album name').fill('E2E newest photos');
+    await page.getByLabel('Check for changes').selectOption('900');
+    await page.getByRole('button', { name: 'Save Live Album' }).click();
+    album = page.locator('#live-album-list .settings-item').filter({
+      hasText: 'E2E newest photos',
+    });
+    await expect(album).toBeVisible();
+
+    await album.getByRole('button', { name: 'Pause' }).click();
+    await expect(album.getByRole('button', { name: 'Resume' })).toBeVisible();
+    page.once('dialog', (dialog) => dialog.accept());
+    await album.getByRole('button', { name: 'Delete' }).click();
+    await expect(album).toHaveCount(0);
+  } finally {
+    await request.delete('/settings/tvs/e2e_album_tv');
+  }
+});
+
 test('offers generate anyway before spending on an offline TV', async ({ page, request }) => {
   await request.post('/settings/tvs', {
     data: {

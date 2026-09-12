@@ -19,6 +19,7 @@ FrameArt is a self-hosted tool that accepts a text description, generates an ima
 - **TV groups and playlists**: Fan out to named groups and rotate ordered library artwork
 - **Durable schedules and integrations**: Restart-safe intervals, signed webhooks, optional MQTT, and Home Assistant-compatible control endpoints
 - **Live Score mode**: League/team/game tracking, 4K scoreboard stills, highlight feeds, and bounded host/TV storage
+- **Live Album mode**: Keep the ten newest photos from public Apple or Google albums synchronized to a TV
 - **Public domain artwork support**: Search and apply art from major open-access museum collections
 - **Style presets**: abstract, oil_painting, watercolor, kid_drawing, and more
 - **Pluggable upscalers**: Built-in Pillow LANCZOS, local HTTP (Real-ESRGAN), or remote services
@@ -317,6 +318,15 @@ Use `deploy/Caddyfile.local` for the local hostname. It removes any client-suppl
 | `PUT` | `/modes/live-score/{id}/enabled` | Pause or resume tracking |
 | `GET` | `/modes/live-score/{id}/image` | Preview the current 4K scoreboard still |
 
+**Live Album mode**:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET/POST` | `/modes/live-album` | List or create public-album synchronizations |
+| `PUT/DELETE` | `/modes/live-album/{id}` | Edit or delete an album and its owned TV photos |
+| `POST` | `/modes/live-album/{id}/sync` | Reconcile the newest ten photos immediately |
+| `PUT` | `/modes/live-album/{id}/enabled` | Pause or resume periodic checks |
+
 **Public domain catalog**:
 
 | Method | Path | Description |
@@ -571,6 +581,27 @@ by the upstream provider. FrameArt renders deterministic Pillow scoreboards inst
 for a generative image on every update. Each tracker atomically overwrites one host image. On
 the TV, FrameArt uploads and switches to the new still before deleting the previous content ID;
 failed deletions are retained in a small retry list rather than allowing unbounded state.
+
+### Live Album providers, synchronization, and safety
+
+Open **Modes → Live Album** to add a public Apple Photos/iCloud Shared Album or a
+link-shared Google Photos album, choose one persistent TV or TV group, and select a check
+interval. Apple albums must have **Public Website** enabled; Google albums must have link
+sharing enabled. No Apple or Google account credentials are stored.
+
+Every successful check sorts still images by when they were added to the shared album and
+reconciles the newest ten with each target TV. Existing matching uploads are reused, missing
+photos are uploaded, and photos deleted upstream—or displaced by newer additions—are deleted
+from the TV. FrameArt records every TV content ID it owns and never deletes unrelated artwork.
+New uploads complete before obsolete photos are removed. A source, download, or TV deletion
+failure preserves the current set and retries later; outstanding deletions block more uploads
+to that TV so a persistent outage cannot grow storage without bound.
+
+Apple exposes public Shared Albums through the same anonymous feed used by its website. Google
+does not document an anonymous shared-album API, so its adapter reads public-page metadata and
+may need adjustment if Google changes that page. The UI reports such failures and does not
+interpret them as an empty album. A confirmed, successfully fetched empty album removes all TV
+photos owned by that synchronization.
 
 ### Multiple TVs
 
@@ -861,6 +892,7 @@ frameart/
   automation.py       # TV groups, playlists, scheduler, webhooks, and MQTT
   backup.py           # Consistent private backups and recoverable restore
   live_score.py       # Sports feeds, 4K scoreboard rendering, bounded display loop
+  live_album.py       # Public Apple/Google album adapters and newest-ten TV reconciliation
   pipeline.py         # Core orchestration: generate -> postprocess -> upload -> switch
   config.py           # Configuration management (YAML + env vars + CLI flags)
   postprocess.py      # 16:9 crop + 4K resize logic

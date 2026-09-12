@@ -3087,6 +3087,111 @@ class TestLiveScoreMode:
         assert tracker["tv_profile_id"] == "Score-TV"
 
 
+class TestLiveAlbumMode:
+    @staticmethod
+    def create_tv():
+        response = client.post(
+            "/settings/tvs",
+            json={
+                "profile_id": "album_tv",
+                "ip": "192.168.1.71",
+                "port": 8002,
+                "client_name": "FrameArt",
+                "ssl": True,
+            },
+        )
+        assert response.status_code == 201
+
+    def test_create_edit_pause_sync_and_delete_album(self, managed_config_env):
+        self.create_tv()
+        public_token = "D2EpublicAlbumToken"
+        created = client.post(
+            "/modes/live-album",
+            json={
+                "name": "Family highlights",
+                "provider": "icloud",
+                "source_url": f"https://www.icloud.com/sharedalbum/#{public_token}",
+                "tv_profile_id": "album_tv",
+                "interval_seconds": 300,
+                "display_newest": True,
+            },
+        )
+
+        assert created.status_code == 201
+        album_id = created.json()["id"]
+        assert created.json()["tv_profile_id"] == "album_tv"
+        assert "source_url" not in created.json()
+        assert public_token not in created.text
+
+        updated = client.put(
+            f"/modes/live-album/{album_id}",
+            json={
+                "name": "Family newest",
+                "provider": "icloud",
+                "tv_profile_id": "album_tv",
+                "interval_seconds": 900,
+                "display_newest": False,
+                "enabled": True,
+            },
+        )
+        assert updated.status_code == 200
+        assert updated.json()["name"] == "Family newest"
+        assert updated.json()["interval_seconds"] == 900
+
+        paused = client.put(
+            f"/modes/live-album/{album_id}/enabled", json={"enabled": False}
+        )
+        assert paused.status_code == 200
+        assert paused.json()["enabled"] is False
+
+        with patch.object(
+            __import__("frameart.api", fromlist=["_live_album_service"])._live_album_service,
+            "sync_album",
+            return_value={
+                "album_id": album_id,
+                "status": "unchanged",
+                "source_count": 8,
+                "synced_count": 8,
+                "uploaded": 0,
+                "deleted": 0,
+                "results": [],
+                "errors": [],
+            },
+        ):
+            synced = client.post(f"/modes/live-album/{album_id}/sync")
+        assert synced.status_code == 200
+        assert synced.json()["synced_count"] == 8
+
+        deleted = client.delete(f"/modes/live-album/{album_id}")
+        assert deleted.status_code == 200
+        assert client.get("/modes/live-album").json() == []
+
+    def test_album_validates_provider_url_and_target(self, managed_config_env):
+        self.create_tv()
+        wrong_provider = client.post(
+            "/modes/live-album",
+            json={
+                "name": "Wrong",
+                "provider": "icloud",
+                "source_url": "https://photos.app.goo.gl/public-token",
+                "tv_profile_id": "album_tv",
+            },
+        )
+        assert wrong_provider.status_code == 422
+
+        missing_tv = client.post(
+            "/modes/live-album",
+            json={
+                "name": "Missing TV",
+                "provider": "google_photos",
+                "source_url": "https://photos.app.goo.gl/public-token",
+                "tv_profile_id": "missing",
+            },
+        )
+        assert missing_tv.status_code == 422
+        assert missing_tv.json()["detail"] == "TV profile was not found."
+
+
 # ---------------------------------------------------------------------------
 # GET / — Web UI
 # ---------------------------------------------------------------------------
@@ -3148,3 +3253,13 @@ class TestWebUI:
         assert 'id="btn-live-score-create"' in page.text
         assert 'id="btn-live-score-feed"' in page.text
         assert "'/modes/live-score'" in script.text
+
+    def test_modes_ui_has_public_album_management(self):
+        page = client.get("/")
+        script = client.get("/static/app.js")
+
+        assert 'id="live-album-url"' in page.text
+        assert 'id="live-album-target"' in page.text
+        assert 'id="btn-live-album-save"' in page.text
+        assert 'id="live-album-list"' in page.text
+        assert "'/modes/live-album'" in script.text
