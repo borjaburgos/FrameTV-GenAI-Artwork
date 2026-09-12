@@ -408,7 +408,47 @@
     </div>
     <div class="settings-card settings-card-wide">
       <h3>Live Album</h3>
-      <p>Public album slideshow management will appear here. Album adapters use one-at-a-time caching so the host and TV do not accumulate copies.</p>
+      <p>Keep the ten newest still photos from a public Apple Photos or Google Photos album synchronized to a TV. Removed and superseded photos are also removed from the TV.</p>
+      <div class="row">
+        <div>
+          <label for="live-album-name">Album name</label>
+          <input id="live-album-name" maxlength="100" autocomplete="off" data-1p-ignore="true" placeholder="Family highlights">
+        </div>
+        <div>
+          <label for="live-album-provider">Photo service</label>
+          <select id="live-album-provider">
+            <option value="icloud">Apple Photos / iCloud</option>
+            <option value="google_photos">Google Photos</option>
+          </select>
+        </div>
+        <div>
+          <label for="live-album-url">Public shared-album URL</label>
+          <input id="live-album-url" type="url" maxlength="4096" autocomplete="off" data-1p-ignore="true" placeholder="https://www.icloud.com/sharedalbum/#...">
+          <p id="live-album-url-help">In Photos, enable Public Website and paste its iCloud link.</p>
+        </div>
+        <div>
+          <label for="live-album-target">Synchronize to</label>
+          <select id="live-album-target"></select>
+        </div>
+        <div>
+          <label for="live-album-interval">Check for changes</label>
+          <select id="live-album-interval">
+            <option value="60">Every minute</option>
+            <option value="300" selected>Every 5 minutes</option>
+            <option value="900">Every 15 minutes</option>
+            <option value="3600">Every hour</option>
+          </select>
+        </div>
+      </div>
+      <div class="checkbox-row">
+        <label><input id="live-album-display-newest" type="checkbox" checked> Display the newest photo when new photos arrive</label>
+      </div>
+      <p class="hint">Only photos owned by this live album are deleted. A provider or download failure leaves the TV unchanged and retries later. Google public-album access is best effort because Google does not publish an anonymous album API.</p>
+      <div class="settings-item-actions">
+        <button class="btn btn-small" id="btn-live-album-save">Create Live Album</button>
+        <button class="btn btn-secondary btn-small" id="btn-live-album-cancel" hidden>Cancel edit</button>
+      </div>
+      <div class="settings-list" id="live-album-list"></div>
     </div>
   </div>
 </div>

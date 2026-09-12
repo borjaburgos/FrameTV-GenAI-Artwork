@@ -85,6 +85,11 @@ from frameart.automation import (
 from frameart.config import STYLE_PRESETS, ProviderConfig, Settings, TVProfile, load_settings
 from frameart.jobs import JobQueueFullError
 from frameart.library import LibraryStore
+from frameart.live_album import (
+    LiveAlbumService,
+    LiveAlbumStore,
+    validate_album_url,
+)
 from frameart.live_score import (
     LiveScoreService,
     LiveScoreStore,
@@ -180,6 +185,7 @@ JobId = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")]
 
 _automation_scheduler = AutomationScheduler(load_settings)
 _live_score_service = LiveScoreService(load_settings)
+_live_album_service = LiveAlbumService(load_settings)
 
 
 @asynccontextmanager
@@ -187,9 +193,11 @@ async def _app_lifespan(_app: FastAPI):
     """Run the durable automation loop for every ASGI deployment."""
     _automation_scheduler.start()
     _live_score_service.start()
+    _live_album_service.start()
     try:
         yield
     finally:
+        _live_album_service.stop()
         _live_score_service.stop()
         _automation_scheduler.stop()
 
@@ -345,7 +353,11 @@ def _required_scope(request: Request) -> str:
     if (
         request.method == "POST"
         and request.url.path.startswith("/modes/")
-        and (request.url.path.endswith("/refresh") or request.url.path.endswith("/feed"))
+        and (
+            request.url.path.endswith("/refresh")
+            or request.url.path.endswith("/feed")
+            or request.url.path.endswith("/sync")
+        )
     ):
         return "control"
     if request.url.path == "/automation/status" and request.method == "GET":
@@ -960,6 +972,10 @@ class WebhookCreateRequest(BaseModel):
             "live_score.displayed",
             "live_score.partial",
             "live_score.error",
+            "live_album.synced",
+            "live_album.unchanged",
+            "live_album.partial",
+            "live_album.error",
         }
         normalized = list(dict.fromkeys(event.strip() for event in value if event.strip()))
         unsupported = sorted(set(normalized) - supported)
@@ -1024,6 +1040,44 @@ class LiveScoreFeedRequest(BaseModel):
         max_length=20,
     )
     provider_updated_at: str | None = Field(None, max_length=100)
+
+
+class LiveAlbumCreateRequest(BaseModel):
+    """Configure a public Apple or Google photo album sync."""
+
+    name: str = Field(..., min_length=1, max_length=100)
+    provider: str = Field(..., pattern=r"^(icloud|google_photos)$")
+    source_url: str = Field(..., min_length=8, max_length=4096)
+    group_id: AutomationId | None = None
+    tv_profile_id: ProfileId | None = None
+    interval_seconds: int = Field(300, ge=60, le=86400)
+    display_newest: bool = True
+    enabled: bool = True
+
+    @field_validator("name")
+    @classmethod
+    def strip_live_album_name(cls, value: str) -> str:
+        return _strip_nonempty(value)
+
+    @model_validator(mode="after")
+    def validate_live_album(self):
+        if (self.group_id is None) == (self.tv_profile_id is None):
+            raise ValueError("Choose exactly one TV or TV group target.")
+        if self.source_url is not None:
+            self.source_url = validate_album_url(self.provider, self.source_url)
+        return self
+
+
+class LiveAlbumUpdateRequest(LiveAlbumCreateRequest):
+    """Replace editable album settings; an omitted URL keeps the current one."""
+
+    source_url: str | None = Field(None, min_length=8, max_length=4096)
+
+
+class LiveAlbumEnabledRequest(BaseModel):
+    """Pause or resume a public album sync."""
+
+    enabled: bool
 
 
 CollectionId = Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")]
@@ -1227,6 +1281,11 @@ def _automation_store(settings=None) -> AutomationStore:
 def _live_score_store(settings=None) -> LiveScoreStore:
     settings = settings or _settings()
     return LiveScoreStore(settings.data_dir)
+
+
+def _live_album_store(settings=None) -> LiveAlbumStore:
+    settings = settings or _settings()
+    return LiveAlbumStore(settings.data_dir)
 
 
 _SENSITIVE_SETTING_TERMS = ("api_key", "password", "secret", "token")
@@ -2552,6 +2611,7 @@ def update_managed_tv(profile_id: ProfileId, req: TVSettingsRequest):
         replacements = {profile_id: target_profile_id}
         AutomationStore(settings.data_dir).replace_tv_profile_ids(replacements)
         LiveScoreStore(settings.data_dir).replace_tv_profile_ids(replacements)
+        LiveAlbumStore(settings.data_dir).replace_tv_profile_ids(replacements)
     return _managed_tvs_response(load_settings())
 
 
@@ -2610,6 +2670,7 @@ def consolidate_managed_tv(profile_id: ProfileId):
     replacements = {duplicate_id: profile_id for duplicate_id in duplicate_ids}
     AutomationStore(settings.data_dir).replace_tv_profile_ids(replacements)
     LiveScoreStore(settings.data_dir).replace_tv_profile_ids(replacements)
+    LiveAlbumStore(settings.data_dir).replace_tv_profile_ids(replacements)
     return _managed_tvs_response(load_settings())
 
 
@@ -3614,6 +3675,115 @@ def delete_live_score_tracker(tracker_id: AutomationId):
     if not _live_score_service.delete_tracker(tracker_id):
         raise HTTPException(status_code=404, detail="Live-score tracker was not found.")
     return {"deleted": tracker_id}
+
+
+# ---------------------------------------------------------------------------
+# Routes — Live Album mode
+# ---------------------------------------------------------------------------
+
+
+def _validate_live_album_target(settings, *, group_id: str | None, tv_profile_id: str | None):
+    if group_id is not None and _automation_store(settings).get_group(group_id) is None:
+        raise HTTPException(status_code=422, detail="TV group was not found.")
+    if tv_profile_id is not None and tv_profile_id not in settings.tvs:
+        raise HTTPException(status_code=422, detail="TV profile was not found.")
+
+
+@app.get("/modes/live-album")
+def list_live_albums():
+    return _live_album_store().list_albums()
+
+
+@app.post("/modes/live-album", status_code=201)
+def create_live_album(req: LiveAlbumCreateRequest):
+    settings = _settings()
+    _validate_live_album_target(
+        settings, group_id=req.group_id, tv_profile_id=req.tv_profile_id
+    )
+    target_type = "group" if req.group_id is not None else "tv"
+    target_id = req.group_id or req.tv_profile_id or ""
+    try:
+        return _live_album_store(settings).create_album(
+            name=req.name,
+            provider=req.provider,
+            source_url=req.source_url,
+            target_type=target_type,
+            target_id=target_id,
+            interval_seconds=req.interval_seconds,
+            display_newest=req.display_newest,
+            enabled=req.enabled,
+        )
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(
+            status_code=409, detail="A live album with that name exists."
+        ) from exc
+
+
+@app.put("/modes/live-album/{album_id}")
+def update_live_album(album_id: AutomationId, req: LiveAlbumUpdateRequest):
+    settings = _settings()
+    store = _live_album_store(settings)
+    current = store.get_album(album_id, include_source=True)
+    if current is None:
+        raise HTTPException(status_code=404, detail="Live album was not found.")
+    _validate_live_album_target(
+        settings, group_id=req.group_id, tv_profile_id=req.tv_profile_id
+    )
+    source_url = req.source_url or current["source_url"]
+    try:
+        source_url = validate_album_url(req.provider, source_url)
+        updated = store.update_album(
+            album_id,
+            name=req.name,
+            provider=req.provider,
+            source_url=source_url,
+            target_type="group" if req.group_id is not None else "tv",
+            target_id=req.group_id or req.tv_profile_id or "",
+            interval_seconds=req.interval_seconds,
+            display_newest=req.display_newest,
+            enabled=req.enabled,
+        )
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(
+            status_code=409, detail="A live album with that name exists."
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not updated:
+        raise HTTPException(status_code=404, detail="Live album was not found.")
+    return store.get_album(album_id)
+
+
+@app.put("/modes/live-album/{album_id}/enabled")
+def set_live_album_enabled(album_id: AutomationId, req: LiveAlbumEnabledRequest):
+    store = _live_album_store()
+    if not store.set_enabled(album_id, req.enabled):
+        raise HTTPException(status_code=404, detail="Live album was not found.")
+    return store.get_album(album_id)
+
+
+@app.post("/modes/live-album/{album_id}/sync")
+def sync_live_album(album_id: AutomationId):
+    try:
+        return _live_album_service.sync_album(album_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Live album was not found.") from exc
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.delete("/modes/live-album/{album_id}")
+def delete_live_album(album_id: AutomationId):
+    try:
+        deleted = _live_album_service.delete_album(album_id)
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Could not remove all album photos from the TV: {exc}",
+        ) from exc
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Live album was not found.")
+    return {"deleted": album_id}
 
 
 @app.post("/jobs/delete", response_model=DeleteJobsResponse)
