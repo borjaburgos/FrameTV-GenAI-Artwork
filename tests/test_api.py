@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from frameart.api import _request_client_ip, _trusted_lan_identity, app
+from frameart.live_album import AlbumItem, LiveAlbumStore
 
 client = TestClient(app)
 
@@ -3191,6 +3192,77 @@ class TestLiveAlbumMode:
         assert missing_tv.status_code == 422
         assert missing_tv.json()["detail"] == "TV profile was not found."
 
+    def test_album_photos_can_be_listed_previewed_and_safely_displayed(
+        self, managed_config_env
+    ):
+        self.create_tv()
+        created = client.post(
+            "/modes/live-album",
+            json={
+                "name": "Family highlights",
+                "provider": "icloud",
+                "source_url": "https://www.icloud.com/sharedalbum/#D2EpublicAlbumToken",
+                "tv_profile_id": "album_tv",
+            },
+        )
+        album_id = created.json()["id"]
+        store = LiveAlbumStore(managed_config_env)
+        item = AlbumItem(
+            item_id="photo-1",
+            image_url="https://cdn.icloud-content.com/photo.jpg",
+            added_at=1234.0,
+            checksum="checksum-1",
+            title="Family photo",
+        )
+        store.replace_source_items(album_id, (item,))
+        saved = store.source_item(album_id, item.item_id)
+        saved["cache_path"].parent.mkdir(parents=True, exist_ok=True)
+        saved["cache_path"].write_bytes(_jpeg_bytes())
+
+        photos = client.get(f"/modes/live-album/{album_id}/photos")
+        assert photos.status_code == 200
+        assert photos.json()[0]["item_id"] == "photo-1"
+        assert photos.json()[0]["image_url"].startswith(
+            f"/modes/live-album/{album_id}/photos/photo-1/image?v="
+        )
+
+        preview = client.get(
+            f"/modes/live-album/{album_id}/photos/photo-1/image"
+        )
+        assert preview.status_code == 200
+        assert preview.headers["content-type"].startswith("image/jpeg")
+        assert preview.headers["cache-control"] == "no-cache"
+
+        service = __import__("frameart.api", fromlist=["_live_album_service"])
+        with patch.object(
+            service._live_album_service,
+            "display_photo",
+            return_value={
+                "album_id": album_id,
+                "item_id": "photo-1",
+                "status": "skipped",
+                "results": [],
+                "skipped": [
+                    {
+                        "tv_profile_id": "album_tv",
+                        "reason": "TV is not in Art Mode; normal viewing was left untouched.",
+                    }
+                ],
+                "errors": [],
+            },
+        ) as mock_display:
+            displayed = client.post(
+                f"/modes/live-album/{album_id}/photos/photo-1/display"
+            )
+        assert displayed.status_code == 200
+        assert displayed.json()["status"] == "skipped"
+        mock_display.assert_called_once_with(album_id, "photo-1")
+
+        cache_dir = saved["cache_path"].parent
+        deleted = client.delete(f"/modes/live-album/{album_id}")
+        assert deleted.status_code == 200
+        assert not cache_dir.exists()
+
 
 # ---------------------------------------------------------------------------
 # GET / — Web UI
@@ -3203,6 +3275,7 @@ class TestWebUI:
         assert "text/html" in resp.headers["content-type"]
         assert "FrameArt" in resp.text
         assert 'href="/static/app.css"' in resp.text
+        assert resp.headers["cache-control"] == "no-cache"
         assert 'src="/static/app.js"' in resp.text
 
         assert client.get("/static/app.css").status_code == 200
@@ -3263,3 +3336,6 @@ class TestWebUI:
         assert 'id="btn-live-album-save"' in page.text
         assert 'id="live-album-list"' in page.text
         assert "'/modes/live-album'" in script.text
+        assert "data-live-album-display" in script.text
+        assert "live-album-photo-grid" in script.text
+        assert script.headers["cache-control"] == "no-cache"

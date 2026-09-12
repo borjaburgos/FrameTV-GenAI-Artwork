@@ -326,6 +326,9 @@ Use `deploy/Caddyfile.local` for the local hostname. It removes any client-suppl
 | `PUT/DELETE` | `/modes/live-album/{id}` | Edit or delete an album and its owned TV photos |
 | `POST` | `/modes/live-album/{id}/sync` | Reconcile the newest ten photos immediately |
 | `PUT` | `/modes/live-album/{id}/enabled` | Pause or resume periodic checks |
+| `GET` | `/modes/live-album/{id}/photos` | List the cached newest-ten gallery |
+| `GET` | `/modes/live-album/{id}/photos/{photo}/image` | Read a cached gallery preview |
+| `POST` | `/modes/live-album/{id}/photos/{photo}/display` | Safely display one photo on its configured target |
 
 **Public domain catalog**:
 
@@ -580,7 +583,9 @@ Polling can run every 30 seconds, minute, or five minutes, but actual freshness 
 by the upstream provider. FrameArt renders deterministic Pillow scoreboards instead of paying
 for a generative image on every update. Each tracker atomically overwrites one host image. On
 the TV, FrameArt uploads and switches to the new still before deleting the previous content ID;
-failed deletions are retained in a small retry list rather than allowing unbounded state.
+failed deletions are retained in a small retry list rather than allowing unbounded state. Live
+Score checks that each TV is already in Art Mode before touching it, so a score update cannot
+interrupt normal TV viewing.
 
 ### Live Album providers, synchronization, and safety
 
@@ -589,13 +594,21 @@ link-shared Google Photos album, choose one persistent TV or TV group, and selec
 interval. Apple albums must have **Public Website** enabled; Google albums must have link
 sharing enabled. No Apple or Google account credentials are stored.
 
+The album card includes a gallery of those ten photos and a **Send to TV** action for each one.
+FrameArt keeps exactly one bounded local JPEG preview per current photo so the WebUI never
+depends on expiring provider image links. A successful upstream refresh replaces this cache and
+removes previews for photos that are no longer in the newest ten.
+
 Every successful check sorts still images by when they were added to the shared album and
 reconciles the newest ten with each target TV. Existing matching uploads are reused, missing
 photos are uploaded, and photos deleted upstream—or displaced by newer additions—are deleted
 from the TV. FrameArt records every TV content ID it owns and never deletes unrelated artwork.
 New uploads complete before obsolete photos are removed. A source, download, or TV deletion
 failure preserves the current set and retries later; outstanding deletions block more uploads
-to that TV so a persistent outage cannot grow storage without bound.
+to that TV so a persistent outage cannot grow storage without bound. Both scheduled newest-photo
+updates and item-level display actions require the TV to positively report that Art Mode is
+already active. An offline TV, an uncertain status, or normal TV playback causes the action to
+be skipped without uploading or enabling Art Mode. Scheduled playlists use the same guard.
 
 Apple exposes public Shared Albums through the same anonymous feed used by its website. Google
 does not document an anonymous shared-album API, so its adapter reads public-page metadata and

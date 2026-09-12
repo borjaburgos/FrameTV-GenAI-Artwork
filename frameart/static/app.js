@@ -22,6 +22,8 @@
   let automationStatus = null;
   let liveScoreTrackers = [];
   let liveAlbums = [];
+  let liveAlbumPhotos = {};
+  let liveAlbumPhotoErrors = {};
   let editingLiveAlbumId = null;
   let editingProviderName = null;
   let editingTVProfileId = null;
@@ -1702,6 +1704,24 @@
       automationGroups = await parseJSONResponse(groupResponse, 'Could not load TV groups.');
       const tvPayload = await parseJSONResponse(tvResponse, 'Could not load TV settings.');
       managedTVSettings = tvPayload.tvs || [];
+      const photoEntries = await Promise.all(liveAlbums.map(async (album) => {
+        try {
+          const response = await apiFetch('/modes/live-album/' + album.id + '/photos');
+          const photos = await parseJSONResponse(
+            response,
+            'Could not load photos for ' + album.name + '.',
+          );
+          return [album.id, photos, null];
+        } catch (error) {
+          return [album.id, [], error.message || 'Could not load album photos.'];
+        }
+      }));
+      liveAlbumPhotos = Object.fromEntries(
+        photoEntries.map(([albumId, photos]) => [albumId, photos])
+      );
+      liveAlbumPhotoErrors = Object.fromEntries(
+        photoEntries.filter((entry) => entry[2]).map(([albumId, _photos, error]) => [albumId, error])
+      );
       renderLiveScores();
       renderLiveAlbums();
     } finally {
@@ -1835,6 +1855,32 @@
     return 'Group · ' + (group?.name || album.group_id);
   }
 
+  function renderLiveAlbumPhotos(album) {
+    const error = liveAlbumPhotoErrors[album.id];
+    if (error) {
+      return '<div class="live-album-gallery-empty error-text">' + esc(error) + '</div>';
+    }
+    const photos = liveAlbumPhotos[album.id] || [];
+    if (!photos.length) {
+      return '<div class="live-album-gallery-empty">No previews are cached yet. Use Sync now to load the newest photos.</div>';
+    }
+    return '<div class="live-album-photo-grid">' + photos.map((photo, index) => {
+      const date = photo.added_at
+        ? new Date(photo.added_at * 1000).toLocaleString()
+        : 'Date unavailable';
+      const location = photo.uploaded_to?.length
+        ? ('On ' + photo.uploaded_to.join(', '))
+        : 'Ready to upload';
+      const title = photo.title || ('Album photo ' + (index + 1));
+      return '<article class="live-album-photo"><img src="' + esc(photo.image_url) +
+        '" loading="lazy" alt="' + esc(title) + '"><div class="live-album-photo-info"><strong>' +
+        esc(index === 0 ? 'Newest photo' : title) + '</strong><span>' + esc(date) +
+        ' · ' + esc(location) + '</span><button class="btn btn-secondary btn-small" ' +
+        'data-live-album-display="' + esc(album.id) + '" data-live-album-photo="' +
+        esc(photo.item_id) + '">Send to TV</button></div></article>';
+    }).join('') + '</div>';
+  }
+
   function renderLiveAlbums() {
     const target = document.getElementById('live-album-target');
     const selectedTarget = target.value;
@@ -1854,7 +1900,8 @@
       const next = album.enabled && album.next_sync
         ? (' · next check ' + new Date(album.next_sync * 1000).toLocaleString())
         : '';
-      return '<div class="settings-item"><div class="settings-item-main"><strong>' +
+      return '<div class="settings-item live-album-item"><div class="live-album-summary">' +
+        '<div class="settings-item-main"><strong>' +
         esc(album.name) + '</strong><span>' + esc(album.source_name || album.source_host || 'Public album') +
         ' · ' + esc(liveAlbumTargetLabel(album)) + '</span><span>' +
         esc(album.provider === 'icloud' ? 'Apple Photos / iCloud' : 'Google Photos') +
@@ -1867,7 +1914,7 @@
         'data-live-album-toggle="' + esc(album.id) + '" data-enabled="' + String(album.enabled) +
         '">' + (album.enabled ? 'Pause' : 'Resume') + '</button>' +
         '<button class="btn btn-danger btn-small" data-live-album-delete="' + esc(album.id) +
-        '">Delete</button></div></div>';
+        '">Delete</button></div></div>' + renderLiveAlbumPhotos(album) + '</div>';
     }).join('');
   }
 
@@ -1952,6 +1999,7 @@
 
   document.getElementById('live-album-list').addEventListener('click', async (event) => {
     const sync = event.target.closest('[data-live-album-sync]');
+    const display = event.target.closest('[data-live-album-display]');
     const edit = event.target.closest('[data-live-album-edit]');
     const toggle = event.target.closest('[data-live-album-toggle]');
     const remove = event.target.closest('[data-live-album-delete]');
@@ -1960,12 +2008,12 @@
       if (album) editLiveAlbum(album);
       return;
     }
-    const button = sync || toggle || remove;
+    const button = sync || display || toggle || remove;
     if (!button) return;
     if (remove && !window.confirm(
       'Delete this live album and remove all photos it synchronized from the TV?'
     )) return;
-    setButtonBusy(button, sync ? 'Syncing...' : 'Saving...');
+    setButtonBusy(button, sync ? 'Syncing...' : (display ? 'Sending...' : 'Saving...'));
     try {
       if (sync) {
         const response = await apiFetch(
@@ -1976,6 +2024,26 @@
           'Album ' + result.status + ': ' + result.synced_count + ' newest photo(s) managed.',
           result.errors?.length ? 'warn' : 'done',
         );
+      } else if (display) {
+        const response = await apiFetch(
+          '/modes/live-album/' + display.dataset.liveAlbumDisplay + '/photos/' +
+          encodeURIComponent(display.dataset.liveAlbumPhoto) + '/display',
+          {method: 'POST'},
+        );
+        const result = await parseJSONResponse(response, 'Could not display album photo.');
+        if (result.status === 'skipped') {
+          showToast(
+            result.skipped?.[0]?.reason || 'TV is in use; normal viewing was left untouched.',
+            'warn',
+          );
+        } else {
+          showToast(
+            result.status === 'displayed'
+              ? 'Album photo displayed.'
+              : 'Album photo display ' + result.status + '.',
+            (result.errors?.length || result.skipped?.length) ? 'warn' : 'done',
+          );
+        }
       } else if (toggle) {
         const response = await apiFetch(
           '/modes/live-album/' + toggle.dataset.liveAlbumToggle + '/enabled', {

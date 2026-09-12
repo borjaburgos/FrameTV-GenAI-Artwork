@@ -392,6 +392,15 @@ def _within_rate_limit(key: str, limit: int) -> bool:
 
 
 @app.middleware("http")
+async def revalidate_web_assets(request: Request, call_next: Callable):
+    """Prevent browsers from running stale HTML and JavaScript after upgrades."""
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
+@app.middleware("http")
 async def authenticate_request(
     request: Request,
     call_next: Callable,
@@ -976,6 +985,8 @@ class WebhookCreateRequest(BaseModel):
             "live_album.unchanged",
             "live_album.partial",
             "live_album.error",
+            "live_album.displayed",
+            "live_album.skipped",
         }
         normalized = list(dict.fromkeys(event.strip() for event in value if event.strip()))
         unsupported = sorted(set(normalized) - supported)
@@ -1078,6 +1089,9 @@ class LiveAlbumEnabledRequest(BaseModel):
     """Pause or resume a public album sync."""
 
     enabled: bool
+
+
+AlbumPhotoId = Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{1,512}$")]
 
 
 CollectionId = Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")]
@@ -3692,6 +3706,47 @@ def _validate_live_album_target(settings, *, group_id: str | None, tv_profile_id
 @app.get("/modes/live-album")
 def list_live_albums():
     return _live_album_store().list_albums()
+
+
+@app.get("/modes/live-album/{album_id}/photos")
+def list_live_album_photos(album_id: AutomationId):
+    store = _live_album_store()
+    if store.get_album(album_id) is None:
+        raise HTTPException(status_code=404, detail="Live album was not found.")
+    photos = store.source_items(album_id)
+    for photo in photos:
+        photo["image_url"] = (
+            f"/modes/live-album/{album_id}/photos/{photo['item_id']}/image"
+            f"?v={photo['version']}"
+        )
+    return photos
+
+
+@app.get("/modes/live-album/{album_id}/photos/{item_id}/image")
+def get_live_album_photo(album_id: AutomationId, item_id: AlbumPhotoId):
+    store = _live_album_store()
+    if store.get_album(album_id) is None:
+        raise HTTPException(status_code=404, detail="Live album was not found.")
+    photo = store.source_item(album_id, item_id)
+    if photo is None or not photo["cache_path"].is_file():
+        raise HTTPException(status_code=404, detail="Live album photo was not found.")
+    return FileResponse(
+        photo["cache_path"],
+        media_type="image/jpeg",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@app.post("/modes/live-album/{album_id}/photos/{item_id}/display")
+def display_live_album_photo(album_id: AutomationId, item_id: AlbumPhotoId):
+    try:
+        return _live_album_service.display_photo(album_id, item_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Live album was not found.") from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Live album photo was not found.") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/modes/live-album", status_code=201)

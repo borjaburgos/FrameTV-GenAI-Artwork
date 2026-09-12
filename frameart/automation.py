@@ -361,13 +361,26 @@ def _find_artifact_image(data_dir: Path, job_id: str) -> Path:
     raise FileNotFoundError(f"Artwork job {job_id!r} does not have an image.")
 
 
-def display_artifact(settings, job_id: str, tv_profile_id: str, matte: str) -> dict[str, Any]:
-    """Display a library artifact on one TV, reusing an existing TV upload when possible."""
-    from frameart.tv.controller import list_art_deduplicated, switch_art, upload_image
+def display_artifact(
+    settings,
+    job_id: str,
+    tv_profile_id: str,
+    matte: str,
+    *,
+    require_art_mode: bool = False,
+) -> dict[str, Any]:
+    """Display one artifact, optionally refusing to interrupt normal TV viewing."""
+    from frameart.tv.controller import get_status, list_art_deduplicated, switch_art, upload_image
 
     profile = settings.tvs.get(tv_profile_id)
     if profile is None:
         raise KeyError(f"TV profile {tv_profile_id!r} is no longer configured.")
+    if require_art_mode:
+        status = get_status(profile)
+        if not (status.reachable and status.art_mode_supported and status.art_mode_on):
+            raise RuntimeError(
+                "TV is not in Art Mode; normal viewing was left untouched."
+            )
     image_path = _find_artifact_image(settings.data_dir, job_id)
     meta_path = image_path.parent / "meta.json"
     try:
@@ -383,7 +396,9 @@ def display_artifact(settings, job_id: str, tv_profile_id: str, matte: str) -> d
     if isinstance(content_id, str) and content_id:
         try:
             available = {str(item.get("content_id", "")) for item in list_art_deduplicated(profile)}
-            reused = content_id in available and switch_art(profile, content_id)
+            reused = content_id in available and switch_art(
+                profile, content_id, require_art_mode=require_art_mode
+            )
         except Exception:
             reused = False
 
@@ -393,7 +408,7 @@ def display_artifact(settings, job_id: str, tv_profile_id: str, matte: str) -> d
         if not upload.success or not upload.content_id:
             raise RuntimeError(upload.error or "TV upload failed.")
         content_id = upload.content_id
-        if not switch_art(profile, content_id):
+        if not switch_art(profile, content_id, require_art_mode=require_art_mode):
             raise RuntimeError("TV accepted the upload but did not switch artwork.")
         tv_map[profile.ip] = content_id
         metadata["tv_content_ids"] = tv_map
@@ -591,7 +606,13 @@ class AutomationScheduler:
             for tv_profile_id in group["tv_profile_ids"]:
                 try:
                     results.append(
-                        display_artifact(settings, job_id, tv_profile_id, schedule["matte"])
+                        display_artifact(
+                            settings,
+                            job_id,
+                            tv_profile_id,
+                            schedule["matte"],
+                            require_art_mode=True,
+                        )
                     )
                 except Exception as exc:
                     errors.append(f"{tv_profile_id}: {exc}")
