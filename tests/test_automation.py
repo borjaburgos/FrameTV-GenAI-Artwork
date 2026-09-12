@@ -6,9 +6,16 @@ import json
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from frameart.automation import AutomationScheduler, AutomationStore, IntegrationPublisher
+import pytest
+
+from frameart.automation import (
+    AutomationScheduler,
+    AutomationStore,
+    IntegrationPublisher,
+    display_artifact,
+)
 
 
 def _definitions(store: AutomationStore):
@@ -62,6 +69,38 @@ def test_scheduler_advances_playlist_and_records_partial_result(
     assert persisted["current_index"] == 1
     assert persisted["last_status"] == "partial"
     assert "kitchen: offline" in persisted["last_error"]
+    assert all(call.kwargs["require_art_mode"] is True for call in mock_display.call_args_list)
+
+
+@patch("frameart.tv.controller.switch_art")
+@patch("frameart.tv.controller.upload_image")
+@patch("frameart.tv.controller.list_art_deduplicated")
+@patch("frameart.tv.controller.get_status")
+def test_scheduled_display_does_not_touch_tv_during_active_viewing(
+    mock_get_status,
+    mock_list,
+    mock_upload,
+    mock_switch,
+    tmp_path,
+):
+    profile = MagicMock()
+    settings = SimpleNamespace(data_dir=tmp_path, tvs={"living_room": profile})
+    mock_get_status.return_value = SimpleNamespace(
+        reachable=True, art_mode_supported=True, art_mode_on=False
+    )
+
+    with pytest.raises(RuntimeError, match="normal viewing was left untouched"):
+        display_artifact(
+            settings,
+            "job-one",
+            "living_room",
+            "none",
+            require_art_mode=True,
+        )
+
+    mock_list.assert_not_called()
+    mock_upload.assert_not_called()
+    mock_switch.assert_not_called()
 
 
 @patch("frameart.automation.httpx.post")

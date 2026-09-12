@@ -789,12 +789,16 @@ def switch_art(
     *,
     wait_for_ready: bool = False,
     readiness_timeout_sec: float = ART_READINESS_TIMEOUT,
+    require_art_mode: bool = False,
 ) -> bool:
     """Switch the displayed artwork on the Frame TV.
 
     Art-mode detection, enabling Art Mode, and image selection each receive an
-    independent bounded deadline. If selection fails or times out, query the TV
-    once more and accept success when the requested content is already current.
+    independent bounded deadline. If ``require_art_mode`` is true, selection is
+    skipped unless the TV positively reports that Art Mode is already active;
+    this prevents background modes from interrupting normal TV viewing. If
+    selection fails or times out, query the TV once more and accept success when
+    the requested content is already current.
     """
     if wait_for_ready:
         wait_for_art(profile, content_id, timeout_sec=readiness_timeout_sec)
@@ -806,8 +810,13 @@ def switch_art(
         )
     except Exception as exc:
         logger.warning("Could not get art mode status before switching: %s", exc)
+        if require_art_mode:
+            return False
 
     if not art_mode_on:
+        if require_art_mode:
+            logger.info("Skipped artwork selection because the TV is not in Art Mode")
+            return False
         try:
             _run_art_call(profile, lambda art: art.set_artmode(True), "Enable art mode")
         except Exception as exc:

@@ -338,6 +338,28 @@ def test_switch_art_gives_art_mode_and_selection_independent_calls(mock_call):
 
 
 @patch("frameart.tv.controller._run_art_call")
+def test_switch_art_does_not_interrupt_active_viewing_when_art_mode_is_required(mock_call):
+    profile = TVProfile(ip="192.168.1.100")
+    mock_call.return_value = "off"
+
+    assert switch_art(profile, "MY_F0006", require_art_mode=True) is False
+
+    descriptions = [invocation.args[2] for invocation in mock_call.call_args_list]
+    assert descriptions == ["Get art mode status"]
+
+
+@patch("frameart.tv.controller._run_art_call")
+def test_switch_art_fails_closed_when_required_art_mode_cannot_be_read(mock_call):
+    profile = TVProfile(ip="192.168.1.100")
+    mock_call.side_effect = RuntimeError("status unavailable")
+
+    assert switch_art(profile, "MY_F0006", require_art_mode=True) is False
+
+    descriptions = [invocation.args[2] for invocation in mock_call.call_args_list]
+    assert descriptions == ["Get art mode status"]
+
+
+@patch("frameart.tv.controller._run_art_call")
 def test_switch_art_reconciles_selection_timeout_as_success(mock_call):
     profile = TVProfile(ip="192.168.1.100")
 

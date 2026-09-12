@@ -463,6 +463,7 @@ def test_live_provider_response_advances_waiting_tracker_to_displayed(
     mock_display.assert_called_once()
 
 
+@patch("frameart.tv.controller.get_status")
 @patch("frameart.tv.controller.delete_art", return_value=True)
 @patch("frameart.tv.controller.switch_art", return_value=True)
 @patch("frameart.tv.controller.upload_image")
@@ -470,6 +471,7 @@ def test_display_uploads_then_deletes_previous_tv_image(
     mock_upload,
     mock_switch,
     mock_delete,
+    mock_get_status,
     tmp_path,
 ):
     group = AutomationStore(tmp_path).create_group("Living Room", ["living_room"])
@@ -478,6 +480,9 @@ def test_display_uploads_then_deletes_previous_tv_image(
     image_path = tmp_path / "score.png"
     Image.new("RGB", (16, 9), "blue").save(image_path)
     mock_upload.return_value = SimpleNamespace(success=True, content_id="new", error=None)
+    mock_get_status.return_value = SimpleNamespace(
+        reachable=True, art_mode_supported=True, art_mode_on=True
+    )
     tracker = {
         "group_id": group["id"],
         "current_content_ids": {"living_room": "old"},
@@ -494,10 +499,11 @@ def test_display_uploads_then_deletes_previous_tv_image(
     assert stale == {}
     assert results[0]["content_id"] == "new"
     assert errors == []
-    mock_switch.assert_called_once_with(profile, "new")
+    mock_switch.assert_called_once_with(profile, "new", require_art_mode=True)
     mock_delete.assert_called_once_with(profile, ["old"])
 
 
+@patch("frameart.tv.controller.get_status")
 @patch("frameart.tv.controller.delete_art", return_value=True)
 @patch("frameart.tv.controller.switch_art", return_value=True)
 @patch("frameart.tv.controller.upload_image")
@@ -505,6 +511,7 @@ def test_display_targets_one_individual_tv(
     mock_upload,
     mock_switch,
     mock_delete,
+    mock_get_status,
     tmp_path,
 ):
     profile = MagicMock()
@@ -512,6 +519,9 @@ def test_display_targets_one_individual_tv(
     image_path = tmp_path / "score.png"
     Image.new("RGB", (16, 9), "blue").save(image_path)
     mock_upload.return_value = SimpleNamespace(success=True, content_id="new", error=None)
+    mock_get_status.return_value = SimpleNamespace(
+        reachable=True, art_mode_supported=True, art_mode_on=True
+    )
     tracker = {
         "group_id": None,
         "tv_profile_id": "living_room",
@@ -529,10 +539,11 @@ def test_display_targets_one_individual_tv(
     assert stale == {}
     assert results == [{"tv_profile_id": "living_room", "content_id": "new"}]
     assert errors == []
-    mock_switch.assert_called_once_with(profile, "new")
+    mock_switch.assert_called_once_with(profile, "new", require_art_mode=True)
     mock_delete.assert_called_once_with(profile, ["old"])
 
 
+@patch("frameart.tv.controller.get_status")
 @patch("frameart.tv.controller.delete_art", return_value=True)
 @patch("frameart.tv.controller.switch_art", return_value=False)
 @patch("frameart.tv.controller.upload_image")
@@ -540,6 +551,7 @@ def test_display_cleans_up_new_upload_when_switch_fails(
     mock_upload,
     _mock_switch,
     mock_delete,
+    mock_get_status,
     tmp_path,
 ):
     group = AutomationStore(tmp_path).create_group("Living Room", ["living_room"])
@@ -548,6 +560,9 @@ def test_display_cleans_up_new_upload_when_switch_fails(
     image_path = tmp_path / "score.png"
     Image.new("RGB", (16, 9), "blue").save(image_path)
     mock_upload.return_value = SimpleNamespace(success=True, content_id="orphan", error=None)
+    mock_get_status.return_value = SimpleNamespace(
+        reachable=True, art_mode_supported=True, art_mode_on=True
+    )
     tracker = {
         "group_id": group["id"],
         "current_content_ids": {"living_room": "old"},
@@ -565,3 +580,43 @@ def test_display_cleans_up_new_upload_when_switch_fails(
     assert results == []
     assert "did not switch" in errors[0]
     mock_delete.assert_called_once_with(profile, ["orphan"])
+
+
+@patch("frameart.tv.controller.get_status")
+@patch("frameart.tv.controller.delete_art")
+@patch("frameart.tv.controller.switch_art")
+@patch("frameart.tv.controller.upload_image")
+def test_display_does_not_touch_tv_during_active_viewing(
+    mock_upload,
+    mock_switch,
+    mock_delete,
+    mock_get_status,
+    tmp_path,
+):
+    profile = MagicMock()
+    settings = SimpleNamespace(data_dir=tmp_path, tvs={"living_room": profile})
+    image_path = tmp_path / "score.png"
+    Image.new("RGB", (16, 9), "blue").save(image_path)
+    mock_get_status.return_value = SimpleNamespace(
+        reachable=True, art_mode_supported=True, art_mode_on=False
+    )
+    tracker = {
+        "group_id": None,
+        "tv_profile_id": "living_room",
+        "current_content_ids": {"living_room": "old"},
+        "stale_content_ids": {},
+    }
+
+    current, stale, results, errors = LiveScoreService._display(
+        settings,
+        tracker,
+        image_path,
+    )
+
+    assert current == {"living_room": "old"}
+    assert stale == {}
+    assert results == []
+    assert "normal viewing was left untouched" in errors[0]
+    mock_upload.assert_not_called()
+    mock_switch.assert_not_called()
+    mock_delete.assert_not_called()

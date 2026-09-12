@@ -272,6 +272,44 @@
     margin-top: .55rem;
     background: #07111f;
   }
+  .live-album-item { flex-direction: column; align-items: stretch; gap: .8rem; }
+  .live-album-summary {
+    display: flex;
+    justify-content: space-between;
+    gap: .75rem;
+    align-items: flex-start;
+  }
+  .live-album-photo-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: .65rem;
+  }
+  .live-album-photo {
+    overflow: hidden;
+    border: 1px solid rgba(168, 179, 200, .16);
+    border-radius: 9px;
+    background: rgba(10, 16, 25, .72);
+  }
+  .live-album-photo img {
+    display: block;
+    width: 100%;
+    aspect-ratio: 4 / 3;
+    object-fit: contain;
+    background: #070d16;
+  }
+  .live-album-photo-info {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: .35rem;
+    padding: .55rem;
+  }
+  .live-album-photo-info span { font-size: .72rem; overflow-wrap: anywhere; }
+  .live-album-gallery-empty {
+    padding: .7rem;
+    border: 1px dashed rgba(168, 179, 200, .18);
+    border-radius: 8px;
+  }
 
   /* --- Forms --- */
   label { display: block; color: var(--muted); font-size: .8rem; margin-bottom: .25rem; }
@@ -673,6 +711,8 @@
     .settings-card-header { flex-direction: column; }
     .settings-item { flex-direction: column; align-items: stretch; }
     .settings-item-actions { justify-content: flex-start; }
+    .live-album-summary { flex-direction: column; }
+    .live-album-photo-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .shortcut-grid { grid-template-columns: 1fr; }
     .shortcut-grid .keys { justify-content: flex-start; }
     .modal-overlay { align-items: flex-end; }

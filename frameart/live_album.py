@@ -39,6 +39,8 @@ _ICLOUD_PAGE_HOSTS = {"icloud.com", "www.icloud.com"}
 _GOOGLE_PAGE_HOSTS = {"photos.app.goo.gl", "photos.google.com"}
 _ICLOUD_STREAM_HOST_RE = re.compile(r"^p\d+-sharedstreams\.icloud\.com$")
 _ICLOUD_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{8,512}$")
+_ALBUM_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+_CACHE_NAME_RE = re.compile(r"^[a-f0-9]{24}-[a-f0-9]{16}\.jpg$")
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,18 @@ class AlbumSnapshot:
     name: str
     total_count: int
     items: tuple[AlbumItem, ...]
+
+
+def _album_cache_directory(data_dir: Path, album_id: str) -> Path:
+    if not _ALBUM_ID_RE.fullmatch(album_id):
+        raise ValueError("Live album ID is invalid.")
+    return Path(data_dir) / "cache" / "live-albums" / album_id
+
+
+def _album_cache_name(item: AlbumItem) -> str:
+    item_digest = hashlib.sha256(item.item_id.encode()).hexdigest()[:24]
+    version_digest = hashlib.sha256(item.checksum.encode()).hexdigest()[:16]
+    return f"{item_digest}-{version_digest}.jpg"
 
 
 def _clean_https_url(value: str) -> str:
@@ -557,6 +571,18 @@ class LiveAlbumStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_photo_album_feeds_due
                     ON photo_album_feeds(enabled, next_sync);
+                CREATE TABLE IF NOT EXISTS photo_album_source_items (
+                    album_id TEXT NOT NULL,
+                    source_item_id TEXT NOT NULL,
+                    source_checksum TEXT NOT NULL,
+                    added_at REAL NOT NULL,
+                    title TEXT NOT NULL,
+                    cache_name TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (album_id, source_item_id),
+                    FOREIGN KEY (album_id) REFERENCES photo_album_feeds(id) ON DELETE CASCADE
+                );
                 CREATE TABLE IF NOT EXISTS photo_album_tv_items (
                     album_id TEXT NOT NULL,
                     tv_profile_id TEXT NOT NULL,
@@ -748,6 +774,95 @@ class LiveAlbumStore:
             connection.execute(
                 f"UPDATE photo_album_feeds SET {', '.join(assignments)} WHERE id = ?", values
             )
+
+    def source_items(self, album_id: str) -> list[dict[str, Any]]:
+        """Return the bounded cached provider snapshot without exposing local paths."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM photo_album_source_items
+                   WHERE album_id = ? ORDER BY added_at DESC, source_item_id DESC""",
+                (album_id,),
+            ).fetchall()
+            uploads = connection.execute(
+                """SELECT source_item_id, source_checksum, tv_profile_id
+                   FROM photo_album_tv_items WHERE album_id = ?""",
+                (album_id,),
+            ).fetchall()
+        uploaded_to: dict[str, list[str]] = {}
+        checksums = {row["source_item_id"]: row["source_checksum"] for row in rows}
+        for upload in uploads:
+            item_id = upload["source_item_id"]
+            if checksums.get(item_id) == upload["source_checksum"]:
+                uploaded_to.setdefault(item_id, []).append(upload["tv_profile_id"])
+        return [
+            {
+                "item_id": row["source_item_id"],
+                "added_at": row["added_at"],
+                "title": row["title"],
+                "version": hashlib.sha256(
+                    row["source_checksum"].encode()
+                ).hexdigest()[:16],
+                "uploaded_to": sorted(uploaded_to.get(row["source_item_id"], [])),
+            }
+            for row in rows
+        ]
+
+    def source_item(self, album_id: str, item_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT * FROM photo_album_source_items
+                   WHERE album_id = ? AND source_item_id = ?""",
+                (album_id, item_id),
+            ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        cache_name = item.pop("cache_name")
+        if not _CACHE_NAME_RE.fullmatch(cache_name):
+            raise RuntimeError("Live album preview metadata is invalid.")
+        item["cache_path"] = _album_cache_directory(
+            self.data_dir, album_id
+        ) / cache_name
+        return item
+
+    def replace_source_items(self, album_id: str, items: tuple[AlbumItem, ...]) -> None:
+        """Atomically replace the gallery snapshot after every image is cached."""
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM photo_album_source_items WHERE album_id = ?", (album_id,)
+            )
+            connection.executemany(
+                """INSERT INTO photo_album_source_items (
+                       album_id, source_item_id, source_checksum, added_at,
+                       title, cache_name, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        album_id,
+                        item.item_id,
+                        item.checksum,
+                        item.added_at,
+                        item.title,
+                        _album_cache_name(item),
+                        now,
+                        now,
+                    )
+                    for item in items
+                ],
+            )
+
+    def clear_source_cache(self, album_id: str) -> None:
+        cache_dir = _album_cache_directory(self.data_dir, album_id)
+        if not cache_dir.is_dir():
+            return
+        for path in cache_dir.iterdir():
+            if path.is_file():
+                path.unlink(missing_ok=True)
+        try:
+            cache_dir.rmdir()
+        except OSError:
+            logger.warning("Could not remove live album cache directory %s", cache_dir)
 
     def current_items(self, album_id: str, tv_profile_id: str) -> dict[str, dict[str, Any]]:
         with self._connect() as connection:
@@ -951,6 +1066,72 @@ class LiveAlbumService:
         store.clear_stale(album_id, profile_id, stale)
         return None
 
+    @staticmethod
+    def _cache_snapshot(
+        store: LiveAlbumStore,
+        album_id: str,
+        provider: str,
+        snapshot: AlbumSnapshot,
+    ) -> dict[tuple[str, str], bytes]:
+        """Cache one complete newest-ten snapshot before replacing the gallery."""
+        cache_dir = _album_cache_directory(store.data_dir, album_id)
+        cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        prepared: dict[tuple[str, str], bytes] = {}
+        created: list[Path] = []
+        try:
+            for item in snapshot.items:
+                cache_path = cache_dir / _album_cache_name(item)
+                saved = store.source_item(album_id, item.item_id)
+                reusable = bool(
+                    saved
+                    and saved["source_checksum"] == item.checksum
+                    and saved["cache_path"] == cache_path
+                    and cache_path.is_file()
+                )
+                if reusable:
+                    continue
+                image_bytes = download_album_image(provider, item)
+                temp_path = cache_dir / f".{cache_path.name}.{uuid.uuid4().hex}.tmp"
+                try:
+                    temp_path.write_bytes(image_bytes)
+                    os.chmod(temp_path, 0o600)
+                    existed = cache_path.exists()
+                    os.replace(temp_path, cache_path)
+                    if not existed:
+                        created.append(cache_path)
+                finally:
+                    temp_path.unlink(missing_ok=True)
+                prepared[(item.item_id, item.checksum)] = image_bytes
+        except Exception:
+            for path in created:
+                path.unlink(missing_ok=True)
+            raise
+
+        store.replace_source_items(album_id, snapshot.items)
+        keep = {_album_cache_name(item) for item in snapshot.items}
+        for path in cache_dir.iterdir():
+            if path.is_file() and path.name not in keep:
+                path.unlink(missing_ok=True)
+        return prepared
+
+    @staticmethod
+    def _cached_image_bytes(
+        store: LiveAlbumStore,
+        album_id: str,
+        item: AlbumItem,
+        prepared: dict[tuple[str, str], bytes] | None = None,
+    ) -> bytes:
+        key = (item.item_id, item.checksum)
+        if prepared and key in prepared:
+            return prepared[key]
+        saved = store.source_item(album_id, item.item_id)
+        if saved is None or saved["source_checksum"] != item.checksum:
+            raise RuntimeError("The album photo is not available in the local preview cache.")
+        try:
+            return saved["cache_path"].read_bytes()
+        except OSError as exc:
+            raise RuntimeError("The cached album photo is unavailable; synchronize again.") from exc
+
     def sync_album(self, album_id: str) -> dict[str, Any]:
         """Fetch one album and reconcile only the TV content owned by this feed."""
         with self._lock:
@@ -962,6 +1143,14 @@ class LiveAlbumService:
             now = time.time()
             try:
                 snapshot = fetch_album_items(album["provider"], album["source_url"])
+                snapshot = AlbumSnapshot(
+                    snapshot.name,
+                    snapshot.total_count,
+                    tuple(snapshot.items[:MAX_SYNC_PHOTOS]),
+                )
+                prepared = self._cache_snapshot(
+                    store, album_id, album["provider"], snapshot
+                )
             except Exception as exc:
                 store.update_runtime(
                     album_id,
@@ -979,7 +1168,6 @@ class LiveAlbumService:
             all_profile_ids = list(
                 dict.fromkeys([*target_ids, *store.owned_profile_ids(album_id)])
             )
-            prepared: dict[tuple[str, str], bytes] = {}
             errors: list[str] = [target_error] if target_error else []
             results: list[dict[str, Any]] = []
             total_uploaded = 0
@@ -1006,12 +1194,10 @@ class LiveAlbumService:
                     saved = current.get(item.item_id)
                     if saved and saved["source_checksum"] == item.checksum:
                         continue
-                    key = (item.item_id, item.checksum)
                     try:
-                        image_bytes = prepared.get(key)
-                        if image_bytes is None:
-                            image_bytes = download_album_image(album["provider"], item)
-                            prepared[key] = image_bytes
+                        image_bytes = self._cached_image_bytes(
+                            store, album_id, item, prepared
+                        )
                         result = upload_image(
                             profile, image_bytes, file_type="JPEG", matte="none"
                         )
@@ -1045,8 +1231,15 @@ class LiveAlbumService:
                         newest = store.current_items(album_id, profile_id).get(
                             snapshot.items[0].item_id
                         )
-                        if newest and not switch_art(profile, newest["content_id"]):
-                            profile_errors.append("TV did not display the newest album photo")
+                        if newest and not switch_art(
+                            profile,
+                            newest["content_id"],
+                            require_art_mode=True,
+                        ):
+                            profile_errors.append(
+                                "newest photo was not displayed because the TV was not "
+                                "confirmed in Art Mode; normal viewing was left untouched"
+                            )
                 elif profile_errors:
                     profile_errors.append(
                         "older photos were kept until every replacement uploads successfully"
@@ -1102,6 +1295,124 @@ class LiveAlbumService:
             )
             return payload
 
+    def display_photo(self, album_id: str, item_id: str) -> dict[str, Any]:
+        """Display one cached album photo without ever enabling Art Mode."""
+        with self._lock:
+            settings = self.settings_loader()
+            store = LiveAlbumStore(settings.data_dir)
+            album = store.get_album(album_id, include_source=True)
+            if album is None:
+                raise KeyError(album_id)
+            saved_item = store.source_item(album_id, item_id)
+            if saved_item is None:
+                raise LookupError(item_id)
+            try:
+                image_bytes = saved_item["cache_path"].read_bytes()
+            except OSError as exc:
+                raise RuntimeError(
+                    "The cached album photo is unavailable; synchronize the album again."
+                ) from exc
+
+            item = AlbumItem(
+                item_id=saved_item["source_item_id"],
+                image_url="",
+                added_at=saved_item["added_at"],
+                checksum=saved_item["source_checksum"],
+                title=saved_item["title"],
+            )
+            profile_ids, target_error = self._target_profile_ids(settings, album)
+            results: list[dict[str, str]] = []
+            skipped: list[dict[str, str]] = []
+            errors: list[str] = [target_error] if target_error else []
+
+            from frameart.tv.controller import get_status, switch_art, upload_image
+
+            for profile_id in profile_ids:
+                profile = settings.tvs.get(profile_id)
+                if profile is None:
+                    errors.append(f"{profile_id}: TV profile is no longer configured")
+                    continue
+                try:
+                    tv_status = get_status(profile)
+                except Exception as exc:
+                    skipped.append(
+                        {
+                            "tv_profile_id": profile_id,
+                            "reason": f"Could not confirm Art Mode: {exc}",
+                        }
+                    )
+                    continue
+                if not (
+                    tv_status.reachable
+                    and tv_status.art_mode_supported
+                    and tv_status.art_mode_on
+                ):
+                    skipped.append(
+                        {
+                            "tv_profile_id": profile_id,
+                            "reason": (
+                                "TV is not in Art Mode; normal viewing was left untouched."
+                            ),
+                        }
+                    )
+                    continue
+
+                current = store.current_items(album_id, profile_id)
+                existing = current.get(item_id)
+                content_id = (
+                    existing["content_id"]
+                    if existing and existing["source_checksum"] == item.checksum
+                    else None
+                )
+                try:
+                    if content_id is None:
+                        uploaded = upload_image(
+                            profile, image_bytes, file_type="JPEG", matte="none"
+                        )
+                        if not uploaded.success or not uploaded.content_id:
+                            raise RuntimeError(uploaded.error or "TV upload failed")
+                        content_id = uploaded.content_id
+                        store.upsert_current(album_id, profile_id, item, content_id)
+                    if not switch_art(
+                        profile, content_id, require_art_mode=True
+                    ):
+                        skipped.append(
+                            {
+                                "tv_profile_id": profile_id,
+                                "reason": (
+                                    "Art Mode changed before display; normal viewing was left "
+                                    "untouched."
+                                ),
+                            }
+                        )
+                        continue
+                    results.append(
+                        {"tv_profile_id": profile_id, "content_id": content_id}
+                    )
+                except Exception as exc:
+                    errors.append(f"{profile_id}: {exc}")
+
+            if results and not skipped and not errors:
+                status = "displayed"
+            elif results:
+                status = "partial"
+            elif skipped and not errors:
+                status = "skipped"
+            else:
+                status = "error"
+            payload = {
+                "album_id": album_id,
+                "item_id": item_id,
+                "status": status,
+                "results": results,
+                "skipped": skipped,
+                "errors": errors,
+            }
+            IntegrationPublisher(AutomationStore(settings.data_dir)).publish(
+                f"live_album.{status}", payload
+            )
+            return payload
+
     def delete_album(self, album_id: str) -> bool:
         """Delete a feed after removing every TV content ID that it owns."""
         settings = self.settings_loader()
@@ -1126,4 +1437,10 @@ class LiveAlbumService:
                     failures.append(f"{profile_id}: {exc}")
         if failures:
             raise RuntimeError("; ".join(failures))
-        return store.delete_album(album_id)
+        deleted = store.delete_album(album_id)
+        if deleted:
+            try:
+                store.clear_source_cache(album_id)
+            except OSError:
+                logger.warning("Could not remove cached previews for live album %s", album_id)
+        return deleted

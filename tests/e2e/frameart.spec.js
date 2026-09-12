@@ -100,6 +100,46 @@ test('creates, edits, pauses, and removes a public photo album sync', async ({ p
       ssl: true,
     },
   });
+  let displayRequests = 0;
+  await page.route(/\/modes\/live-album\/[a-f0-9]{32}\/photos$/, async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify([
+        {
+          item_id: 'photo-e2e',
+          title: 'Newest family photo',
+          added_at: 1789234000,
+          version: 'e2e-version',
+          uploaded_to: ['e2e_album_tv'],
+          image_url: route.request().url() + '/photo-e2e/image?v=e2e-version',
+        },
+      ]),
+    });
+  });
+  await page.route(/\/photos\/photo-e2e\/image/, async (route) => {
+    await route.fulfill({
+      contentType: 'image/png',
+      body: Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII=',
+        'base64',
+      ),
+    });
+  });
+  await page.route(/\/photos\/photo-e2e\/display$/, async (route) => {
+    displayRequests += 1;
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        status: 'skipped',
+        results: [],
+        errors: [],
+        skipped: [{
+          tv_profile_id: 'e2e_album_tv',
+          reason: 'TV is not in Art Mode; normal viewing was left untouched.',
+        }],
+      }),
+    });
+  });
   try {
     await page.goto('/');
     await page.locator('.tabs').getByRole('button', { name: 'Modes' }).click();
@@ -114,6 +154,11 @@ test('creates, edits, pauses, and removes a public photo album sync', async ({ p
       hasText: 'E2E family album',
     });
     await expect(album).toContainText('Apple Photos / iCloud');
+    await expect(album.getByAltText('Newest family photo')).toBeVisible();
+    await expect(album).toContainText('On e2e_album_tv');
+    await album.getByRole('button', { name: 'Send to TV' }).click();
+    await expect(page.locator('#toast-wrap')).toContainText('normal viewing was left untouched');
+    expect(displayRequests).toBe(1);
     await expect(page.getByLabel('Public shared-album URL')).toHaveValue('');
 
     await album.getByRole('button', { name: 'Edit' }).click();

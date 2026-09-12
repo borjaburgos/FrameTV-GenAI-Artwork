@@ -274,8 +274,14 @@ def test_sync_reconciles_newest_ten_and_deletes_photo_removed_upstream(
     assert second["deleted"] == 1
     assert len(store.current_items(album["id"], "living")) == 10
     assert store.current_items(album["id"], "living")["photo-10"]["content_id"] == "content-10"
+    assert [item["item_id"] for item in store.source_items(album["id"])] == [
+        f"photo-{number}" for number in range(10, 0, -1)
+    ]
+    assert len(list((tmp_path / "cache" / "live-albums" / album["id"]).glob("*.jpg"))) == 10
     assert mock_delete.call_args_list[-1] == call(settings.tvs["living"], ["content-9"])
-    assert mock_switch.call_args_list[-1] == call(settings.tvs["living"], "content-10")
+    assert mock_switch.call_args_list[-1] == call(
+        settings.tvs["living"], "content-10", require_art_mode=True
+    )
 
 
 @patch("frameart.live_album.IntegrationPublisher.publish", return_value=[])
@@ -375,3 +381,114 @@ def test_failed_cleanup_is_retained_and_blocks_more_uploads(
     assert second["uploaded"] == 0
     assert mock_upload.call_count == 1
     assert mock_delete.call_count == 2
+
+
+@patch("frameart.live_album.IntegrationPublisher.publish", return_value=[])
+@patch("frameart.tv.controller.get_status")
+@patch("frameart.tv.controller.switch_art")
+@patch("frameart.tv.controller.upload_image")
+@patch("frameart.live_album.download_album_image", return_value=_jpeg_bytes())
+def test_specific_cached_photo_is_displayed_without_reuploading(
+    _download,
+    mock_upload,
+    mock_switch,
+    mock_get_status,
+    _publish,
+    tmp_path,
+):
+    profile = object()
+    settings = SimpleNamespace(data_dir=tmp_path, tvs={"living": profile})
+    store = LiveAlbumStore(tmp_path)
+    album = _album(store)
+    service = LiveAlbumService(lambda: settings)
+    service._cache_snapshot(
+        store, album["id"], "icloud", AlbumSnapshot("Family", 1, (_item(1),))
+    )
+    store.upsert_current(album["id"], "living", _item(1), "content-1")
+    mock_get_status.return_value = SimpleNamespace(
+        reachable=True, art_mode_supported=True, art_mode_on=True
+    )
+    mock_switch.return_value = True
+
+    result = service.display_photo(album["id"], "photo-1")
+
+    assert result["status"] == "displayed"
+    assert result["results"] == [
+        {"tv_profile_id": "living", "content_id": "content-1"}
+    ]
+    mock_upload.assert_not_called()
+    mock_switch.assert_called_once_with(
+        profile, "content-1", require_art_mode=True
+    )
+
+
+@patch("frameart.live_album.IntegrationPublisher.publish", return_value=[])
+@patch("frameart.tv.controller.get_status")
+@patch("frameart.tv.controller.switch_art")
+@patch("frameart.tv.controller.upload_image")
+@patch("frameart.live_album.download_album_image", return_value=_jpeg_bytes())
+def test_specific_photo_does_not_touch_tv_during_active_viewing(
+    _download,
+    mock_upload,
+    mock_switch,
+    mock_get_status,
+    _publish,
+    tmp_path,
+):
+    profile = object()
+    settings = SimpleNamespace(data_dir=tmp_path, tvs={"living": profile})
+    store = LiveAlbumStore(tmp_path)
+    album = _album(store)
+    service = LiveAlbumService(lambda: settings)
+    service._cache_snapshot(
+        store, album["id"], "icloud", AlbumSnapshot("Family", 1, (_item(1),))
+    )
+    mock_get_status.return_value = SimpleNamespace(
+        reachable=True, art_mode_supported=True, art_mode_on=False
+    )
+
+    result = service.display_photo(album["id"], "photo-1")
+
+    assert result["status"] == "skipped"
+    assert "normal viewing was left untouched" in result["skipped"][0]["reason"]
+    mock_upload.assert_not_called()
+    mock_switch.assert_not_called()
+
+
+@patch("frameart.live_album.IntegrationPublisher.publish", return_value=[])
+@patch("frameart.tv.controller.get_status")
+@patch("frameart.tv.controller.switch_art", return_value=True)
+@patch("frameart.tv.controller.upload_image")
+@patch("frameart.live_album.download_album_image", return_value=_jpeg_bytes())
+def test_specific_cached_photo_uploads_when_missing_and_art_mode_is_active(
+    _download,
+    mock_upload,
+    mock_switch,
+    mock_get_status,
+    _publish,
+    tmp_path,
+):
+    profile = object()
+    settings = SimpleNamespace(data_dir=tmp_path, tvs={"living": profile})
+    store = LiveAlbumStore(tmp_path)
+    album = _album(store)
+    service = LiveAlbumService(lambda: settings)
+    service._cache_snapshot(
+        store, album["id"], "icloud", AlbumSnapshot("Family", 1, (_item(1),))
+    )
+    mock_get_status.return_value = SimpleNamespace(
+        reachable=True, art_mode_supported=True, art_mode_on=True
+    )
+    mock_upload.return_value = SimpleNamespace(
+        success=True, content_id="new-content", error=None
+    )
+
+    result = service.display_photo(album["id"], "photo-1")
+
+    assert result["status"] == "displayed"
+    assert store.current_items(album["id"], "living")["photo-1"]["content_id"] == (
+        "new-content"
+    )
+    mock_switch.assert_called_once_with(
+        profile, "new-content", require_art_mode=True
+    )

@@ -1036,7 +1036,7 @@ class LiveScoreService:
 
     @staticmethod
     def _display(settings, tracker, image_path: Path):
-        from frameart.tv.controller import delete_art, switch_art, upload_image
+        from frameart.tv.controller import delete_art, get_status, switch_art, upload_image
 
         profile_ids, target_error = LiveScoreService._target_profile_ids(settings, tracker)
         if target_error:
@@ -1053,6 +1053,23 @@ class LiveScoreService:
             if profile is None:
                 errors.append(f"{profile_id}: TV profile is no longer configured")
                 continue
+            try:
+                tv_status = get_status(profile)
+            except Exception as exc:
+                errors.append(
+                    f"{profile_id}: Could not confirm Art Mode; normal viewing was left "
+                    f"untouched ({exc})"
+                )
+                continue
+            if not (
+                tv_status.reachable
+                and tv_status.art_mode_supported
+                and tv_status.art_mode_on
+            ):
+                errors.append(
+                    f"{profile_id}: TV is not in Art Mode; normal viewing was left untouched"
+                )
+                continue
             retry_ids = stale.pop(profile_id, [])
             if retry_ids:
                 try:
@@ -1066,7 +1083,7 @@ class LiveScoreService:
                 if not uploaded.success or not uploaded.content_id:
                     raise RuntimeError(uploaded.error or "TV upload failed")
                 new_content_id = uploaded.content_id
-                if not switch_art(profile, new_content_id):
+                if not switch_art(profile, new_content_id, require_art_mode=True):
                     raise RuntimeError("TV did not switch to the new scoreboard")
                 old_id = current.get(profile_id)
                 current[profile_id] = new_content_id
