@@ -2740,6 +2740,73 @@ class TestLibraryManagement:
         assert removed.status_code == 200
         assert client.delete(f"/library/collections/{collection_id}").status_code == 200
 
+    def test_library_paginates_and_serves_versioned_cached_thumbnails(
+        self, managed_config_env
+    ):
+        for number in range(22):
+            self.create_artifact(
+                managed_config_env,
+                f"library-page-{number:02d}",
+                f"Artwork {number}",
+            )
+
+        first_page = client.get("/jobs", params={"limit": 21, "offset": 0})
+        second_page = client.get("/jobs", params={"limit": 21, "offset": 20})
+        assert first_page.status_code == 200
+        assert second_page.status_code == 200
+        assert len(first_page.json()) == 21
+        assert len(second_page.json()) == 2
+        assert {
+            item["job_id"] for item in first_page.json()[:20]
+        }.isdisjoint({item["job_id"] for item in second_page.json()})
+
+        job = first_page.json()[0]
+        assert job["thumbnail_url"].startswith(f"/jobs/{job['job_id']}/thumbnail?v=")
+        assert job["image_url"].startswith(f"/jobs/{job['job_id']}/image?v=")
+
+        job_dir = (
+            managed_config_env
+            / "artifacts"
+            / "2026"
+            / "01"
+            / "01"
+            / job["job_id"]
+        )
+        Image.new("RGB", (1600, 900), "royalblue").save(job_dir / "final.png", format="PNG")
+        refreshed = client.get("/jobs", params={"q": job["job_id"]}).json()[0]
+        with patch("frameart.api._scan_artifact_dirs") as scan_artifacts:
+            thumbnail = client.get(refreshed["thumbnail_url"])
+        scan_artifacts.assert_not_called()
+
+        assert thumbnail.status_code == 200
+        assert thumbnail.headers["content-type"].startswith("image/webp")
+        assert thumbnail.headers["cache-control"] == (
+            "private, max-age=31536000, immutable"
+        )
+        assert len(thumbnail.content) < (job_dir / "final.png").stat().st_size
+        with Image.open(BytesIO(thumbnail.content)) as image:
+            assert image.size == (640, 360)
+        full_image = client.get(refreshed["image_url"])
+        assert full_image.headers["cache-control"] == (
+            "private, max-age=31536000, immutable"
+        )
+
+        cache_dir = (
+            managed_config_env / "cache" / "library-thumbnails" / job["job_id"]
+        )
+        cached_files = list(cache_dir.glob("*.webp"))
+        assert len(cached_files) == 1
+        cached_mtime = cached_files[0].stat().st_mtime_ns
+        assert client.get(refreshed["thumbnail_url"]).content == thumbnail.content
+        assert cached_files[0].stat().st_mtime_ns == cached_mtime
+
+        unversioned = client.get(f"/jobs/{job['job_id']}/thumbnail")
+        assert unversioned.headers["cache-control"] == "private, no-cache"
+
+        deleted = client.post("/jobs/delete", json={"job_ids": [job["job_id"]]})
+        assert deleted.status_code == 200
+        assert not cache_dir.exists()
+
     def test_display_history_endpoint(self, managed_config_env):
         from frameart.library import LibraryStore
 

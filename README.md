@@ -288,12 +288,19 @@ Use `deploy/Caddyfile.local` for the local hostname. It removes any client-suppl
 | `GET` | `/tv/art/thumbnail` | Serve a bounded, persistent TV thumbnail (`refresh=true` forces refresh) |
 | `GET` | `/tv/mattes` | List cached TV matte styles (`refresh=true` forces refresh) |
 | `DELETE` | `/tv/mattes/cache` | Invalidate one TV's matte cache (admin token required) |
-| `GET` | `/jobs` | List recent jobs |
+| `GET` | `/jobs` | List recent jobs (`limit` and `offset` support incremental loading) |
+| `GET` | `/jobs/{job_id}/thumbnail` | Serve a bounded, versioned WebP gallery thumbnail |
 | `GET` | `/jobs/{job_id}/image` | Serve the final processed image |
 | `PUT` | `/jobs/{job_id}/tags` | Replace persistent artwork tags |
 | `GET/POST` | `/library/collections` | List or create named collections |
 | `POST/DELETE` | `/library/collections/{id}/items` | Add or remove collection items |
 | `GET` | `/library/history` | List recent TV display history |
+
+The WebUI loads artwork in groups of 20 and uses cached 640-pixel WebP thumbnails for the
+library grid. Full-resolution artwork is transferred only when a preview is opened. Versioned
+thumbnail and preview URLs use private, immutable browser caching; replacing or editing the
+source image automatically produces a new version, while deleting a job removes its thumbnail
+cache.
 
 **Automations**:
 

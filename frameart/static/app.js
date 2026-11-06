@@ -15,6 +15,10 @@
   let managedAccessSettings = null;
   let managedCollections = [];
   let loadedGalleryJobs = {};
+  const galleryPageSize = 20;
+  let galleryOffset = 0;
+  let galleryHasMore = false;
+  let galleryLoading = false;
   let automationGroups = [];
   let automationPlaylists = [];
   let automationSchedules = [];
@@ -1127,6 +1131,8 @@
   function bindGallerySelectionHandlers() {
     const items = document.querySelectorAll('.gallery-select-item');
     items.forEach((item) => {
+      if (item.dataset.selectionBound === 'true') return;
+      item.dataset.selectionBound = 'true';
       item.addEventListener('change', (e) => {
         const checkbox = e.target;
         const card = checkbox.closest('.gallery-item');
@@ -1268,15 +1274,28 @@
     clearButtonBusy(btn);
   }
 
-  async function loadGallery() {
+  async function loadGallery(append = false) {
+    if (galleryLoading) return;
+    galleryLoading = true;
     const grid = document.getElementById('gallery-grid');
     const empty = document.getElementById('gallery-empty');
-    selectedGalleryJobIds = new Set();
-    updateGallerySelectionUI();
-    grid.innerHTML = gallerySkeleton(6);
-    empty.style.display = 'none';
+    const loadMore = document.getElementById('btn-gallery-load-more');
+    if (!append) {
+      galleryOffset = 0;
+      galleryHasMore = false;
+      selectedGalleryJobIds = new Set();
+      updateGallerySelectionUI();
+      grid.innerHTML = gallerySkeleton(6);
+      empty.style.display = 'none';
+      loadMore.hidden = true;
+    } else {
+      setButtonBusy(loadMore, 'Loading...');
+    }
     try {
-      const params = new URLSearchParams({ limit: '50' });
+      const params = new URLSearchParams({
+        limit: String(galleryPageSize + 1),
+        offset: String(galleryOffset),
+      });
       const query = document.getElementById('gallery-search').value.trim();
       const tag = document.getElementById('gallery-tag-filter').value.trim();
       const collection = document.getElementById('gallery-collection-filter').value;
@@ -1284,17 +1303,26 @@
       if (tag) params.set('tag', tag);
       if (collection) params.set('collection', collection);
       const resp = await apiFetch('/jobs?' + params.toString());
-      const jobs = await parseJSONResponse(resp, 'Could not load library.');
-      loadedGalleryJobs = Object.fromEntries(jobs.map((job) => [job.job_id, job]));
-      if (!jobs.length) { grid.innerHTML = ''; empty.style.display = 'block'; return; }
+      const responseJobs = await parseJSONResponse(resp, 'Could not load library.');
+      const jobs = responseJobs.slice(0, galleryPageSize);
+      galleryHasMore = responseJobs.length > galleryPageSize;
+      if (!jobs.length && !append) {
+        loadedGalleryJobs = {};
+        grid.innerHTML = '';
+        empty.style.display = 'block';
+        return;
+      }
+      const nextJobs = Object.fromEntries(jobs.map((job) => [job.job_id, job]));
+      loadedGalleryJobs = append ? {...loadedGalleryJobs, ...nextJobs} : nextJobs;
       empty.style.display = 'none';
-      grid.innerHTML = jobs.map(j => {
+      const cards = jobs.map(j => {
         const promptText = esc(j.prompt || j.job_id);
         const promptShort = esc((j.prompt || '').substring(0, 40));
         const chips = [...(j.tags || []), ...(j.collections || []).map((name) => '#' + name)];
         return `
         <div class="gallery-item">
-          <img src="/jobs/${esc(j.job_id)}/image" alt="${promptShort}" loading="lazy"
+          <img src="${esc(j.thumbnail_url)}" alt="${promptShort}" loading="lazy"
+               width="640" height="360" decoding="async"
                data-preview-job-id="${esc(j.job_id)}"
                onerror="this.style.display='none'">
           <div class="info">
@@ -1319,17 +1347,27 @@
           </div>
         </div>`;
       }).join('');
+      if (append) grid.insertAdjacentHTML('beforeend', cards);
+      else grid.innerHTML = cards;
+      galleryOffset += jobs.length;
+      loadMore.hidden = !galleryHasMore;
       animateStaggeredChildren(grid, '.gallery-item');
       bindGallerySelectionHandlers();
     } catch (e) {
-      grid.innerHTML = '<div class="empty">Failed to load gallery. Use Refresh to retry.</div>';
+      if (!append) {
+        grid.innerHTML = '<div class="empty">Failed to load gallery. Use Refresh to retry.</div>';
+      }
       showToast('Failed to load gallery: ' + e.message, 'error');
     } finally {
+      galleryLoading = false;
+      if (append) clearButtonBusy(loadMore);
+      loadMore.hidden = !galleryHasMore;
       updateGallerySelectionUI();
     }
   }
 
-  document.getElementById('btn-refresh-gallery').addEventListener('click', loadGallery);
+  document.getElementById('btn-refresh-gallery').addEventListener('click', () => loadGallery());
+  document.getElementById('btn-gallery-load-more').addEventListener('click', () => loadGallery(true));
   document.getElementById('btn-gallery-select-all').addEventListener('click', () => setAllGallerySelections(true));
   document.getElementById('btn-gallery-clear-selection').addEventListener('click', () => setAllGallerySelections(false));
   document.getElementById('btn-gallery-delete-selected').addEventListener('click', deleteSelectedGalleryJobs);
@@ -1401,7 +1439,7 @@
       });
     }
   });
-  document.getElementById('btn-gallery-filter').addEventListener('click', loadGallery);
+  document.getElementById('btn-gallery-filter').addEventListener('click', () => loadGallery());
   document.getElementById('gallery-search').addEventListener('keydown', (event) => {
     if (event.key === 'Enter') loadGallery();
   });
@@ -1521,7 +1559,8 @@
   });
 
   window.showPreview = function(jobId) {
-    document.getElementById('modal-img').src = '/jobs/' + jobId + '/image';
+    const imageUrl = loadedGalleryJobs[jobId]?.image_url || ('/jobs/' + jobId + '/image');
+    document.getElementById('modal-img').src = imageUrl;
     openModal('modal');
   };
   document.getElementById('modal').addEventListener('click', function() {
