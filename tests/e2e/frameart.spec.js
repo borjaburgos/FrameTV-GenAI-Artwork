@@ -120,7 +120,7 @@ test('creates, edits, pauses, and removes a public photo album sync', async ({ p
     await route.fulfill({
       contentType: 'image/png',
       body: Buffer.from(
-        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII=',
+        'iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAFElEQVR4nGNkYPjPAANMDEgANwcAMdMBB1sLEtoAAAAASUVORK5CYII=',
         'base64',
       ),
     });
@@ -280,7 +280,7 @@ test('keeps generated artwork and retries only TV delivery', async ({ page, requ
     await route.fulfill({
       contentType: 'image/png',
       body: Buffer.from(
-        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII=',
+        'iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAFElEQVR4nGNkYPjPAANMDEgANwcAMdMBB1sLEtoAAAAASUVORK5CYII=',
         'base64',
       ),
     });
@@ -420,7 +420,7 @@ test('searches, tags, and collects library artwork', async ({ page }) => {
   await writeFile(
     path.join(jobDir, 'final.png'),
     Buffer.from(
-      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII=',
+      'iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAFElEQVR4nGNkYPjPAANMDEgANwcAMdMBB1sLEtoAAAAASUVORK5CYII=',
       'base64',
     ),
   );
@@ -459,6 +459,57 @@ test('searches, tags, and collects library artwork', async ({ page }) => {
   }
 });
 
+test('loads cached library thumbnails twenty at a time', async ({ page }) => {
+  const offsets = [];
+  const items = Array.from({ length: 22 }, (_, index) => ({
+    job_id: `mock-${String(index).padStart(2, '0')}`,
+    prompt: `Paged artwork ${index}`,
+    provider: 'openai',
+    content_id: null,
+    tags: [],
+    collections: [],
+    thumbnail_url: `/jobs/mock-${String(index).padStart(2, '0')}/thumbnail?v=abc-${index}`,
+    image_url: `/jobs/mock-${String(index).padStart(2, '0')}/image?v=abc-${index}`,
+  }));
+  await page.route(/\/jobs\?.*/, async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname !== '/jobs') {
+      await route.fallback();
+      return;
+    }
+    const offset = Number(url.searchParams.get('offset') || '0');
+    const limit = Number(url.searchParams.get('limit') || '21');
+    offsets.push(offset);
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify(items.slice(offset, offset + limit)),
+    });
+  });
+  await page.route(/\/jobs\/mock-\d+\/thumbnail/, async (route) => {
+    await route.fulfill({
+      contentType: 'image/png',
+      body: Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAFElEQVR4nGNkYPjPAANMDEgANwcAMdMBB1sLEtoAAAAASUVORK5CYII=',
+        'base64',
+      ),
+    });
+  });
+
+  await page.goto('/');
+  await page.locator('.tabs').getByRole('button', { name: 'Library' }).click();
+
+  await expect(page.locator('#gallery-grid .gallery-item')).toHaveCount(20);
+  await expect(page.locator('#gallery-grid img').first()).toHaveAttribute(
+    'src',
+    /\/thumbnail\?v=/,
+  );
+  await expect(page.getByRole('button', { name: 'Load More' })).toBeVisible();
+  await page.getByRole('button', { name: 'Load More' }).click();
+  await expect(page.locator('#gallery-grid .gallery-item')).toHaveCount(22);
+  await expect(page.getByRole('button', { name: 'Load More' })).toBeHidden();
+  expect(offsets).toEqual([0, 20]);
+});
+
 test('library actions safely handle hostile prompt text', async ({ page }) => {
   const cases = [
     ['e2e-prompt-apostrophe', "child's drawing"],
@@ -483,7 +534,7 @@ test('library actions safely handle hostile prompt text', async ({ page }) => {
     await writeFile(
       path.join(jobDir, 'final.png'),
       Buffer.from(
-        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII=',
+        'iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAFElEQVR4nGNkYPjPAANMDEgANwcAMdMBB1sLEtoAAAAASUVORK5CYII=',
         'base64',
       ),
     );
@@ -524,7 +575,7 @@ test('matte selectors normalize Samsung objects and ignore malformed entries', a
   await writeFile(
     path.join(jobDir, 'final.png'),
     Buffer.from(
-      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII=',
+      'iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAFElEQVR4nGNkYPjPAANMDEgANwcAMdMBB1sLEtoAAAAASUVORK5CYII=',
       'base64',
     ),
   );
@@ -649,7 +700,7 @@ test('creates TV groups, playlists, and durable schedules', async ({ page, reque
   await writeFile(
     path.join(jobDir, 'final.png'),
     Buffer.from(
-      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZlS8AAAAASUVORK5CYII=',
+      'iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAAFElEQVR4nGNkYPjPAANMDEgANwcAMdMBB1sLEtoAAAAASUVORK5CYII=',
       'base64',
     ),
   );

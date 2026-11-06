@@ -856,6 +856,8 @@ class JobSummary(BaseModel):
     prompt: str | None = None
     provider: str | None = None
     content_id: str | None = None
+    thumbnail_url: str
+    image_url: str
     tags: list[str] = Field(default_factory=list)
     collections: list[str] = Field(default_factory=list)
 
@@ -3252,21 +3254,134 @@ def _validated_job_id(job_id: str) -> str:
     return job_id
 
 
+_ARTIFACT_INDEX_TTL_SECONDS = 30.0
+_artifact_index_lock = threading.Lock()
+_artifact_dir_index: dict[Path, tuple[float, dict[str, tuple[Path, ...]]]] = {}
+_library_thumbnail_slots = threading.BoundedSemaphore(2)
+
+
+def _seed_artifact_dir_index(artifacts_dir: Path, job_dirs: list[Path]) -> None:
+    """Cache one artifact scan so every gallery image does not rescan the tree."""
+    grouped: dict[str, list[Path]] = defaultdict(list)
+    for job_dir in job_dirs:
+        if job_dir.is_dir():
+            grouped[job_dir.name].append(job_dir)
+    snapshot = {job_id: tuple(paths) for job_id, paths in grouped.items()}
+    with _artifact_index_lock:
+        _artifact_dir_index[Path(artifacts_dir)] = (
+            time.monotonic() + _ARTIFACT_INDEX_TTL_SECONDS,
+            snapshot,
+        )
+
+
+def _scan_artifact_dirs(artifacts_dir: Path) -> dict[str, tuple[Path, ...]]:
+    grouped: dict[str, list[Path]] = defaultdict(list)
+    for candidate in artifacts_dir.glob("*/*/*/*"):
+        if candidate.is_dir():
+            grouped[candidate.name].append(candidate)
+    return {job_id: tuple(paths) for job_id, paths in grouped.items()}
+
+
+def _invalidate_artifact_dir_index(artifacts_dir: Path) -> None:
+    with _artifact_index_lock:
+        _artifact_dir_index.pop(Path(artifacts_dir), None)
+
+
 def _find_job_dirs(artifacts_dir: Path, job_id: str) -> list[Path]:
-    """Resolve a job ID without interpolating it into a glob expression."""
+    """Resolve a job ID through a short-lived, path-safe artifact index."""
     safe_job_id = _validated_job_id(job_id)
     if not artifacts_dir.exists():
         return []
-    return [
-        candidate
-        for candidate in artifacts_dir.glob("*/*/*/*")
-        if candidate.is_dir() and candidate.name == safe_job_id
-    ]
+    artifacts_dir = Path(artifacts_dir)
+    now = time.monotonic()
+    with _artifact_index_lock:
+        cached = _artifact_dir_index.get(artifacts_dir)
+        if cached and cached[0] > now:
+            matches = [path for path in cached[1].get(safe_job_id, ()) if path.is_dir()]
+            if matches:
+                return matches
+        snapshot = _scan_artifact_dirs(artifacts_dir)
+        _artifact_dir_index[artifacts_dir] = (
+            now + _ARTIFACT_INDEX_TTL_SECONDS,
+            snapshot,
+        )
+    return [path for path in snapshot.get(safe_job_id, ()) if path.is_dir()]
+
+
+def _job_image_path(job_dir: Path) -> Path | None:
+    final_path = job_dir / "final.png"
+    if final_path.is_file():
+        return final_path
+    source_path = job_dir / "source.png"
+    if source_path.is_file():
+        return source_path
+    return None
+
+
+def _artifact_version(image_path: Path) -> str:
+    stat = image_path.stat()
+    return f"{stat.st_mtime_ns:x}-{stat.st_size:x}"
+
+
+def _find_job_image_path(settings, job_id: str) -> Path:
+    """Find a generated job image path (prefer final, then source) or raise 404."""
+    artifacts_dir = settings.data_dir / "artifacts"
+    for job_dir in _find_job_dirs(artifacts_dir, job_id):
+        image_path = _job_image_path(job_dir)
+        if image_path is not None:
+            return image_path
+    raise HTTPException(status_code=404, detail=f"No image found for job {job_id}")
+
+
+def _library_thumbnail_directory(data_dir: Path, job_id: str) -> Path:
+    return Path(data_dir) / "cache" / "library-thumbnails" / _validated_job_id(job_id)
+
+
+def _ensure_library_thumbnail(settings, job_id: str, source_path: Path) -> tuple[Path, str]:
+    """Create one bounded WebP thumbnail, retaining only the current source version."""
+    version = _artifact_version(source_path)
+    cache_dir = _library_thumbnail_directory(settings.data_dir, job_id)
+    cache_path = cache_dir / f"{version}.webp"
+    if cache_path.is_file():
+        return cache_path, version
+
+    with _library_thumbnail_slots:
+        if cache_path.is_file():
+            return cache_path, version
+        cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temp_path = cache_dir / f".{version}.{uuid.uuid4().hex}.tmp"
+        try:
+            with Image.open(source_path) as source:
+                thumbnail = ImageOps.exif_transpose(source)
+                thumbnail.thumbnail((640, 640), Image.Resampling.LANCZOS, reducing_gap=3.0)
+                if thumbnail.mode not in {"RGB", "RGBA"}:
+                    target_mode = "RGBA" if "transparency" in thumbnail.info else "RGB"
+                    thumbnail = thumbnail.convert(target_mode)
+                thumbnail.save(temp_path, format="WEBP", quality=78, method=4)
+            os.chmod(temp_path, 0o600)
+            os.replace(temp_path, cache_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+        for stale_path in cache_dir.glob("*.webp"):
+            if stale_path != cache_path:
+                stale_path.unlink(missing_ok=True)
+    return cache_path, version
+
+
+def _library_image_cache_headers(requested_version: str | None, version: str) -> dict[str, str]:
+    if requested_version == version:
+        return {"Cache-Control": "private, max-age=31536000, immutable"}
+    return {"Cache-Control": "private, no-cache"}
+
+
+def _remove_library_thumbnail_cache(data_dir: Path, job_id: str) -> None:
+    shutil.rmtree(_library_thumbnail_directory(data_dir, job_id), ignore_errors=True)
 
 
 @app.get("/jobs", response_model=list[JobSummary])
 def list_jobs(
     limit: int = Query(20, ge=1, le=200, description="Max jobs to return."),
+    offset: int = Query(0, ge=0, description="Matching jobs to skip."),
     q: str | None = Query(None, max_length=200, description="Prompt/provider text search."),
     tag: str | None = Query(None, max_length=50, description="Required tag."),
     collection: str | None = Query(None, max_length=32, description="Collection ID."),
@@ -3281,24 +3396,28 @@ def list_jobs(
 
     library = _library_store(settings)
     meta_files = sorted(artifacts_dir.rglob("meta.json"), reverse=True)
-    candidates: list[tuple[Path, dict[str, Any]]] = []
+    candidates: list[tuple[Path, dict[str, Any], Path, str]] = []
     for meta_path in meta_files:
         job_dir = meta_path.parent
-        if not (job_dir / "final.png").exists() and not (job_dir / "source.png").exists():
+        image_path = _job_image_path(job_dir)
+        if image_path is None:
             continue
         try:
             meta = _json.loads(meta_path.read_text())
         except Exception:
             meta = {}
-        candidates.append((meta_path, meta))
+        candidates.append((meta_path, meta, image_path, _artifact_version(image_path)))
 
-    job_ids = [meta.get("job_id", path.parent.name) for path, meta in candidates]
+    _seed_artifact_dir_index(artifacts_dir, [path.parent for path, *_rest in candidates])
+
+    job_ids = [meta.get("job_id", path.parent.name) for path, meta, *_rest in candidates]
     library_metadata = library.metadata_for_jobs(job_ids)
     collection_ids = library.collection_job_ids(collection) if collection else None
     search = q.strip().lower() if q else None
     required_tag = tag.strip().lower() if tag else None
     jobs: list[JobSummary] = []
-    for meta_path, meta in candidates:
+    matching_index = 0
+    for meta_path, meta, _image_path, version in candidates:
         job_id = str(meta.get("job_id", meta_path.parent.name))
         extra = library_metadata.get(job_id, {"tags": [], "collections": []})
         if collection_ids is not None and job_id not in collection_ids:
@@ -3317,12 +3436,18 @@ def list_jobs(
         ).lower()
         if search and search not in searchable:
             continue
+        if matching_index < offset:
+            matching_index += 1
+            continue
+        matching_index += 1
         jobs.append(
             JobSummary(
                 job_id=job_id,
                 prompt=meta.get("prompt_original"),
                 provider=meta.get("provider"),
                 content_id=meta.get("content_id"),
+                thumbnail_url=f"/jobs/{job_id}/thumbnail?v={version}",
+                image_url=f"/jobs/{job_id}/image?v={version}",
                 tags=extra["tags"],
                 collections=extra["collections"],
             )
@@ -3869,30 +3994,54 @@ def delete_jobs(req: DeleteJobsRequest):
         try:
             for job_dir in job_dirs:
                 shutil.rmtree(job_dir)
+            _remove_library_thumbnail_cache(settings.data_dir, job_id)
             library.remove_job(job_id)
             async_jobs.delete(job_id)
             deleted.append(job_id)
         except Exception as e:
             failed[job_id] = str(e)
 
+    if deleted:
+        _invalidate_artifact_dir_index(artifacts_dir)
     return DeleteJobsResponse(deleted=deleted, not_found=not_found, failed=failed)
 
 
 @app.get("/jobs/{job_id}/image")
-def get_job_image(job_id: str):
+def get_job_image(
+    job_id: str,
+    v: str | None = Query(None, max_length=80, pattern=r"^[a-f0-9-]+$"),
+):
     """Serve the final processed image for a job."""
     settings = _settings()
-    artifacts_dir = settings.data_dir / "artifacts"
+    image_path = _find_job_image_path(settings, job_id)
+    version = _artifact_version(image_path)
+    return FileResponse(
+        image_path,
+        media_type="image/png",
+        headers=_library_image_cache_headers(v, version),
+    )
 
-    for job_dir in _find_job_dirs(artifacts_dir, job_id):
-        final_path = job_dir / "final.png"
-        if final_path.is_file():
-            return FileResponse(final_path, media_type="image/png")
-        source_path = job_dir / "source.png"
-        if source_path.is_file():
-            return FileResponse(source_path, media_type="image/png")
 
-    raise HTTPException(status_code=404, detail=f"No image found for job {job_id}")
+@app.get("/jobs/{job_id}/thumbnail")
+def get_job_thumbnail(
+    job_id: str,
+    v: str | None = Query(None, max_length=80, pattern=r"^[a-f0-9-]+$"),
+):
+    """Serve a cached, browser-friendly thumbnail instead of the full artwork."""
+    settings = _settings()
+    source_path = _find_job_image_path(settings, job_id)
+    try:
+        thumbnail_path, version = _ensure_library_thumbnail(settings, job_id, source_path)
+    except (OSError, UnidentifiedImageError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="The artwork could not be converted into a gallery thumbnail.",
+        ) from exc
+    return FileResponse(
+        thumbnail_path,
+        media_type="image/webp",
+        headers=_library_image_cache_headers(v, version),
+    )
 
 
 class JobApplyRequest(BaseModel):
@@ -3928,20 +4077,6 @@ class TVArtEditRequest(EditFromExistingRequest):
         None, max_length=100, description="Source TV profile name from config."
     )
     source_tv_ip: PrivateTVIPv4 | None = Field(None, description="Private source TV IP.")
-
-
-def _find_job_image_path(settings, job_id: str) -> Path:
-    """Find a generated job image path (prefer final, then source) or raise 404."""
-    artifacts_dir = settings.data_dir / "artifacts"
-    for job_dir in _find_job_dirs(artifacts_dir, job_id):
-        final_path = job_dir / "final.png"
-        if final_path.is_file():
-            return final_path
-        source_path = job_dir / "source.png"
-        if source_path.is_file():
-            return source_path
-
-    raise HTTPException(status_code=404, detail=f"No image found for job {job_id}")
 
 
 def _find_artifact_image_by_content_id(
