@@ -16,6 +16,7 @@ FrameArt is a self-hosted tool that accepts a text description, generates an ima
 - **Persistent async job queue**: Restart-safe SQLite status, results, and bounded history
 - **Web UI**: Built-in browser interface with provider/model dropdowns and concurrent async job tracking
 - **Managed artwork library**: Search, tags, named collections, bulk organization, and display history
+- **Visual Art Profile**: A short museum-art quiz with saved household preferences for a future daily collection
 - **TV groups and playlists**: Fan out to named groups and rotate ordered library artwork
 - **Durable schedules and integrations**: Restart-safe intervals, signed webhooks, optional MQTT, and Home Assistant-compatible control endpoints
 - **Live Score mode**: League/team/game tracking, 4K scoreboard stills, highlight feeds, and bounded host/TV storage
@@ -301,6 +302,29 @@ library grid. Full-resolution artwork is transferred only when a preview is open
 thumbnail and preview URLs use private, immutable browser caching; replacing or editing the
 source image automatically produces a new version, while deleting a job removes its thumbnail
 cache.
+
+**Art curation**:
+
+Open **Curate** (or `/?page=curate`) to take the visual Art Profile quiz. Choose between
+12 pairs of public-domain museum artworks, with both, neither, and skip options. Optional
+household details describe places and roots, children, the room's colors, favorite subjects,
+subjects to avoid, meaningful dates, seasons, and how artwork should fit the TV. All artwork
+examples are bundled locally with source credits, so the quiz does not contact image providers.
+
+Drafts and completed profiles are stored in the local FrameArt database and can be resumed
+from another device connected to the same server. Download the profile as JSON to share the
+answers for curation. The profile's visual themes are tentative preferences, not exclusions;
+the written preferences remain available alongside the original votes.
+
+Completion prepares a brief for a 20–30-work review collection. It does not schedule TV changes
+or start a 365-work download. The next stage uses the household's answers and review feedback
+before preparing the year-long calendar and TV-specific image formats.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/curation/quiz` | Read the bundled visual pairings and source credits |
+| `GET` | `/curation/profile` | Read the local household profile or `null` |
+| `PUT` | `/curation/profile` | Save draft choices or complete the Art Profile |
 
 **Automations**:
 

@@ -1,0 +1,546 @@
+{
+  "version": 1,
+  "pairs": [
+    {
+      "id": "calm-energy",
+      "title": "Quiet or energetic?",
+      "prompt": "Which would you enjoy seeing in the family room?",
+      "left": {
+        "id": "aic-16568",
+        "title": "Water Lilies",
+        "artist": "Claude Monet",
+        "date": "1906",
+        "image_url": "/static/curation/aic-16568.webp",
+        "source_url": "https://www.artic.edu/artworks/16568",
+        "source_api_url": "https://api.artic.edu/api/v1/artworks/16568?fields=id,title,artist_title,date_display,image_id,is_public_domain",
+        "source_image_url": "https://www.artic.edu/iiif/2/3c27b499-af56-f0d5-93b5-a7f2f1ad5813/full/843,/0/default.jpg",
+        "license": "Public Domain (CC0)",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution": "Art Institute of Chicago",
+        "is_public_domain": true,
+        "tags": [
+          "calm",
+          "soft-colors",
+          "impressionism",
+          "water",
+          "nature"
+        ]
+      },
+      "right": {
+        "id": "aic-8987",
+        "title": "Painting with Green Center",
+        "artist": "Vasily Kandinsky",
+        "date": "1913",
+        "image_url": "/static/curation/aic-8987.webp",
+        "source_url": "https://www.artic.edu/artworks/8987",
+        "source_api_url": "https://api.artic.edu/api/v1/artworks/8987?fields=id,title,artist_title,date_display,image_id,is_public_domain",
+        "source_image_url": "https://www.artic.edu/iiif/2/c68f33ec-feb1-5277-334b-b71ac15ae394/full/843,/0/default.jpg",
+        "license": "Public Domain (CC0)",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution": "Art Institute of Chicago",
+        "is_public_domain": true,
+        "tags": [
+          "energetic",
+          "bold-colors",
+          "abstract",
+          "modern"
+        ]
+      }
+    },
+    {
+      "id": "landscape-city",
+      "title": "Outdoors or city streets?",
+      "prompt": "Which place pulls you in?",
+      "left": {
+        "id": "aic-81537",
+        "title": "Bordighera",
+        "artist": "Claude Monet",
+        "date": "1884",
+        "image_url": "/static/curation/aic-81537.webp",
+        "source_url": "https://www.artic.edu/artworks/81537",
+        "source_api_url": "https://api.artic.edu/api/v1/artworks/81537?fields=id,title,artist_title,date_display,image_id,is_public_domain",
+        "source_image_url": "https://www.artic.edu/iiif/2/4d1b3ad0-14db-0d21-ad9f-17abb8bdfbb5/full/843,/0/default.jpg",
+        "license": "Public Domain (CC0)",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution": "Art Institute of Chicago",
+        "is_public_domain": true,
+        "tags": [
+          "landscape",
+          "nature",
+          "mediterranean",
+          "sunlight"
+        ]
+      },
+      "right": {
+        "id": "aic-20684",
+        "title": "Paris Street; Rainy Day",
+        "artist": "Gustave Caillebotte",
+        "date": "1877",
+        "image_url": "/static/curation/aic-20684.webp",
+        "source_url": "https://www.artic.edu/artworks/20684",
+        "source_api_url": "https://api.artic.edu/api/v1/artworks/20684?fields=id,title,artist_title,date_display,image_id,is_public_domain",
+        "source_image_url": "https://www.artic.edu/iiif/2/f8fd76e9-c396-5678-36ed-6a348c904d27/full/843,/0/default.jpg",
+        "license": "Public Domain (CC0)",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution": "Art Institute of Chicago",
+        "is_public_domain": true,
+        "tags": [
+          "city",
+          "architecture",
+          "everyday-life",
+          "europe"
+        ]
+      }
+    },
+    {
+      "id": "home-outdoors",
+      "title": "A room or a world outside?",
+      "prompt": "Which scene feels more at home on your wall?",
+      "left": {
+        "id": "aic-28560",
+        "title": "The Bedroom",
+        "artist": "Vincent van Gogh",
+        "date": "1889",
+        "image_url": "/static/curation/aic-28560.webp",
+        "source_url": "https://www.artic.edu/artworks/28560",
+        "source_api_url": "https://api.artic.edu/api/v1/artworks/28560?fields=id,title,artist_title,date_display,image_id,is_public_domain",
+        "source_image_url": "https://www.artic.edu/iiif/2/6644829f-f292-c5c4-a73c-0356a6fdbf0d/full/843,/0/default.jpg",
+        "license": "Public Domain (CC0)",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution": "Art Institute of Chicago",
+        "is_public_domain": true,
+        "tags": [
+          "interiors",
+          "bold-colors",
+          "expressive",
+          "everyday-life"
+        ]
+      },
+      "right": {
+        "id": "aic-27992",
+        "title": "A Sunday on La Grande Jatte — 1884",
+        "artist": "Georges Seurat",
+        "date": "1884–86, border added 1888–89",
+        "image_url": "/static/curation/aic-27992.webp",
+        "source_url": "https://www.artic.edu/artworks/27992",
+        "source_api_url": "https://api.artic.edu/api/v1/artworks/27992?fields=id,title,artist_title,date_display,image_id,is_public_domain",
+        "source_image_url": "https://www.artic.edu/iiif/2/2d484387-2509-5e8e-2c43-22f9981972eb/full/843,/0/default.jpg",
+        "license": "Public Domain (CC0)",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution": "Art Institute of Chicago",
+        "is_public_domain": true,
+        "tags": [
+          "outdoors",
+          "people",
+          "summer",
+          "leisure"
+        ]
+      }
+    },
+    {
+      "id": "people-still-life",
+      "title": "People or everyday objects?",
+      "prompt": "Which subject would you like to live with?",
+      "left": {
+        "id": "aic-13916",
+        "title": "On the Balcony",
+        "artist": "Berthe Morisot",
+        "date": "1871/72",
+        "image_url": "/static/curation/aic-13916.webp",
+        "source_url": "https://www.artic.edu/artworks/13916",
+        "source_api_url": "https://api.artic.edu/api/v1/artworks/13916?fields=id,title,artist_title,date_display,image_id,is_public_domain",
+        "source_image_url": "https://www.artic.edu/iiif/2/325efa52-e2cf-8ddb-3b42-93c6ebaf5cbf/full/843,/0/default.jpg",
+        "license": "Public Domain (CC0)",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution": "Art Institute of Chicago",
+        "is_public_domain": true,
+        "tags": [
+          "people",
+          "family",
+          "portraits",
+          "intimate"
+        ]
+      },
+      "right": {
+        "id": "aic-111436",
+        "title": "The Basket of Apples",
+        "artist": "Paul Cezanne",
+        "date": "c. 1893",
+        "image_url": "/static/curation/aic-111436.webp",
+        "source_url": "https://www.artic.edu/artworks/111436",
+        "source_api_url": "https://api.artic.edu/api/v1/artworks/111436?fields=id,title,artist_title,date_display,image_id,is_public_domain",
+        "source_image_url": "https://www.artic.edu/iiif/2/52ac8996-3460-cf71-cb42-5c4d0aa29b74/full/843,/0/default.jpg",
+        "license": "Public Domain (CC0)",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution": "Art Institute of Chicago",
+        "is_public_domain": true,
+        "tags": [
+          "still-life",
+          "food",
+          "warm-colors",
+          "modern"
+        ]
+      }
+    },
+    {
+      "id": "space-pattern",
+      "title": "Room to breathe or rich detail?",
+      "prompt": "Choose the composition you enjoy looking at.",
+      "left": {
+        "id": "aic-38666",
+        "title": "The Water Fan",
+        "artist": "Winslow Homer",
+        "date": "1898/99",
+        "image_url": "/static/curation/aic-38666.webp",
+        "source_url": "https://www.artic.edu/artworks/38666",
+        "source_api_url": "https://api.artic.edu/api/v1/artworks/38666?fields=id,title,artist_title,date_display,image_id,is_public_domain",
+        "source_image_url": "https://www.artic.edu/iiif/2/1de73bb7-52d6-e099-f4e1-763e201e78fa/full/843,/0/default.jpg",
+        "license": "Public Domain (CC0)",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution": "Art Institute of Chicago",
+        "is_public_domain": true,
+        "tags": [
+          "open-space",
+          "watercolor",
+          "coast",
+          "calm"
+        ]
+      },
+      "right": {
+        "id": "aic-103918",
+        "title": "Peacock and Dragon",
+        "artist": "William Morris",
+        "date": "Design 1878",
+        "image_url": "/static/curation/aic-103918.webp",
+        "source_url": "https://www.artic.edu/artworks/103918",
+        "source_api_url": "https://api.artic.edu/api/v1/artworks/103918?fields=id,title,artist_title,date_display,image_id,is_public_domain",
+        "source_image_url": "https://www.artic.edu/iiif/2/2287bfa7-89a3-8c59-78ed-0d8f5f43b199/full/843,/0/default.jpg",
+        "license": "Public Domain (CC0)",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution": "Art Institute of Chicago",
+        "is_public_domain": true,
+        "tags": [
+          "pattern",
+          "decorative",
+          "textile",
+          "rich-detail"
+        ]
+      }
+    },
+    {
+      "id": "summer-winter",
+      "title": "Summer light or winter hush?",
+      "prompt": "Which seasonal mood appeals more?",
+      "left": {
+        "id": "aic-64818",
+        "title": "Stacks of Wheat (End of Summer)",
+        "artist": "Claude Monet",
+        "date": "1890–91",
+        "image_url": "/static/curation/aic-64818.webp",
+        "source_url": "https://www.artic.edu/artworks/64818",
+        "source_api_url": "https://api.artic.edu/api/v1/artworks/64818?fields=id,title,artist_title,date_display,image_id,is_public_domain",
+        "source_image_url": "https://www.artic.edu/iiif/2/a38e2828-ec6f-ece1-a30f-70243449197b/full/843,/0/default.jpg",
+        "license": "Public Domain (CC0)",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution": "Art Institute of Chicago",
+        "is_public_domain": true,
+        "tags": [
+          "summer",
+          "warm-colors",
+          "landscape",
+          "sunlight"
+        ]
+      },
+      "right": {
+        "id": "aic-16560",
+        "title": "Stack of Wheat (Snow Effect, Overcast Day)",
+        "artist": "Claude Monet",
+        "date": "1890–91",
+        "image_url": "/static/curation/aic-16560.webp",
+        "source_url": "https://www.artic.edu/artworks/16560",
+        "source_api_url": "https://api.artic.edu/api/v1/artworks/16560?fields=id,title,artist_title,date_display,image_id,is_public_domain",
+        "source_image_url": "https://www.artic.edu/iiif/2/db36f74f-47d9-ad08-cdf9-b4b436e6d18c/full/843,/0/default.jpg",
+        "license": "Public Domain (CC0)",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution": "Art Institute of Chicago",
+        "is_public_domain": true,
+        "tags": [
+          "winter",
+          "cool-colors",
+          "landscape",
+          "quiet"
+        ]
+      }
+    },
+    {
+      "id": "growth-autumn",
+      "title": "Garden greens or autumn gold?",
+      "prompt": "Which seasonal palette would you choose?",
+      "left": {
+        "id": "aic-153798",
+        "title": "Woman in a Garden",
+        "artist": "Berthe Morisot",
+        "date": "1882–83",
+        "image_url": "/static/curation/aic-153798.webp",
+        "source_url": "https://www.artic.edu/artworks/153798",
+        "source_api_url": "https://api.artic.edu/api/v1/artworks/153798?fields=id,title,artist_title,date_display,image_id,is_public_domain",
+        "source_image_url": "https://www.artic.edu/iiif/2/5edb357d-2e8f-8673-d9e8-4b1150af3895/full/843,/0/default.jpg",
+        "license": "Public Domain (CC0)",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution": "Art Institute of Chicago",
+        "is_public_domain": true,
+        "tags": [
+          "garden",
+          "green",
+          "flowers",
+          "spring"
+        ]
+      },
+      "right": {
+        "id": "aic-127644",
+        "title": "Autumn Maples with Poem Slips",
+        "artist": "Tosa Mitsuoki",
+        "date": "c. 1675",
+        "image_url": "/static/curation/aic-127644.webp",
+        "source_url": "https://www.artic.edu/artworks/127644",
+        "source_api_url": "https://api.artic.edu/api/v1/artworks/127644?fields=id,title,artist_title,date_display,image_id,is_public_domain",
+        "source_image_url": "https://www.artic.edu/iiif/2/86e919b9-d366-b3ca-d26f-4c16880474a3/full/843,/0/default.jpg",
+        "license": "Public Domain (CC0)",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution": "Art Institute of Chicago",
+        "is_public_domain": true,
+        "tags": [
+          "autumn",
+          "gold",
+          "trees",
+          "japanese-art"
+        ]
+      }
+    },
+    {
+      "id": "photo-paint",
+      "title": "Photography or painting?",
+      "prompt": "The subject is similar; which way of seeing it do you prefer?",
+      "left": {
+        "id": "aic-66303",
+        "title": "The Hand of Man",
+        "artist": "Alfred Stieglitz",
+        "date": "1902, printed 1920/39",
+        "image_url": "/static/curation/aic-66303.webp",
+        "source_url": "https://www.artic.edu/artworks/66303",
+        "source_api_url": "https://api.artic.edu/api/v1/artworks/66303?fields=id,title,artist_title,date_display,image_id,is_public_domain",
+        "source_image_url": "https://www.artic.edu/iiif/2/7ae8cca1-a81b-9d01-5246-316b82602a13/full/843,/0/default.jpg",
+        "license": "Public Domain (CC0)",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution": "Art Institute of Chicago",
+        "is_public_domain": true,
+        "tags": [
+          "photography",
+          "black-and-white",
+          "city",
+          "industrial"
+        ]
+      },
+      "right": {
+        "id": "aic-16571",
+        "title": "Arrival of the Normandy Train, Gare Saint-Lazare",
+        "artist": "Claude Monet",
+        "date": "1877",
+        "image_url": "/static/curation/aic-16571.webp",
+        "source_url": "https://www.artic.edu/artworks/16571",
+        "source_api_url": "https://api.artic.edu/api/v1/artworks/16571?fields=id,title,artist_title,date_display,image_id,is_public_domain",
+        "source_image_url": "https://www.artic.edu/iiif/2/0f1cc0e0-e42e-be16-3f71-2022da38cb93/full/843,/0/default.jpg",
+        "license": "Public Domain (CC0)",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution": "Art Institute of Chicago",
+        "is_public_domain": true,
+        "tags": [
+          "painting",
+          "impressionism",
+          "city",
+          "industrial"
+        ]
+      }
+    },
+    {
+      "id": "observed-imagined",
+      "title": "Observed or imagined?",
+      "prompt": "Which world would you spend more time with?",
+      "left": {
+        "id": "aic-38445",
+        "title": "River and Park Landscape",
+        "artist": "Henri Rousseau",
+        "date": "1885/90",
+        "image_url": "/static/curation/aic-38445.webp",
+        "source_url": "https://www.artic.edu/artworks/38445",
+        "source_api_url": "https://api.artic.edu/api/v1/artworks/38445?fields=id,title,artist_title,date_display,image_id,is_public_domain",
+        "source_image_url": "https://www.artic.edu/iiif/2/2410fd8c-957b-dde7-6375-f976318839f8/full/843,/0/default.jpg",
+        "license": "Public Domain (CC0)",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution": "Art Institute of Chicago",
+        "is_public_domain": true,
+        "tags": [
+          "landscape",
+          "drawing",
+          "black-and-white",
+          "peaceful"
+        ]
+      },
+      "right": {
+        "id": "aic-76395",
+        "title": "Flower Clouds",
+        "artist": "Odilon Redon",
+        "date": "c. 1903",
+        "image_url": "/static/curation/aic-76395.webp",
+        "source_url": "https://www.artic.edu/artworks/76395",
+        "source_api_url": "https://api.artic.edu/api/v1/artworks/76395?fields=id,title,artist_title,date_display,image_id,is_public_domain",
+        "source_image_url": "https://www.artic.edu/iiif/2/fb2077d9-82cc-ca7e-f450-5471d7f78c9a/full/843,/0/default.jpg",
+        "license": "Public Domain (CC0)",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution": "Art Institute of Chicago",
+        "is_public_domain": true,
+        "tags": [
+          "dreamlike",
+          "imaginative",
+          "pastel",
+          "symbolism"
+        ]
+      }
+    },
+    {
+      "id": "line-brush",
+      "title": "Graphic lines or loose brushwork?",
+      "prompt": "Which treatment of the coast catches your eye?",
+      "left": {
+        "id": "aic-24645",
+        "title": "Under the Wave off Kanagawa (Kanagawa oki nami ura), also known as The Great Wave, from the series \"Thirty-Six Views of Mount Fuji (Fugaku sanjūrokkei)\"",
+        "artist": "Katsushika Hokusai",
+        "date": "1830/33",
+        "image_url": "/static/curation/aic-24645.webp",
+        "source_url": "https://www.artic.edu/artworks/24645",
+        "source_api_url": "https://api.artic.edu/api/v1/artworks/24645?fields=id,title,artist_title,date_display,image_id,is_public_domain",
+        "source_image_url": "https://www.artic.edu/iiif/2/b3974542-b9b4-7568-fc4b-966738f61d78/full/843,/0/default.jpg",
+        "license": "Public Domain (CC0)",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution": "Art Institute of Chicago",
+        "is_public_domain": true,
+        "tags": [
+          "print",
+          "graphic",
+          "japanese-art",
+          "dramatic"
+        ]
+      },
+      "right": {
+        "id": "aic-66144",
+        "title": "Rocks at the Lighthouse, Biarritz",
+        "artist": "Joaquín Sorolla y Bastida",
+        "date": "1906",
+        "image_url": "/static/curation/aic-66144.webp",
+        "source_url": "https://www.artic.edu/artworks/66144",
+        "source_api_url": "https://api.artic.edu/api/v1/artworks/66144?fields=id,title,artist_title,date_display,image_id,is_public_domain",
+        "source_image_url": "https://www.artic.edu/iiif/2/0558d3c0-dd86-7d26-2e55-126c1470ca41/full/843,/0/default.jpg",
+        "license": "Public Domain (CC0)",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution": "Art Institute of Chicago",
+        "is_public_domain": true,
+        "tags": [
+          "loose-brushwork",
+          "coast",
+          "mediterranean",
+          "sunlight"
+        ]
+      }
+    },
+    {
+      "id": "dark-bright",
+      "title": "Low light or bright color?",
+      "prompt": "Which atmosphere would suit an evening at home?",
+      "left": {
+        "id": "aic-56905",
+        "title": "Nocturne: Blue and Gold—Southampton Water",
+        "artist": "James McNeill Whistler",
+        "date": "1872",
+        "image_url": "/static/curation/aic-56905.webp",
+        "source_url": "https://www.artic.edu/artworks/56905",
+        "source_api_url": "https://api.artic.edu/api/v1/artworks/56905?fields=id,title,artist_title,date_display,image_id,is_public_domain",
+        "source_image_url": "https://www.artic.edu/iiif/2/50034c7f-ce51-00f1-430e-a6f7efc233fc/full/843,/0/default.jpg",
+        "license": "Public Domain (CC0)",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution": "Art Institute of Chicago",
+        "is_public_domain": true,
+        "tags": [
+          "dark",
+          "muted-colors",
+          "minimal",
+          "night"
+        ]
+      },
+      "right": {
+        "id": "aic-110982",
+        "title": "Still Life with Flowers",
+        "artist": "Odilon Redon",
+        "date": "1905",
+        "image_url": "/static/curation/aic-110982.webp",
+        "source_url": "https://www.artic.edu/artworks/110982",
+        "source_api_url": "https://api.artic.edu/api/v1/artworks/110982?fields=id,title,artist_title,date_display,image_id,is_public_domain",
+        "source_image_url": "https://www.artic.edu/iiif/2/bdb9f780-83be-dd12-191d-54a77c5444ab/full/843,/0/default.jpg",
+        "license": "Public Domain (CC0)",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution": "Art Institute of Chicago",
+        "is_public_domain": true,
+        "tags": [
+          "bright",
+          "flowers",
+          "still-life",
+          "colorful"
+        ]
+      }
+    },
+    {
+      "id": "playful-geometric",
+      "title": "A little character or pure geometry?",
+      "prompt": "Which sort of surprise would you welcome?",
+      "left": {
+        "id": "aic-51719",
+        "title": "Winter: Cat on a Cushion",
+        "artist": "Théophile-Alexandre Pierre Steinlen",
+        "date": "1909",
+        "image_url": "/static/curation/aic-51719.webp",
+        "source_url": "https://www.artic.edu/artworks/51719",
+        "source_api_url": "https://api.artic.edu/api/v1/artworks/51719?fields=id,title,artist_title,date_display,image_id,is_public_domain",
+        "source_image_url": "https://www.artic.edu/iiif/2/e8e67721-bbb1-d007-82bd-c430ea73db70/full/843,/0/default.jpg",
+        "license": "Public Domain (CC0)",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution": "Art Institute of Chicago",
+        "is_public_domain": true,
+        "tags": [
+          "playful",
+          "animals",
+          "graphic",
+          "warm-colors"
+        ]
+      },
+      "right": {
+        "id": "aic-109819",
+        "title": "Lozenge Composition with Yellow, Black, Blue, Red, and Gray",
+        "artist": "Piet Mondrian",
+        "date": "1921",
+        "image_url": "/static/curation/aic-109819.webp",
+        "source_url": "https://www.artic.edu/artworks/109819",
+        "source_api_url": "https://api.artic.edu/api/v1/artworks/109819?fields=id,title,artist_title,date_display,image_id,is_public_domain",
+        "source_image_url": "https://www.artic.edu/iiif/2/25f660ee-f1db-d13b-42a5-56df97c98ba7/full/843,/0/default.jpg",
+        "license": "Public Domain (CC0)",
+        "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "attribution": "Art Institute of Chicago",
+        "is_public_domain": true,
+        "tags": [
+          "geometric",
+          "abstract",
+          "modern",
+          "minimal"
+        ]
+      }
+    }
+  ]
+}

@@ -13,6 +13,7 @@
   <div class="tabs">
     <button class="active" data-page="create">Create</button>
     <button data-page="library">Library</button>
+    <button data-page="curate">Curate</button>
     <button data-page="tvs">TVs</button>
     <button data-page="modes">Modes</button>
     <button data-page="automations">Automations</button>
@@ -204,6 +205,14 @@
     <div class="status-bar" id="edit-upload-status">
       <div class="value" id="edit-upload-status-text"></div>
     </div>
+  </div>
+</div>
+
+<div class="panel" id="panel-curate">
+  <div id="art-profile-root" aria-live="polite">
+    <div class="page-eyebrow">Curate</div>
+    <h2>Your household’s Art Profile</h2>
+    <p class="page-intro">Choose artwork you would enjoy living with, then tell us what makes home yours.</p>
   </div>
 </div>
 
@@ -894,12 +903,14 @@
 <div class="mobile-nav" id="mobile-nav">
   <button class="active" data-page="create">Create</button>
   <button data-page="library">Library</button>
+  <button data-page="curate">Curate</button>
   <button data-page="tvs">TVs</button>
   <button data-page="modes">Modes</button>
   <button data-page="automations">Automations</button>
   <button data-page="settings">Settings</button>
 </div>
 
+<script src="/static/curation.js" defer></script>
 <script src="/static/app.js" defer></script>
 </body>
 </html>
