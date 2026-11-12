@@ -76,6 +76,7 @@ from pydantic import AfterValidator, BaseModel, Field, SecretStr, field_validato
 import frameart.public_domain as public_domain
 from frameart import __version__
 from frameart.access import AccessStore, InvalidPairingCodeError
+from frameart.art_profile import ArtProfileRequest, ArtProfileStore, load_art_quiz
 from frameart.automation import (
     AutomationScheduler,
     AutomationStore,
@@ -152,6 +153,7 @@ _PUBLIC_PATHS = {
 _PUBLIC_PREFIXES = ("/static/",)
 _ADMIN_PATHS = {"/jobs/delete", "/tv/art/delete", "/tv/art/matte", "/tv/mattes/cache"}
 _ADMIN_PREFIXES = (
+    "/curation",
     "/settings",
     "/automation",
     "/auth/access",
@@ -3520,6 +3522,31 @@ def get_library_history(
     limit: int = Query(100, ge=1, le=500, description="Maximum display events."),
 ):
     return _library_store().list_history(limit)
+
+
+# ---------------------------------------------------------------------------
+# Routes — household art profile and visual quiz
+# ---------------------------------------------------------------------------
+
+
+@app.get("/curation/quiz")
+def get_art_profile_quiz():
+    return load_art_quiz()
+
+
+@app.get("/curation/profile")
+def get_household_art_profile(response: Response):
+    response.headers["Cache-Control"] = "private, no-store"
+    return ArtProfileStore(_settings().data_dir).get_profile()
+
+
+@app.put("/curation/profile")
+def save_household_art_profile(req: ArtProfileRequest, response: Response):
+    response.headers["Cache-Control"] = "private, no-store"
+    try:
+        return ArtProfileStore(_settings().data_dir).save_profile(req, load_art_quiz())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------

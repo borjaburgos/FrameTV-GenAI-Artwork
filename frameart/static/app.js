@@ -514,6 +514,7 @@
     pageTabs.forEach((tab) => tab.classList.toggle('active', tab.dataset.page === pageName));
     panels.forEach((panel) => panel.classList.toggle('active', panel.id === ('panel-' + pageName)));
     localStorage.setItem(storageKeys.page, pageName);
+    if (pageName === 'curate') window.FrameArtCuration.open({apiFetch, parseJSONResponse, showToast});
     if (pageName === 'library') {
       loadLibraryCollections().then(loadGallery).catch((error) => {
         showToast(error?.message || 'Could not load library metadata.', 'error');
@@ -557,7 +558,8 @@
     setActiveCreateMode('ai');
   }
 
-  const rememberedPage = localStorage.getItem(storageKeys.page);
+  const rememberedPage = new URLSearchParams(window.location.search).get('page') ||
+    localStorage.getItem(storageKeys.page);
   if (rememberedPage && [...pageTabs].some((tab) => tab.dataset.page === rememberedPage)) {
     setActivePage(rememberedPage);
   } else {
