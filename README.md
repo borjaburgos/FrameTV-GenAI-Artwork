@@ -316,6 +316,17 @@ from another device connected to the same server. Download the profile as JSON t
 answers for curation. The profile's visual themes are tentative preferences, not exclusions;
 the written preferences remain available alongside the original votes.
 
+Use **Now showing** in Curate or TVs to check the current picture on a configured TV and tap
+**Good** or **Bad**. Tap the selected reaction again, or use Clear, to undo it. A household has
+one current reaction per artwork, so repeated taps do not amplify a preference. Ratings are
+saved independently of the quiz and remain available when the quiz is revised or restarted.
+
+Artwork reactions refine the Art Profile using known tags, style, and artist metadata, while
+retaining the exact liked and disliked examples for future curation. Unknown TV artwork can
+still be rated without inventing a style or subject. Matching a TV content ID always includes
+the TV's identity. Checking and rating do not change the displayed image or enable Art Mode;
+normal TV viewing is left untouched. TV-only previews use the existing local thumbnail cache.
+
 Completion prepares a brief for a 20–30-work review collection. It does not schedule TV changes
 or start a 365-work download. The next stage uses the household's answers and review feedback
 before preparing the year-long calendar and TV-specific image formats.
@@ -325,6 +336,10 @@ before preparing the year-long calendar and TV-specific image formats.
 | `GET` | `/curation/quiz` | Read the bundled visual pairings and source credits |
 | `GET` | `/curation/profile` | Read the local household profile or `null` |
 | `PUT` | `/curation/profile` | Save draft choices or complete the Art Profile |
+| `GET` | `/curation/now-showing?tv_profile_id=...` | Check one TV's current Art Mode picture |
+| `GET` | `/curation/ratings` | Read saved household artwork reactions and preference totals |
+| `PUT` | `/curation/ratings` | Set, change, or clear a reaction to a captured artwork reference |
+| `GET` | `/curation/thumbnail` | Read an existing local TV thumbnail without contacting the TV |
 
 **Automations**:
 

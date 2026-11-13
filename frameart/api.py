@@ -61,7 +61,7 @@ from email.header import decode_header, make_header
 from io import BytesIO
 from ipaddress import ip_address, ip_network
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
 import httpx2 as httpx
@@ -71,11 +71,21 @@ from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps, UnidentifiedImageError
-from pydantic import AfterValidator, BaseModel, Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 
 import frameart.public_domain as public_domain
 from frameart import __version__
 from frameart.access import AccessStore, InvalidPairingCodeError
+from frameart.art_feedback import ArtworkFeedbackStore
+from frameart.art_feedback_resolver import resolve_feedback_artwork
 from frameart.art_profile import ArtProfileRequest, ArtProfileStore, load_art_quiz
 from frameart.automation import (
     AutomationScheduler,
@@ -3537,16 +3547,155 @@ def get_art_profile_quiz():
 @app.get("/curation/profile")
 def get_household_art_profile(response: Response):
     response.headers["Cache-Control"] = "private, no-store"
-    return ArtProfileStore(_settings().data_dir).get_profile()
+    settings = _settings()
+    profile = ArtProfileStore(settings.data_dir).get_profile()
+    return ArtworkFeedbackStore(settings.data_dir).enrich_profile(profile, load_art_quiz())
 
 
 @app.put("/curation/profile")
 def save_household_art_profile(req: ArtProfileRequest, response: Response):
     response.headers["Cache-Control"] = "private, no-store"
     try:
-        return ArtProfileStore(_settings().data_dir).save_profile(req, load_art_quiz())
+        settings = _settings()
+        quiz = load_art_quiz()
+        profile = ArtProfileStore(settings.data_dir).save_profile(req, quiz)
+        return ArtworkFeedbackStore(settings.data_dir).enrich_profile(profile, quiz)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+class ArtworkRatingReference(BaseModel):
+    """Captured identifiers, with metadata resolved only from local server records."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: JobId | None = None
+    tv_profile_id: ProfileId | None = None
+    content_id: ContentId | None = None
+    artwork_key: str | None = Field(None, min_length=1, max_length=512)
+
+    @model_validator(mode="after")
+    def one_target(self):
+        if self.artwork_key is not None:
+            targets = (self.job_id, self.tv_profile_id, self.content_id)
+            if any(value is not None for value in targets):
+                raise ValueError("Choose one saved rating or one captured artwork.")
+        elif self.job_id is not None:
+            if self.tv_profile_id is not None or self.content_id is not None:
+                raise ValueError("Choose a job or a captured TV artwork, not both.")
+        elif self.tv_profile_id is None or self.content_id is None:
+            raise ValueError("A captured TV artwork requires a TV profile and content ID.")
+        return self
+
+
+class ArtworkRatingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reference: ArtworkRatingReference
+    value: Literal["good", "bad"] | None = Field(...)
+
+
+def _resolve_rating_reference(settings, reference: ArtworkRatingReference):
+    if reference.artwork_key is not None:
+        saved = ArtworkFeedbackStore(settings.data_dir).get_rating(reference.artwork_key)
+        if saved is None:
+            raise HTTPException(status_code=404, detail="Saved artwork rating was not found.")
+        return {**saved["artwork"], "key": saved["artwork_key"]}
+    try:
+        return resolve_feedback_artwork(settings, reference.model_dump(exclude_none=True))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/curation/now-showing")
+def get_curation_now_showing(tv_profile_id: ProfileId, response: Response):
+    """Read one configured TV on explicit request, without altering TV viewing."""
+    from frameart.tv.controller import get_status
+
+    response.headers["Cache-Control"] = "private, no-store"
+    settings = _settings()
+    profile = settings.tvs.get(tv_profile_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="TV profile was not found.")
+    payload = {
+        "tv_profile_id": tv_profile_id,
+        "tv_name": tv_profile_id,
+        "status": "unknown",
+        "message": "Could not confirm the artwork currently showing.",
+        "artwork": None,
+        "rating": None,
+    }
+    try:
+        status = get_status(profile)
+    except Exception:
+        return payload
+    if not status.reachable:
+        return {**payload, "status": "offline", "message": "TV is currently unreachable."}
+    if not status.art_mode_supported:
+        return {**payload, "message": "Art Mode is unavailable on this TV."}
+    if not status.art_mode_on:
+        return {
+            **payload,
+            "status": "watching",
+            "message": "TV is being used. Normal viewing has been left untouched.",
+        }
+    content_id = status.current_artwork
+    if not isinstance(content_id, str) or not re.fullmatch(_IDENTIFIER_RE, content_id):
+        return payload
+    artwork = _resolve_rating_reference(
+        settings,
+        ArtworkRatingReference(tv_profile_id=tv_profile_id, content_id=content_id),
+    )
+    rating = ArtworkFeedbackStore(settings.data_dir).get_rating(artwork["key"])
+    return {
+        **payload,
+        "status": "showing",
+        "message": "Rate the picture currently showing in Art Mode.",
+        "artwork": artwork,
+        "rating": rating["value"] if rating else None,
+    }
+
+
+@app.get("/curation/thumbnail")
+def get_curation_cached_thumbnail(
+    tv_profile_id: ProfileId, content_id: ContentId, response: Response
+):
+    """Serve only an already cached thumbnail, never initiating a TV connection."""
+    settings = _settings()
+    profile = settings.tvs.get(tv_profile_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="TV profile was not found.")
+    cached = TVCacheStore(settings.data_dir).get_thumbnail(tv_cache_key(profile), content_id)
+    if cached is None:
+        raise HTTPException(status_code=404, detail="No cached preview is available.")
+    return Response(
+        cached.value["data"],
+        media_type=cached.value["media_type"],
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
+@app.get("/curation/ratings")
+def get_artwork_ratings(response: Response, limit: int = Query(100, ge=1, le=100)):
+    response.headers["Cache-Control"] = "private, no-store"
+    store = ArtworkFeedbackStore(_settings().data_dir)
+    return {"ratings": store.list_ratings(limit=limit), "summary": store.summary()}
+
+
+@app.put("/curation/ratings")
+def save_artwork_rating(req: ArtworkRatingRequest, response: Response):
+    response.headers["Cache-Control"] = "private, no-store"
+    settings = _settings()
+    artwork = _resolve_rating_reference(settings, req.reference)
+    store = ArtworkFeedbackStore(settings.data_dir)
+    rating = store.rate(artwork["key"], req.value, artwork)
+    return {
+        "rating": rating["value"] if rating else None,
+        "artwork": artwork,
+        "summary": store.summary(),
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -46,6 +46,7 @@
 
   function save(status = 'draft') {
     clearTimeout(saveTimer);
+    saveTimer = null;
     profile.status = status;
     profile.step = step;
     const currentRevision = ++revision;
@@ -64,6 +65,8 @@
         profile.created_at = saved.created_at;
         profile.quiz_version = saved.quiz_version;
         profile.derived = saved.derived;
+        profile.feedback = saved.feedback;
+        profile.quiz_derived = saved.quiz_derived;
         profile.updated_at = saved.updated_at;
         profile.completed_at = saved.completed_at;
         saveError = '';
@@ -250,13 +253,17 @@
     const derived = profile.derived || {};
     const preferred = derived.preferred_tags || [];
     const avoided = derived.avoided_tags || [];
+    const feedback = profile.feedback || {};
     shell('<div class="curation-result"><div class="curation-result-mark" aria-hidden="true">✓</div><p class="curation-lede">Your first chapter is ready.</p>' +
       '<p>Your Art Profile is saved. The next step is a handpicked collection of 20–30 artworks for your review, guided by these choices and your family’s story.</p>' +
       '<p class="hint">The review collection will be curated after your answers are reviewed. No daily rotation has been scheduled.</p></div>' +
+      (feedback.total_count ? '<section class="curation-summary-card curation-feedback-summary"><h3>Learning from your daily ratings</h3><p>' +
+        esc(feedback.good_count || 0) + ' good · ' + esc(feedback.bad_count || 0) +
+        ' bad. Your artwork reactions now contribute alongside the quiz choices below.</p></section>' : '') +
       '<div class="curation-summary-grid"><section class="curation-summary-card"><h3>What you’re drawn to</h3><div class="curation-tags">' +
       (preferred.length ? preferred.slice(0, 12).map((item) => '<span>' + esc(item.tag.replaceAll('_', ' ')) + '</span>').join('') : '<p>Your household notes will guide the first selection.</p>') +
       '</div>' + (avoided.length ? '<h4>Use less of</h4><p>' + avoided.slice(0, 8).map((item) => esc(item.tag.replaceAll('_', ' '))).join(' · ') + '</p>' : '') +
-      '<p class="hint">A dislike applies to this pairing; these are starting signals you can refine in the review gallery.</p></section>' +
+      '<p class="hint">These are starting signals from your quiz and artwork ratings. Individual reactions do not rule out an entire style.</p></section>' +
       '<section class="curation-summary-card"><h3>Your curation brief</h3><ul>' +
       (derived.summary || []).map((line) => '<li>' + esc(line) + '</li>').join('') + '</ul></section></div>' +
       '<section class="curation-summary-card"><h3>About your home</h3><dl class="curation-home-summary">' +
@@ -276,17 +283,28 @@
       mode = 'household';
       render(true);
     });
-    root.querySelector('#art-profile-export').addEventListener('click', () => {
-      const blob = new Blob([JSON.stringify(profile, null, 2)], {type: 'application/json'});
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = 'frameart-art-profile.json';
-      link.click();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    root.querySelector('#art-profile-export').addEventListener('click', async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        if (savePending || saveTimer) await save(profile.status);
+        const response = await services.apiFetch('/curation/profile');
+        const latest = await services.parseJSONResponse(response, 'Could not load your latest Art Profile.');
+        const blob = new Blob([JSON.stringify(latest || profile, null, 2)], {type: 'application/json'});
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'frameart-art-profile.json';
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      } catch (error) {
+        services.showToast(error.message || 'Could not export your Art Profile.', 'error');
+      } finally {
+        button.disabled = false;
+      }
     });
     root.querySelector('#art-profile-reset').addEventListener('click', async () => {
-      if (!window.confirm('Clear your saved Art Profile and start the quiz again?')) return;
+      if (!window.confirm('Clear your quiz answers and home details? Your artwork ratings will be kept.')) return;
       profile = freshProfile();
       step = 0;
       mode = 'intro';
@@ -309,11 +327,28 @@
 
   document.addEventListener('keydown', (event) => {
     if (mode !== 'quiz' || !root.closest('.panel.active')) return;
+    if (event.target.closest('.art-feedback-root')) return;
     if (event.ctrlKey || event.metaKey || event.altKey || event.target.closest('input, textarea, select')) return;
     const choice = {ArrowLeft: 'left', ArrowRight: 'right', b: 'both', n: 'neither', s: 'skip'}[event.key];
     if (choice) {
       event.preventDefault();
       choose(choice);
+    }
+  });
+
+  window.addEventListener('frameart:feedback-updated', async () => {
+    if (!services || !profile) return;
+    try {
+      await saving.catch(() => {});
+      const response = await services.apiFetch('/curation/profile');
+      const latest = await services.parseJSONResponse(response, 'Could not refresh your Art Profile.');
+      if (!latest) return;
+      profile.feedback = latest.feedback;
+      profile.derived = latest.derived;
+      profile.quiz_derived = latest.quiz_derived;
+      if (mode === 'summary' && !savePending) render();
+    } catch (error) {
+      services.showToast(error.message || 'Your rating is saved. Refresh to update the Art Profile summary.', 'warn');
     }
   });
 
