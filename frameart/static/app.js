@@ -514,6 +514,9 @@
     pageTabs.forEach((tab) => tab.classList.toggle('active', tab.dataset.page === pageName));
     panels.forEach((panel) => panel.classList.toggle('active', panel.id === ('panel-' + pageName)));
     localStorage.setItem(storageKeys.page, pageName);
+    if (pageName === 'curate' || pageName === 'tvs') {
+      window.FrameArtFeedback.open({apiFetch, parseJSONResponse, showToast}, 'art-feedback-' + pageName);
+    }
     if (pageName === 'curate') window.FrameArtCuration.open({apiFetch, parseJSONResponse, showToast});
     if (pageName === 'library') {
       loadLibraryCollections().then(loadGallery).catch((error) => {
