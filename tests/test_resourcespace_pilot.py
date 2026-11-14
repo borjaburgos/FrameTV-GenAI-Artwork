@@ -1,7 +1,8 @@
-"""The pilot never ingests originals or silently expands past 20 artworks."""
+"""Importers never ingest originals or silently expand their explicit scope."""
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from io import BytesIO
@@ -110,7 +111,12 @@ class FakeAPI:
                     for ref, data in self.resources.items()
                     if data["fields"].get("frameartid") == artwork_id
                 ]
-            return {"total": len(refs), "data": [{"ref": ref} for ref in refs]}
+            refs = sorted(refs)
+            offset, limit = map(int, params["fetchrows"].split(","))
+            return {
+                "total": len(refs),
+                "data": [{"ref": ref} for ref in refs[offset : offset + limit]],
+            }
         if function == "create_resource":
             ref = 1000 + len(self.resources)
             names = {str(field["ref"]): field["name"] for field in self.fields}
@@ -160,6 +166,91 @@ def test_manifest_requires_exactly_twenty(pilot_files, size):
 
     with pytest.raises(pilot.PilotError, match="exactly 20"):
         load_files(pilot_files, mutate)
+
+
+@pytest.fixture
+def library_files(pilot_files):
+    """A full year using small generated files, never the real NAS library."""
+    path, originals, renditions, document = pilot_files
+    for number in range(20, 365):
+        item = copy.deepcopy(document["items"][0])
+        original = originals / f"source-{number}.jpg"
+        original.write_bytes(b"original-only-" + str(number).encode())
+        rendition = renditions / f"tv-{number}.jpg"
+        rendition.hardlink_to(renditions / "tv-0.jpg")
+        item.update(
+            original_path=original.name,
+            rendition_path=rendition.name,
+            original_sha256=pilot.file_sha256(original),
+        )
+        item["metadata"].update(id=f"pilot-{number}", title=f"Artwork {number}")
+        document["items"].append(item)
+    document["collection_name"] = "FrameArt full-year test"
+    path.write_text(json.dumps(document))
+    return pilot_files
+
+
+def test_full_library_requires_explicit_count_and_remains_idempotent(library_files):
+    path, originals, renditions, _document = library_files
+    with pytest.raises(pilot.PilotError, match="exactly 20"):
+        pilot.load_manifest(path, originals, renditions)
+    manifest = pilot.load_manifest(path, originals, renditions, expected_count=365)
+    assert len(manifest.items) == manifest.expected_count == 365
+    api = FakeAPI()
+    first = pilot.import_pilot(manifest, api)
+    second = pilot.import_pilot(manifest, api)
+    assert first == second
+    assert first["item_count"] == len(api.resources) == len(api.members) == len(api.uploads) == 365
+    assert all(path.parent == renditions for path in api.uploads)
+    assert all(item.original.read_bytes().startswith(b"original-only-") for item in manifest.items)
+    assert "delete_resource" not in api.calls
+    assert "replace_resource_file" not in api.calls
+
+
+@pytest.mark.parametrize("count", [0, -1, 1001, True, "365"])
+def test_invalid_explicit_counts_are_rejected_before_file_reads(pilot_files, count):
+    with pytest.raises(pilot.PilotError, match="between 1 and 1000"):
+        pilot.load_manifest(*pilot_files[:3], expected_count=count)
+
+
+def test_full_library_cli_dry_run_and_collection_override_do_not_modify_manifest(
+    library_files, monkeypatch, capsys
+):
+    path, originals, renditions, _document = library_files
+    before = path.read_bytes()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Dry-run must not initialize network access")
+
+    monkeypatch.setattr(pilot, "AdminAPI", forbidden)
+    assert (
+        pilot.main(
+            [
+                "--manifest",
+                str(path),
+                "--originals-root",
+                str(originals),
+                "--renditions-root",
+                str(renditions),
+                "--expected-count",
+                "365",
+                "--collection-name",
+                "FrameArt — 20 artwork pilot",
+            ]
+        )
+        == 0
+    )
+    report = json.loads(capsys.readouterr().out)
+    assert report["item_count"] == 365
+    assert report["network_requests"] == 0
+    assert report["collection_name"] == "FrameArt — 20 artwork pilot"
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("name", ["", " ", "x" * 201])
+def test_collection_name_override_is_validated(pilot_files, name):
+    with pytest.raises(pilot.PilotError, match="collection_name"):
+        pilot.load_manifest(*pilot_files[:3], collection_name=name)
 
 
 @pytest.mark.parametrize("path", ["../outside.jpg", "/etc/passwd", "..\\outside.jpg"])

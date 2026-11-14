@@ -9,6 +9,7 @@ import os
 import sqlite3
 import threading
 import warnings
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,7 @@ from urllib.parse import urlsplit
 from PIL import Image, ImageOps
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from frameart.resourcespace import PILOT_LIMIT, ResourceSpaceClient, ResourceSpaceError
+from frameart.resourcespace import CATALOG_LIMIT, ResourceSpaceClient, ResourceSpaceError
 
 _locks_guard = threading.Lock()
 _sync_locks: dict[str, threading.Lock] = {}
@@ -211,7 +212,7 @@ class ArtCatalogStore:
             rows = connection.execute(
                 "SELECT id, metadata, thumbnail IS NOT NULL AS has_thumbnail "
                 "FROM art_catalog_items ORDER BY id LIMIT ?",
-                (PILOT_LIMIT,),
+                (CATALOG_LIMIT,),
             ).fetchall()
         items = []
         for row in rows:
@@ -236,14 +237,15 @@ class ArtCatalogStore:
             "items": items,
             "last_synced_at": state.get("last_synced_at"),
             "error": error,
-            "pilot_limit": PILOT_LIMIT,
+            "pilot_limit": CATALOG_LIMIT,
+            "catalog_limit": CATALOG_LIMIT,
         }
 
     def replace(self, records: list[tuple[ArtworkMetadata, bytes | None]], settings) -> None:
-        if not records or len(records) > PILOT_LIMIT:
-            raise ResourceSpaceError("The pilot collection is empty or exceeds its size limit.")
+        if not records or len(records) > CATALOG_LIMIT:
+            raise ResourceSpaceError("The artwork collection is empty or exceeds its size limit.")
         if len({record.id for record, _thumbnail in records}) != len(records):
-            raise ResourceSpaceError("The pilot collection contains duplicate artwork IDs.")
+            raise ResourceSpaceError("The artwork collection contains duplicate artwork IDs.")
         with self._connect() as connection:
             connection.execute("DELETE FROM art_catalog_items")
             connection.executemany(
@@ -275,13 +277,25 @@ class ArtCatalogStore:
             ).fetchone()
         return row["thumbnail"] if row else None
 
+    def get(self, artwork_id: str) -> ArtworkMetadata | None:
+        """Look up one cached artwork without performing any upstream request."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT metadata FROM art_catalog_items WHERE id = ?", (artwork_id,)
+            ).fetchone()
+        return ArtworkMetadata.model_validate_json(row["metadata"]) if row else None
+
 
 class CatalogSyncBusyError(RuntimeError):
     """Another request is already refreshing this local catalog."""
 
 
-def sync_catalog(settings) -> dict[str, Any]:
-    """Manually refresh at most 20 records, without ever touching a TV or NAS."""
+def sync_catalog(settings, progress: Callable[[int, int], None] | None = None) -> dict[str, Any]:
+    """Refresh the bounded catalog atomically, without touching a TV or NAS.
+
+    The optional callback receives (completed artworks, total artworks), first
+    at zero and then after each metadata/preview pair has been validated.
+    """
     if not integration_configured(settings):
         raise ResourceSpaceError(
             "Configure the ResourceSpace server, reader key and collection first."
@@ -305,7 +319,12 @@ def sync_catalog(settings) -> dict[str, Any]:
                 raise ResourceSpaceError(
                     "ResourceSpace returned no artworks; the previous catalog was retained."
                 )
+            if len(resources) > CATALOG_LIMIT:
+                raise ResourceSpaceError("ResourceSpace collection exceeds the catalog size limit.")
+            if progress:
+                progress(0, len(resources))
             records = []
+            artwork_ids: set[str] = set()
             for row in resources:
                 try:
                     ref = int(row["ref"])
@@ -316,8 +335,15 @@ def sync_catalog(settings) -> dict[str, Any]:
                         "ResourceSpace returned an invalid artwork reference."
                     ) from None
                 record = artwork_from_fields(ref, client.resource_fields(ref))
+                if record.id in artwork_ids:
+                    raise ResourceSpaceError(
+                        "The artwork collection contains duplicate artwork IDs."
+                    )
+                artwork_ids.add(record.id)
                 preview = client.thumbnail(ref, str(row.get("preview_extension") or "jpg"))
                 records.append((record, _webp_thumbnail(preview) if preview else None))
+                if progress:
+                    progress(len(records), len(resources))
             store.replace(records, settings)
         except Exception as exc:
             message = (

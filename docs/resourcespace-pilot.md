@@ -1,8 +1,10 @@
-# ResourceSpace: 20-artwork pilot
+# ResourceSpace artwork catalog and Daily Art
 
 This is an optional, local-only artwork catalog alongside FrameArt. It does not
-replace the existing library or change TV playback, daily schedules, or ratings.
-The pilot is bounded to exactly 20 reviewed artworks.
+replace the existing generated-art library. Browsing and metadata refresh do not
+change TV playback. The importer defaults to the original 20-work pilot, while
+an explicit expected count supports full annual collections up to 1,000 works.
+Sending artwork and Daily Art scheduling are separate, opt-in FrameArt controls.
 
 ## Storage and safety boundaries
 
@@ -11,8 +13,8 @@ The pilot is bounded to exactly 20 reviewed artworks.
   is already mounted on the FrameArt host.
 - ResourceSpace receives **read-only** mounts for originals and approved TV
   renditions. Docker refuses to create missing host paths.
-- In this first pilot, ResourceSpace manages **copies of the 20 generated TV
-  JPEGs only**. Its metadata links each rendition to the original's relative path
+- ResourceSpace manages **copies of the approved TV JPEGs only** (20 in the
+  initial pilot, 365 in an annual library). Metadata links each to the original's relative path
   and verified SHA-256. Originals are **not** uploaded, moved, indexed by
   StaticSync, or re-encoded. Do not describe this as original-file ingestion.
 - ResourceSpace's SQL database, installer configuration and writable managed
@@ -95,7 +97,8 @@ violate the pilot's source-preservation model.
 ## Portable input manifest
 
 Keep this manifest and the catalog metadata with the NAS library, not solely in
-ResourceSpace's database. Exactly 20 `items` are required. Every item has stable
+ResourceSpace's database. Exactly 20 `items` are required by default; pass an
+explicit `--expected-count` when expanding. Every item has stable
 identity, explicit rights, an AI flag, original/rendition paths and both checksums:
 
 ```json
@@ -182,7 +185,96 @@ are rejected rather than silently selected.
 Save the successful JSON report in the private deployment record. It contains the
 ResourceSpace collection ID and resource IDs, no credentials. The script also
 confirms source checksums after import. Do not configure FrameArt until the report
-confirms exactly 20 resources and the real catalog previews have been reviewed.
+confirms the expected resource count and the real catalog previews have been reviewed.
+
+## Expand an existing pilot to 365
+
+Validate the complete portable manifest against the read-only source roots first:
+
+```bash
+python -m scripts.resourcespace_pilot \
+  --manifest /path/to/Artwork/collections/artwork-metadata-365.json \
+  --originals-root /path/to/Artwork/originals \
+  --renditions-root /path/to/Artwork/renditions \
+  --expected-count 365 \
+  --collection-name 'FrameArt — 20 artwork pilot' \
+  --dry-run
+```
+
+The collection-name override deliberately expands the already shared pilot
+collection without editing the NAS manifest or changing the reader's scope.
+Use the actual existing collection name, not a guessed ID. The name can remain
+historical; it does not limit the catalog's size. Repeat with `--apply` only
+after validation and explicit approval for the catalog import. Existing stable
+artwork IDs and matching checksums are reused; rerunning does not duplicate
+uploads. The runtime reader still has no upload, edit or delete permissions.
+
+FrameArt requests bounded `offset,count` pages and validates ResourceSpace's
+reported total, ordering, identities and page lengths. A truncated, duplicate,
+changing or over-limit response never replaces the previous cached snapshot.
+The refresh API returns `202`; poll cached `GET /art-catalog` for its `sync`
+progress. Neither polling nor browsing scans the NAS or sends commands to TVs.
+
+## Daily Art calendar and delivery
+
+Import a calendar in **Modes → Daily Art** using this schema (512KiB maximum):
+
+```json
+{
+  "year": 2027,
+  "timezone": "America/New_York",
+  "entries": [
+    {"date": "2027-01-01", "artwork_id": "stable-artwork-id"},
+    {"date": "2027-01-02", "artwork_id": "another-stable-artwork-id"}
+  ]
+}
+```
+
+The example is a partial two-day calendar. A full annual file contains 365 dates,
+or 366 for a leap year, with unique dates and artwork IDs within that year.
+All referenced artwork must already be cached in FrameArt. Optional entry fields
+are `month`, `day_of_year`, `season` and `occasion`; dates must match the declared
+year. A 2027 calendar cannot authorize a 2026 selection. Adjacent years can coexist;
+importing one replaces only that year's calendar. Plan movable holidays for the
+actual year rather than copying their month/day from another year.
+
+Select a configured TV/group, local timezone and change time, then explicitly
+enable Daily Art. Configuration and calendar writes require an admin token.
+Family albums can share a TV with Daily Art without changing their settings.
+A genuinely new album photo wins over that TV's daily artwork: priority is
+recorded before delivery, and shared per-TV arbitration prevents stale in-flight
+or hourly daily retries from overwriting it. Once the photo is safely shown,
+the hold lasts until the next local midnight, not a fixed 24 hours. If the TV is
+being watched, the photo stays pending and retains priority across midnight.
+Unchanged polls or falling back to an already known older photo do not renew
+priority. Clearing manual holds never clears family-album priority. Detection
+uses the existing polling interval; it is not an instant iCloud push.
+
+An enabled overlapping sports feed still blocks Daily Art. No mode is silently disabled.
+
+The durable worker considers only today's due artwork. Busy, offline and unknown
+TV states defer it; they do not advance a playlist or wake the TV. The default
+change time is local midnight; unsuccessful TVs retry on a fixed hourly cadence.
+Successful group members are skipped on retry. A committed but uncertain dispatch is held
+instead of being blindly repeated after a timeout or restart. An uncertain
+per-TV selection is checked read-only each hour; only a known matching image
+and confirmed TV state can authorize a safe retry. Unknown uploads remain held.
+Pause/target/manual
+hold changes are rechecked before upload and final selection. A manual FrameArt
+selection wins for the rest of the local day; clearing a hold is not a command
+to replay an already confirmed daily selection.
+
+Only full-frame 3840×2160 RGB JPEG TV renditions are delivered, with matte `none`.
+ResourceSpace downloads use the configured origin, bounded bytes, no redirects
+and redacted transport logging. The browser receives only cached local previews,
+never signed rendition URLs or a ResourceSpace key. Local full-resolution caching
+is bounded to eight renditions, separate from NAS originals.
+
+Daily retention considers only files uploaded and still verifiably owned by this
+mode. It never deletes unrelated photos, manual selections, the actual current
+image, or files with unknown identity. A factory-reset/recycled content ID is
+not ownership proof. The application's actual per-TV pairing and image identity
+checks must pass before reusing a mapping or deleting an old owned upload.
 
 ## Connect FrameArt
 
@@ -225,7 +317,9 @@ Before expanding past the pilot, verify:
 3. Both source mounts are read-only and original SHA-256 values are unchanged.
 4. Re-running import creates no additional records or uploads.
 5. Catalog service/NAS outage preserves cached information and never deletes art.
-6. No scheduled job or catalog operation sends artwork to a TV or interrupts viewing.
+6. Browsing and refresh send no TV commands. Opt-in delivery and scheduling leave
+   active viewing and unknown TV status untouched, including status changes
+   between the initial check and the actual upload/selection connection.
 7. Database/configuration/filestore backups and portable metadata exports are
    recoverable independently of FrameArt.
 

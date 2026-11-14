@@ -77,13 +77,83 @@ def test_collection_search_is_bounded_and_posts_no_secret(install_transport):
         outer = parse_qs(request.content.decode())
         inner = parse_qs(outer["query"][0])
         assert inner["search"] == ["!collection9"]
-        assert inner["fetchrows"] == ["0,20"]
+        assert inner["fetchrows"] == ["0,100"]
         assert inner["archive"] == ["0"]
         return httpx.Response(200, json={"total": 1, "data": [{"ref": "7"}]})
 
     install_transport(handler)
     client = ResourceSpaceClient("http://catalog.local", "reader", "private-key")
     assert client.collection_resources(9) == [{"ref": "7"}]
+
+
+@pytest.mark.parametrize("count", [0, 20, 100, 365, 1000])
+def test_collection_reads_every_ordered_page_without_truncation(install_transport, count):
+    offsets = []
+    rows = [{"ref": str(ref)} for ref in range(1, count + 1)]
+
+    def handler(request):
+        inner = parse_qs(parse_qs(request.content.decode())["query"][0])
+        offset, limit = map(int, inner["fetchrows"][0].split(","))
+        offsets.append(offset)
+        assert limit == 100
+        assert inner["order_by"] == ["resourceid"]
+        assert inner["sort"] == ["asc"]
+        return httpx.Response(
+            200, json={"total": str(count), "data": rows[offset : offset + limit]}
+        )
+
+    install_transport(handler)
+    assert (
+        ResourceSpaceClient("http://catalog.local", "reader", "key").collection_resources(9) == rows
+    )
+    assert offsets == list(range(0, max(count, 1), 100))
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        [],
+        {"data": []},
+        {"total": True, "data": []},
+        {"total": -1, "data": []},
+        {"total": "²", "data": []},
+        {"total": "9" * 5000, "data": []},
+        {"total": 1001, "data": []},
+        {"total": 1, "data": []},
+        {"total": 0, "data": [{"ref": 1}]},
+        {"total": 1, "data": [{"ref": True}]},
+        {"total": 1, "data": [{"ref": "²"}]},
+        {"total": 1, "data": [{"ref": "9" * 5000}]},
+        {"total": 1, "data": [{"ref": 0}]},
+        {"total": 2, "data": [{"ref": 1}, {"ref": "1"}]},
+        {"total": 2, "data": [{"ref": 2}, {"ref": 1}]},
+    ],
+)
+def test_collection_rejects_invalid_incomplete_or_oversized_pages(install_transport, result):
+    install_transport(lambda request: httpx.Response(200, json=result))
+    with pytest.raises(ResourceSpaceError):
+        ResourceSpaceClient("http://catalog.local", "reader", "key").collection_resources(9)
+
+
+@pytest.mark.parametrize("failure", ["repeated", "changed_total", "short_page"])
+def test_collection_rejects_repeated_or_changing_second_page(install_transport, failure):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        rows = [{"ref": ref} for ref in range(1, 101)]
+        if len(calls) == 1:
+            return httpx.Response(200, json={"total": 200, "data": rows})
+        if failure == "changed_total":
+            return httpx.Response(200, json={"total": 199, "data": []})
+        if failure == "short_page":
+            return httpx.Response(200, json={"total": 200, "data": []})
+        return httpx.Response(200, json={"total": 200, "data": rows})
+
+    install_transport(handler)
+    with pytest.raises(ResourceSpaceError):
+        ResourceSpaceClient("http://catalog.local", "reader", "key").collection_resources(9)
+    assert len(calls) == 2  # No unbounded loop when an upstream ignores offsets.
 
 
 def test_upstream_error_bodies_and_urls_are_not_exposed(install_transport):
@@ -272,6 +342,112 @@ def test_limits_download_bytes_before_caching(install_transport, monkeypatch):
     install_transport(handler)
     with pytest.raises(ResourceSpaceError, match="size limit"):
         ResourceSpaceClient("http://catalog.local", "reader", "key").thumbnail(7)
+
+
+def test_rendition_requests_existing_full_jpeg_without_generation_or_metadata_writes(
+    install_transport, caplog
+):
+    caplog.set_level(logging.INFO, logger="httpx2")
+
+    def handler(request):
+        if request.method == "POST":
+            inner = parse_qs(parse_qs(request.content.decode())["query"][0], keep_blank_values=True)
+            assert inner["function"] == ["get_resource_path"]
+            assert inner["ref"] == ["7"]
+            assert inner["size"] == [""]
+            assert inner["extension"] == ["jpg"]
+            assert inner["generate"] == ["0"]
+            assert inner["write_metadata"] == ["0"]
+            return httpx.Response(
+                200, json="http://catalog.local/full.jpg?access_key=RENDER-SECRET"
+            )
+        return httpx.Response(200, content=b"raw-jpeg-bytes")
+
+    install_transport(handler)
+    assert (
+        ResourceSpaceClient("http://catalog.local", "reader", "key").rendition(7)
+        == b"raw-jpeg-bytes"
+    )
+    assert "RENDER-SECRET" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "https://other.local/full.jpg",
+        "//other.local/full.jpg",
+        "http://reader:secret@catalog.local/full.jpg",
+        "http://catalog.local:8187/full.jpg",
+        "http://catalog.local/full.jpg#fragment",
+        "file:///etc/passwd",
+    ],
+)
+def test_rendition_rejects_other_origins_credentials_and_fragments(install_transport, location):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json=location)
+
+    install_transport(handler)
+    with pytest.raises(ResourceSpaceError, match="configured server"):
+        ResourceSpaceClient("http://catalog.local", "reader", "key").rendition(7)
+    assert len(requests) == 1
+
+
+def test_rendition_never_follows_redirects(install_transport):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.method == "POST":
+            return httpx.Response(200, json="http://catalog.local/full.jpg")
+        return httpx.Response(302, headers={"Location": "http://other.local/private"})
+
+    install_transport(handler)
+    with pytest.raises(ResourceSpaceError, match="rendition"):
+        ResourceSpaceClient("http://catalog.local", "reader", "key").rendition(7)
+    assert len(requests) == 2
+
+
+def test_rendition_invalid_ipv6_url_fails_without_exposing_details(install_transport):
+    install_transport(lambda request: httpx.Response(200, json="http://[bad?access_key=SECRET"))
+    with pytest.raises(ResourceSpaceError, match="invalid rendition location") as error:
+        ResourceSpaceClient("http://catalog.local", "reader", "key").rendition(7)
+    assert "SECRET" not in str(error.value)
+
+
+def test_rendition_enforces_streaming_32_mib_limit(install_transport, monkeypatch):
+    assert resourcespace.MAX_RENDITION_BYTES == 32 * 1024 * 1024
+    monkeypatch.setattr(resourcespace, "MAX_RENDITION_BYTES", 5)
+
+    def handler(request):
+        if request.method == "POST":
+            return httpx.Response(200, json="http://catalog.local/full.jpg")
+        return httpx.Response(200, content=b"123456")
+
+    install_transport(handler)
+    with pytest.raises(ResourceSpaceError, match="size limit"):
+        ResourceSpaceClient("http://catalog.local", "reader", "key").rendition(7)
+
+
+@pytest.mark.parametrize("missing", [False, None])
+def test_rendition_requires_an_existing_file(install_transport, missing):
+    install_transport(
+        lambda request: httpx.Response(200, content=b"null" if missing is None else b"false")
+    )
+    with pytest.raises(ResourceSpaceError, match="unavailable"):
+        ResourceSpaceClient("http://catalog.local", "reader", "key").rendition(7)
+
+
+@pytest.mark.parametrize("ref", [True, 0, -1, "7"])
+def test_rendition_rejects_invalid_references_before_network(install_transport, ref):
+    def handler(request):
+        raise AssertionError("Invalid references must never reach ResourceSpace")
+
+    install_transport(handler)
+    with pytest.raises(ResourceSpaceError, match="positive integer"):
+        ResourceSpaceClient("http://catalog.local", "reader", "key").rendition(ref)
 
 
 @pytest.mark.parametrize(

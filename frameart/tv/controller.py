@@ -34,6 +34,8 @@ TV_PREFLIGHT_TIMEOUT = 3.0
 # Convert images to JPEG to keep size reasonable.
 _JPEG_QUALITY = 95
 _MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB safety threshold
+_GUARDED_MUTATION_SKIPPED = object()
+
 
 @dataclass
 class TVStatus:
@@ -53,6 +55,7 @@ class UploadResult:
     content_id: str
     success: bool
     error: str | None = None
+    deferred: bool = False
 
 
 class TVOperationError(RuntimeError):
@@ -65,6 +68,10 @@ class TVOperationBusyError(TVOperationError):
 
 class TVOperationTimeoutError(TVOperationError):
     """Raised when an active TV operation exceeds its response deadline."""
+
+
+class TVNotInArtModeError(TVOperationError):
+    """A guarded mutation was refused before sending it to the TV."""
 
 
 class _TVOperationGate:
@@ -182,7 +189,10 @@ def _connect(profile: TVProfile, *, timeout: float = DEFAULT_TIMEOUT) -> Samsung
 
     logger.debug(
         "Connecting to %s:%d token_file=%s (exists=%s)",
-        profile.ip, profile.port, token_file, Path(token_file).is_file(),
+        profile.ip,
+        profile.port,
+        token_file,
+        Path(token_file).is_file(),
     )
 
     return SamsungTVWS(
@@ -205,7 +215,10 @@ def _connect_art(profile: TVProfile) -> SamsungTVArt:
 
     logger.debug(
         "Connecting art to %s:%d token_file=%s (exists=%s)",
-        profile.ip, profile.port, token_file, Path(token_file).is_file(),
+        profile.ip,
+        profile.port,
+        token_file,
+        Path(token_file).is_file(),
     )
 
     return SamsungTVArt(
@@ -234,13 +247,20 @@ def _retry(
             last_error = e
             logger.debug(
                 "%s error detail (attempt %d): %s: %s",
-                description, attempt + 1, type(e).__name__, e,
+                description,
+                attempt + 1,
+                type(e).__name__,
+                e,
             )
             if attempt < MAX_RETRIES - 1:
                 wait = RETRY_BACKOFF[attempt]
                 logger.warning(
                     "%s failed (attempt %d/%d): %s — retrying in %ds",
-                    description, attempt + 1, MAX_RETRIES, e, wait,
+                    description,
+                    attempt + 1,
+                    MAX_RETRIES,
+                    e,
+                    wait,
                 )
                 if cancel_event is not None:
                     if cancel_event.wait(wait):
@@ -252,7 +272,9 @@ def _retry(
             else:
                 logger.error(
                     "%s failed after %d attempts: %s",
-                    description, MAX_RETRIES, e,
+                    description,
+                    MAX_RETRIES,
+                    e,
                 )
     raise RuntimeError(f"{description} failed after {MAX_RETRIES} attempts: {last_error}")
 
@@ -281,13 +303,13 @@ def pair(profile: TVProfile) -> bool:
 
         secrets_dir = _default_data_dir() / "secrets"
         secrets_dir.mkdir(parents=True, exist_ok=True)
-        profile.token_file = str(
-            secrets_dir / f"{profile.ip.replace('.', '_')}.token"
-        )
+        profile.token_file = str(secrets_dir / f"{profile.ip.replace('.', '_')}.token")
 
     logger.info(
         "Pairing with TV at %s:%d (token will be saved to %s)",
-        profile.ip, profile.port, profile.token_file,
+        profile.ip,
+        profile.port,
+        profile.token_file,
     )
 
     tv = _connect(profile)
@@ -343,6 +365,7 @@ def _run_tv_op(
     *,
     priority: str = "mutation",
     cancel=None,
+    retry: bool = True,
 ):
     """Run a TV operation through a cancellable, priority-aware device gate.
 
@@ -373,7 +396,9 @@ def _run_tv_op(
 
     def _inner():
         try:
-            return _retry(func, description, cancel_event=cancel_event)
+            if retry:
+                return _retry(func, description, cancel_event=cancel_event)
+            return func()
         finally:
             gate.release(lease)
 
@@ -398,8 +423,7 @@ def _frame_support_from_device_info(device_info: dict[str, Any]) -> bool:
     device = device_info.get("device", {})
     is_support_str = device_info.get("isSupport", "{}")
     return (
-        isinstance(device, dict)
-        and device.get("FrameTVSupport") == "true"
+        isinstance(device, dict) and device.get("FrameTVSupport") == "true"
     ) or '"FrameTVSupport":"true"' in str(is_support_str)
 
 
@@ -409,6 +433,7 @@ def preflight_tv(
     timeout_sec: float = TV_PREFLIGHT_TIMEOUT,
 ) -> TVStatus:
     """Run a short REST-only reachability and Frame capability check."""
+
     def _probe() -> dict[str, Any]:
         tv = _connect(profile, timeout=max(0.1, timeout_sec))
         try:
@@ -488,7 +513,8 @@ def get_status(profile: TVProfile) -> TVStatus:
 
 
 def _prepare_image_for_tv(
-    image_bytes: bytes, file_type: str,
+    image_bytes: bytes,
+    file_type: str,
 ) -> tuple[bytes, str]:
     """Convert image to JPEG for TV upload if needed.
 
@@ -500,13 +526,15 @@ def _prepare_image_for_tv(
     size_mb = len(image_bytes) / (1024 * 1024)
     logger.debug(
         "Preparing image for TV: input_format=%s input_size=%.2f MB",
-        file_type, size_mb,
+        file_type,
+        size_mb,
     )
 
     if file_type.upper() in ("PNG",) or len(image_bytes) > _MAX_UPLOAD_BYTES:
         logger.info(
             "Converting %s (%.1f MB) to JPEG for TV upload",
-            file_type, size_mb,
+            file_type,
+            size_mb,
         )
         img = Image.open(io.BytesIO(image_bytes))
         img = ImageOps.exif_transpose(img)
@@ -531,6 +559,8 @@ def upload_image(
     image_bytes: bytes,
     file_type: str = "PNG",
     matte: str = "none",
+    *,
+    require_art_mode: bool = False,
 ) -> UploadResult:
     """Upload an image to the TV's art collection.
 
@@ -564,7 +594,8 @@ def upload_image(
     # Validate image bytes before attempting upload
     if len(upload_bytes) < 100:
         return UploadResult(
-            content_id="", success=False,
+            content_id="",
+            success=False,
             error=f"Image too small ({len(upload_bytes)} bytes) — likely corrupt",
         )
     if ft == "jpg" and upload_bytes[:2] != b"\xff\xd8":
@@ -572,21 +603,36 @@ def upload_image(
 
     logger.info(
         "Uploading %s image (%.1f KB, file_type=%s, matte=%s)",
-        upload_type, len(upload_bytes) / 1024, ft, effective_matte,
+        upload_type,
+        len(upload_bytes) / 1024,
+        ft,
+        effective_matte,
     )
 
-    def _do_upload(art: SamsungTVArt) -> str:
+    def _do_upload(art: SamsungTVArt):
+        if require_art_mode:
+            try:
+                confirmed = _art_mode_is_on(art.get_artmode())
+            except Exception:
+                return _GUARDED_MUTATION_SKIPPED
+            if not confirmed:
+                return _GUARDED_MUTATION_SKIPPED
         logger.debug(
-            "Upload details: host=%s port=%d size=%d bytes file_type=%s "
-            "matte=%s token_file=%s",
-            profile.ip, profile.port, len(upload_bytes), ft,
-            effective_matte, art.token_file,
+            "Upload details: host=%s port=%d size=%d bytes file_type=%s matte=%s token_file=%s",
+            profile.ip,
+            profile.port,
+            len(upload_bytes),
+            ft,
+            effective_matte,
+            art.token_file,
         )
 
         # samsungtvws v3.x handles API version detection, WS binary (0.97),
         # D2D socket (modern), SSL, request_id, and sendall internally.
         content_id = art.upload(
-            file=upload_bytes, matte=effective_matte, file_type=ft,
+            file=upload_bytes,
+            matte=effective_matte,
+            file_type=ft,
         )
         logger.debug("TV returned content_id=%s", content_id)
         return content_id
@@ -597,9 +643,19 @@ def upload_image(
             _do_upload,
             "Upload image",
             timeout_sec=60,
+            retry=not require_art_mode,
         )
+        if content_id is _GUARDED_MUTATION_SKIPPED:
+            return UploadResult(
+                content_id="",
+                success=False,
+                error="TV Art Mode was not confirmed.",
+                deferred=True,
+            )
         logger.info("Uploaded image, content_id=%s", content_id)
         return UploadResult(content_id=content_id, success=True)
+    except TVNotInArtModeError as exc:
+        return UploadResult(content_id="", success=False, error=str(exc), deferred=True)
     except Exception as e:
         error_msg = str(e)
         if isinstance(e, TimeoutError):
@@ -630,6 +686,7 @@ def _run_art_call(
     *,
     timeout_sec: float = TV_OP_TIMEOUT,
     priority: str = "mutation",
+    retry: bool = True,
 ):
     """Run one art-service call with its own connection and deadline."""
 
@@ -667,15 +724,14 @@ def _run_art_call(
             # wake either blocking receive path.
             open_d2d = getattr(art, "_open_d2d_socket", None)
             if callable(open_d2d):
+
                 def _open_tracked_socket(*args, **kwargs):
                     sock = open_d2d(*args, **kwargs)
                     with state_lock:
                         if cancelled.is_set():
                             with contextlib.suppress(Exception):
                                 sock.close()
-                            raise TVOperationTimeoutError(
-                                f"{description}: cancelled after timeout"
-                            )
+                            raise TVOperationTimeoutError(f"{description}: cancelled after timeout")
                         active_sockets.add(sock)
                     return sock
 
@@ -686,9 +742,7 @@ def _run_art_call(
                 should_abort = cancelled.is_set()
             if should_abort:
                 _abort_art(art)
-                raise TVOperationTimeoutError(
-                    f"{description}: cancelled after timeout"
-                )
+                raise TVOperationTimeoutError(f"{description}: cancelled after timeout")
             return func(art)
         finally:
             with state_lock:
@@ -706,6 +760,7 @@ def _run_art_call(
         timeout_sec=timeout_sec,
         priority=priority,
         cancel=_cancel,
+        retry=retry,
     )
 
 
@@ -713,7 +768,9 @@ def _art_mode_is_on(value: Any) -> bool:
     """Normalize the bool/string states returned by different TV generations."""
     if isinstance(value, str):
         return value.strip().lower() in {"1", "on", "true", "yes"}
-    return bool(value)
+    if isinstance(value, bool):
+        return value
+    return isinstance(value, int) and value == 1
 
 
 def _content_id_from_current(value: Any) -> str | None:
@@ -824,14 +881,31 @@ def switch_art(
             # Selection still gets its own connection and deadline below.
             logger.warning("Could not enable art mode before switching: %s", exc)
 
+    def _select(art: SamsungTVArt):
+        # Check again on the connection that sends the actual selection. A TV
+        # can leave Art Mode after the earlier advisory read.
+        if require_art_mode:
+            try:
+                confirmed = _art_mode_is_on(art.get_artmode())
+            except Exception:
+                return _GUARDED_MUTATION_SKIPPED
+            if not confirmed:
+                return _GUARDED_MUTATION_SKIPPED
+        art.select_image(content_id)
+
     try:
-        _run_art_call(
+        result = _run_art_call(
             profile,
-            lambda art: art.select_image(content_id),
+            _select,
             f"Switch art to {content_id}",
+            retry=not require_art_mode,
         )
+        if result is _GUARDED_MUTATION_SKIPPED:
+            return False
         logger.info("Switched display to content_id=%s", content_id)
         return True
+    except TVNotInArtModeError:
+        return False
     except Exception as exc:
         logger.warning("Artwork selection did not complete for %s: %s", content_id, exc)
 
@@ -897,6 +971,7 @@ def get_art_thumbnail(profile: TVProfile, content_id: str) -> bytes | None:
 
     Returns ``None`` if the TV does not provide a thumbnail for the content.
     """
+
     def _do_thumbnail(art: SamsungTVArt) -> bytes | None:
         data = art.get_thumbnail(content_id)
         if isinstance(data, (bytes, bytearray)):
@@ -1001,7 +1076,12 @@ def get_matte_list(profile: TVProfile) -> list[dict[str, str]]:
     return _normalize_matte_types(result)
 
 
-def delete_art(profile: TVProfile, content_ids: list[str]) -> bool:
+def delete_art(
+    profile: TVProfile,
+    content_ids: list[str],
+    *,
+    require_art_mode: bool = False,
+) -> bool:
     """Delete artworks from the TV by content ID.
 
     Parameters
@@ -1010,22 +1090,67 @@ def delete_art(profile: TVProfile, content_ids: list[str]) -> bool:
         TV connection profile.
     content_ids:
         List of content IDs to delete (e.g., ``["MY_F0006", "MY_F0007"]``).
+    require_art_mode:
+        Refuse cleanup unless the actual deletion connection confirms Art Mode
+        and identifies a current artwork outside the requested deletion list.
 
     Returns
     -------
     True on success, False on failure.
     """
-    def _do_delete() -> None:
+
+    def _do_delete() -> bool:
         art = None
         try:
             art = _connect_art(profile)
+            if require_art_mode:
+                try:
+                    confirmed = _art_mode_is_on(art.get_artmode())
+                    current_state = art.get_current() if confirmed else None
+                    candidate = (
+                        current_state.get("content_id")
+                        if isinstance(current_state, dict)
+                        else current_state
+                    )
+                    current = (
+                        _content_id_from_current(current_state)
+                        if isinstance(candidate, str)
+                        else None
+                    )
+                except Exception as exc:
+                    raise TVNotInArtModeError(
+                        "TV Art Mode or current artwork could not be confirmed."
+                    ) from exc
+                current = current.strip() if current else None
+                if (
+                    not confirmed
+                    or not current
+                    or current.lower() in {"unknown", "none", "null", "unavailable", "off", "on"}
+                    or current in content_ids
+                ):
+                    raise TVNotInArtModeError(
+                        "Cleanup deferred; the TV is in use or requested artwork may be displayed."
+                    )
             art.delete_list(content_ids)
+            return True
+        except TVNotInArtModeError:
+            # A safety refusal is a completed check, not a transient transport
+            # failure. Return it before the common retry layer can repeat it.
+            return False
         finally:
             with contextlib.suppress(Exception):
                 art.close()
 
     try:
-        _run_tv_op(profile, _do_delete, f"Delete {len(content_ids)} artwork(s)")
+        deleted = _run_tv_op(
+            profile,
+            _do_delete,
+            f"Delete {len(content_ids)} artwork(s)",
+            retry=not require_art_mode,
+        )
+        if deleted is False:
+            logger.info("Skipped guarded artwork cleanup because TV state was unsafe")
+            return False
         logger.info("Deleted %d artwork(s): %s", len(content_ids), ", ".join(content_ids))
         return True
     except Exception as e:
@@ -1049,6 +1174,7 @@ def change_matte(profile: TVProfile, content_id: str, matte_id: str) -> bool:
     -------
     True on success, False on failure.
     """
+
     def _do_change_matte() -> None:
         art = None
         try:

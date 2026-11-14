@@ -12,6 +12,12 @@
   let services;
   let snapshot = null;
   let loading = false;
+  let visibleCount = 24;
+  let pollTimer = null;
+  let targets = [];
+  let targetError = '';
+  let selectedItem = null;
+  let sending = false;
 
   function esc(value) {
     return String(value ?? '').replace(/[&<>"']/g, (char) => ({
@@ -70,8 +76,10 @@
       item.title, creator(item), item.date, item.medium, item.movement, ...(item.tags || []),
     ].join(' ').toLocaleLowerCase().includes(query));
     document.getElementById('art-catalog-tools').hidden = !items.length;
-    document.getElementById('art-catalog-count').textContent = filtered.length + ' of ' + items.length + ' artworks';
-    grid.innerHTML = filtered.map((item) => '<article class="art-catalog-card"><button type="button" data-art-catalog-id="' +
+    document.getElementById('art-catalog-count').textContent = 'Showing ' + Math.min(visibleCount, filtered.length) +
+      ' of ' + filtered.length + ' artworks' + (query ? ' matching your search' : '');
+    document.getElementById('art-catalog-more').hidden = visibleCount >= filtered.length;
+    grid.innerHTML = filtered.slice(0, visibleCount).map((item) => '<article class="art-catalog-card"><button type="button" data-art-catalog-id="' +
       esc(item.id) + '" aria-label="Artwork details: ' + esc(item.title) + '">' + image(item) +
       '<span class="art-catalog-caption"><strong>' + esc(item.title) + '</strong><span>' +
       esc(creator(item)) + (item.date ? ' · ' + esc(item.date) : '') + '</span>' +
@@ -81,7 +89,7 @@
     if (items.length && !filtered.length) empty.textContent = 'No artwork matches this search. Try another artist, title or tag.';
     else if (snapshot?.configured === false) {
       empty.textContent = 'ResourceSpace is not connected yet. Configure FRAMEART_RESOURCESPACE_URL, FRAMEART_RESOURCESPACE_USER, FRAMEART_RESOURCESPACE_API_KEY and FRAMEART_RESOURCESPACE_COLLECTION on the FrameArt server, then reopen Library. The pilot setup guide explains the read-only NAS configuration.';
-    } else empty.textContent = 'No artwork has been cached yet. Refresh metadata after the 20-artwork pilot collection is ready in ResourceSpace.';
+    } else empty.textContent = 'No artwork has been cached yet. Refresh metadata to import the artwork collection from ResourceSpace.';
     wireImageFallbacks(grid);
   }
 
@@ -96,10 +104,17 @@
     status.dataset.state = state;
     if (snapshot?.configured === false) status.textContent = 'Not connected · Originals are not being scanned or changed.';
     else if (state === 'stale') status.textContent = 'ResourceSpace unavailable · Showing the last successfully cached catalog.';
-    else if ((snapshot?.items || []).length) status.textContent = 'Local catalog · ' + snapshot.items.length + ' artworks · Read-only ResourceSpace integration';
+    else if ((snapshot?.items || []).length) status.textContent = 'Local catalog · ' + snapshot.items.length + ' artworks · Originals remain in ResourceSpace';
     else status.textContent = 'ResourceSpace configured · Waiting for the first successful metadata refresh.';
     const when = lastSynced(snapshot?.last_synced_at);
     if (when) status.textContent += ' · Last refreshed ' + when;
+    const sync = snapshot?.sync || snapshot?.sync_job || snapshot?.sync_progress;
+    if (sync && ['running', 'queued', 'pending'].includes(sync.status)) {
+      status.textContent += ' · Refreshing in the background' +
+        (sync.completed !== undefined ? ' · ' + sync.completed + (sync.total ? ' / ' + sync.total : '') : '');
+      clearTimeout(pollTimer);
+      pollTimer = setTimeout(() => load(), 1800);
+    }
     errorBox.hidden = !snapshot?.error;
     errorBox.textContent = snapshot?.error || '';
     renderCards();
@@ -121,6 +136,7 @@
   }
 
   function showDetails(item) {
+    selectedItem = item;
     const artist = item.artist || {};
     const lifespan = [artist.birth_year, artist.death_year].filter((value) => value !== null && value !== undefined && value !== '').join('–');
     detail.innerHTML = '<h2 id="art-catalog-detail-title">' + esc(item.title) + '</h2><p class="art-catalog-detail-artist">' +
@@ -145,9 +161,86 @@
         'This work is labeled as AI-created; it is not attributed to a historical or living artist.' :
         'An artist biography has not been added yet.')) + '</p>' +
       (item.ai_generated ? '<dl class="art-catalog-facts">' + fact('AI provenance', item.ai_provenance) + '</dl>' : '') +
-      '<div class="art-catalog-links">' + link('Artist reference', artist.source_url) + '</div>';
+      '<div class="art-catalog-links">' + link('Artist reference', artist.source_url) + '</div>' +
+      '<section class="art-catalog-send"><h3>Send this artwork to your Frame</h3>' +
+      '<label for="art-catalog-target">TV or TV group</label><select id="art-catalog-target" autocomplete="off" data-1p-ignore="true">' +
+      targetOptions() + '</select><p class="hint">Only TVs confirmed to be in Art Mode can change artwork. Active viewing, offline TVs, or an uncertain status leave the screen untouched.</p>' +
+      '<button class="btn" id="art-catalog-send" type="button"' + (!targets.length ? ' disabled' : '') + '>Send to TV</button>' +
+      '<p id="art-catalog-delivery" class="art-catalog-delivery" role="status" aria-live="polite"></p></section>';
     wireImageFallbacks(detail);
+    detail.querySelector('#art-catalog-send').addEventListener('click', sendArtwork);
     dialog.showModal();
+  }
+
+  function targetOptions() {
+    if (targetError) return '<option value="">' + esc(targetError) + '</option>';
+    if (!targets.length) return '<option value="">No TVs configured — add one in Settings</option>';
+    return targets.map((target, index) => '<option value="' + index + '">' + esc(target.label) + '</option>').join('');
+  }
+
+  async function loadTargets() {
+    const [tvResponse, groupResponse] = await Promise.all([
+      services.apiFetch('/settings/tvs'), services.apiFetch('/automation/groups'),
+    ]);
+    const tvPayload = await services.parseJSONResponse(tvResponse, 'Could not load configured TVs.');
+    const groups = await services.parseJSONResponse(groupResponse, 'Could not load TV groups.');
+    targets = [
+      ...(tvPayload.tvs || tvPayload || []).map((tv) => ({
+        target_type: 'tv', target_id: tv.profile_id || tv.id || tv.name,
+        label: 'TV · ' + (tv.profile_id || tv.name || tv.id) + (tv.ip ? ' (' + tv.ip + ')' : ''),
+      })),
+      ...(groups || []).map((group) => ({target_type: 'group', target_id: group.id, label: 'Group · ' + group.name})),
+    ];
+    targetError = '';
+    if (dialog.open && !sending) {
+      detail.querySelector('#art-catalog-target').innerHTML = targetOptions();
+      detail.querySelector('#art-catalog-send').disabled = !targets.length;
+    }
+  }
+
+  function deliveryMessage(job) {
+    const results = job.results || [];
+    return results.length ? results.map((result) => (result.tv || result.tv_profile_id || 'TV') + ': ' +
+      (result.status === 'displayed' ? 'Artwork displayed.' :
+        result.status === 'deferred' ? 'Skipped safely; the TV is busy or unavailable. Try again when it is in Art Mode.' :
+          result.detail || result.error || result.status)).join(' ') :
+      (job.error || (job.status === 'completed' ? 'Delivery finished.' : 'Preparing artwork…'));
+  }
+
+  async function sendArtwork() {
+    if (sending) return;
+    const button = detail.querySelector('#art-catalog-send');
+    const output = detail.querySelector('#art-catalog-delivery');
+    const target = targets[Number(detail.querySelector('#art-catalog-target').value)];
+    if (!target || !selectedItem) return;
+    sending = true;
+    button.disabled = true;
+    button.textContent = 'Sending…';
+    output.textContent = 'Preparing the Frame-ready image. This can take a moment.';
+    try {
+      const response = await services.apiFetch('/art-catalog/' + encodeURIComponent(selectedItem.id) + '/send', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({target_type: target.target_type, target_id: target.target_id}),
+      });
+      let job = await services.parseJSONResponse(response, 'Could not send the artwork.');
+      const id = job.id || job.job_id;
+      for (let attempt = 0; ['running', 'pending', 'queued'].includes(job.status) && attempt < 100; attempt += 1) {
+        output.textContent = deliveryMessage(job);
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+        const state = await services.apiFetch('/art-catalog/deliveries/' + encodeURIComponent(id));
+        job = await services.parseJSONResponse(state, 'Could not check artwork delivery.');
+      }
+      output.textContent = ['running', 'pending', 'queued'].includes(job.status)
+        ? 'Delivery is still running on the server. Reopen Library later to check the TV.' : deliveryMessage(job);
+      output.dataset.state = job.status === 'error' ? 'error' : 'done';
+    } catch (error) {
+      output.textContent = error.message || 'Could not send artwork. Please try again.';
+      output.dataset.state = 'error';
+    } finally {
+      sending = false;
+      button.disabled = !targets.length;
+      button.textContent = 'Send to TV';
+    }
   }
 
   async function load(sync = false) {
@@ -158,9 +251,15 @@
     root.setAttribute('aria-busy', 'true');
     errorBox.hidden = true;
     try {
-      const response = await services.apiFetch(sync ? '/art-catalog/sync' : '/art-catalog',
+      let response = await services.apiFetch(sync ? '/art-catalog/sync' : '/art-catalog',
         sync ? {method: 'POST'} : {});
-      const result = await services.parseJSONResponse(response, 'Could not load the artwork catalog.');
+      let result = await services.parseJSONResponse(response, 'Could not load the artwork catalog.');
+      if (sync && response.status === 202) {
+        response = await services.apiFetch('/art-catalog');
+        result = await services.parseJSONResponse(response, 'Could not load the cached artwork catalog.');
+        clearTimeout(pollTimer);
+        pollTimer = setTimeout(() => load(), 1800);
+      }
       if (!result || !Array.isArray(result.items)) throw new Error('The artwork catalog response was invalid.');
       snapshot = result;
       renderStatus();
@@ -184,7 +283,11 @@
     }
   }
 
-  search.addEventListener('input', renderCards);
+  search.addEventListener('input', () => { visibleCount = 24; renderCards(); });
+  document.getElementById('art-catalog-more').addEventListener('click', () => {
+    visibleCount += 24;
+    renderCards();
+  });
   refresh.addEventListener('click', () => load(true));
   grid.addEventListener('click', (event) => {
     const button = event.target.closest('[data-art-catalog-id]');
@@ -202,6 +305,11 @@
   window.FrameArtArtCatalog = {
     open(dependencies) {
       services = dependencies;
+      loadTargets().catch(() => {
+        targets = [];
+        targetError = 'TV targets could not be loaded. Reopen Library to retry.';
+        if (dialog.open && !sending) detail.querySelector('#art-catalog-target').innerHTML = targetOptions();
+      });
       return load();
     },
   };
