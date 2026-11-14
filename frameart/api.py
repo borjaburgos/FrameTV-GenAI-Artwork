@@ -76,6 +76,7 @@ from pydantic import AfterValidator, BaseModel, Field, SecretStr, field_validato
 import frameart.public_domain as public_domain
 from frameart import __version__
 from frameart.access import AccessStore, InvalidPairingCodeError
+from frameart.archive import ArchiveStore, protect_before_delete
 from frameart.art_catalog_api import create_art_catalog_router
 from frameart.art_delivery import CatalogDeliveryService
 from frameart.art_profile import ArtProfileRequest, ArtProfileStore, load_art_quiz
@@ -4024,6 +4025,10 @@ def delete_jobs(req: DeleteJobsRequest):
             continue
 
         try:
+            # Snapshot all eligible generations locally before removing any
+            # source. This never touches the NAS, even when it is offline.
+            for job_dir in job_dirs:
+                protect_before_delete(settings, job_dir)
             for job_dir in job_dirs:
                 shutil.rmtree(job_dir)
             _remove_library_thumbnail_cache(settings.data_dir, job_id)
@@ -4036,6 +4041,13 @@ def delete_jobs(req: DeleteJobsRequest):
     if deleted:
         _invalidate_artifact_dir_index(artifacts_dir)
     return DeleteJobsResponse(deleted=deleted, not_found=not_found, failed=failed)
+
+
+@app.get("/archive/status")
+def archive_status():
+    """Local queue/receipt status only; no NAS probe on a web request."""
+    settings = _settings()
+    return ArchiveStore(settings).status()
 
 
 @app.get("/jobs/{job_id}/image")

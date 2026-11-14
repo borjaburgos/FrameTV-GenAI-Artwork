@@ -738,11 +738,85 @@ def cleanup(ctx, older_than, dry_run):
                             if dry_run:
                                 click.echo(f"  Would delete: {job_dir}")
                             else:
+                                from frameart.archive import protect_before_delete
+
+                                protect_before_delete(settings, job_dir)
                                 shutil.rmtree(job_dir)
                             removed += 1
 
     action = "Would remove" if dry_run else "Removed"
     click.echo(f"{action} {removed} job(s) older than {older_than} days.")
+
+
+# --- generated-art NAS archive ---------------------------------------------
+
+
+@main.group("archive")
+@click.pass_context
+def archive_group(ctx):
+    """Append-only generated artwork archive (not full application backups)."""
+    _ensure_logging(ctx)
+
+
+def _archive_command(ctx, operation, **kwargs):
+    import json
+
+    from frameart.archive import ArchiveStore
+
+    try:
+        result = getattr(ArchiveStore(ctx.obj["settings"]), operation)(**kwargs)
+    except (OSError, ValueError, RuntimeError) as exc:
+        # Do not print NAS paths, identities, credentials or raw provider data.
+        raise click.ClickException(f"Archive {operation} failed ({type(exc).__name__}).") from exc
+    click.echo(json.dumps(result, sort_keys=True))
+    if result.get("failed") or result.get("errors"):
+        raise click.exceptions.Exit(1)
+    discovery = result.get("discovery")
+    if isinstance(discovery, dict) and discovery.get("errors"):
+        raise click.exceptions.Exit(1)
+
+
+@archive_group.command("status")
+@click.pass_context
+def archive_status_command(ctx):
+    """Show local pending/failed counts and verification timestamps."""
+    _archive_command(ctx, "status")
+
+
+@archive_group.command("backfill")
+@click.option("--limit", type=click.IntRange(min=1), default=None)
+@click.option("--dry-run", is_flag=True)
+@click.pass_context
+def archive_backfill(ctx, limit, dry_run):
+    """Inventory or locally queue existing generated artwork; never contact NAS."""
+    _archive_command(ctx, "backfill", limit=limit, dry_run=dry_run)
+
+
+@archive_group.command("run")
+@click.option("--limit", type=click.IntRange(min=1), default=25, show_default=True)
+@click.option("--discover/--no-discover", default=True, show_default=True)
+@click.option("--retry-now", is_flag=True, help="Retry failed copies without waiting five minutes.")
+@click.pass_context
+def archive_run(ctx, limit, discover, retry_now):
+    """Copy/verify pending generations in a separate worker process."""
+    _archive_command(ctx, "run", limit=limit, discover=discover, retry_now=retry_now)
+
+
+@archive_group.command("verify")
+@click.option("--key", required=True, help="YYYY/MM/DD/job-id")
+@click.pass_context
+def archive_verify(ctx, key):
+    """Re-read NAS bytes and verify the manifest and local receipt."""
+    _archive_command(ctx, "verify", key=key)
+
+
+@archive_group.command("restore")
+@click.option("--key", required=True, help="YYYY/MM/DD/job-id")
+@click.option("--output", required=True, type=click.Path(path_type=Path))
+@click.pass_context
+def archive_restore(ctx, key, output):
+    """Verify and restore to a NEW offline directory; never change TV playback."""
+    _archive_command(ctx, "restore", key=key, output=output)
 
 
 # --- data backup / restore --------------------------------------------------
