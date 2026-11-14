@@ -107,8 +107,13 @@ log/summary write error cannot turn a failed check green. A printed trace URL is
 not, on its own, proof of successful execution or receipt by the Cloud service;
 hosted execution and telemetry are verified separately.
 
-The GitHub-hosted verification run and its trace will be linked here after they
-pass. No hosted trace or cross-run cache success is claimed in advance.
+Verified [GitHub-hosted run](https://github.com/borjaburgos/FrameTV-GenAI-Artwork/actions/runs/43571729216)
+on commit `cf73867` passed all nine checks: 752 backend tests and 22 subtests on
+each Python version, 28 browser tests, lint, Docker, and generated-code validation.
+The [Dagger trace](https://dagger.cloud/borja/traces/623412a847bdae080e1a2441af24faf0)
+was independently confirmed through the Cloud API with successful status and the
+matching commit. This verifies GitHub-hosted execution and telemetry receipt,
+not shared cross-run caching.
 
 ## Source and cache boundaries
 
