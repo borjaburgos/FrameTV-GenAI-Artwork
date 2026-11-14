@@ -524,6 +524,9 @@
     if (pageName === 'automations') loadAutomations().catch((error) => {
       showToast(error?.message || 'Could not load automations.', 'error');
     });
+    if (pageName === 'modes' && window.FrameArtDailyArt) {
+      window.FrameArtDailyArt.open({apiFetch, parseJSONResponse, showToast});
+    }
     if (pageName === 'modes') loadLiveScores().catch((error) => {
       showToast(error?.message || 'Could not load live modes.', 'error');
     });

@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import call, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -16,10 +16,12 @@ from frameart.tv.controller import (
     _run_tv_op,
     _run_with_timeout,
     _tv_operation_gate,
+    delete_art,
     get_art_thumbnails,
     get_matte_list,
     preflight_tv,
     switch_art,
+    upload_image,
     wait_for_art,
 )
 
@@ -320,6 +322,251 @@ def test_switch_art_skips_enable_when_art_mode_is_already_on(mock_call):
 
     descriptions = [invocation.args[2] for invocation in mock_call.call_args_list]
     assert descriptions == ["Get art mode status", "Switch art to MY_F0006"]
+
+
+@pytest.mark.parametrize(
+    "mode", ["off", False, None, "unknown", {}, {"error": "unknown"}, ["unknown"], 2]
+)
+@patch("frameart.tv.controller._run_art_call")
+def test_guarded_upload_reads_actual_upload_connection_and_skips_non_art_mode(mock_call, mode):
+    profile = TVProfile(ip="192.168.1.207")
+    art = MagicMock()
+    art.get_artmode.return_value = mode
+    mock_call.side_effect = lambda _profile, callback, *_args, **_kwargs: callback(art)
+
+    result = upload_image(profile, b"\xff\xd8" + b"x" * 120, "JPEG", require_art_mode=True)
+
+    assert result.success is False
+    assert result.deferred is True
+    art.get_artmode.assert_called_once_with()
+    art.upload.assert_not_called()
+    art.select_image.assert_not_called()
+    art.set_artmode.assert_not_called()
+
+
+@patch("frameart.tv.controller._run_art_call")
+def test_guarded_upload_never_uploads_when_actual_connection_status_read_fails(mock_call):
+    profile = TVProfile(ip="192.168.1.207")
+    art = MagicMock()
+    art.get_artmode.side_effect = RuntimeError("status unavailable")
+    mock_call.side_effect = lambda _profile, callback, *_args, **_kwargs: callback(art)
+
+    result = upload_image(profile, b"\xff\xd8" + b"x" * 120, "JPEG", require_art_mode=True)
+
+    assert result.success is False
+    assert result.deferred is True
+    art.upload.assert_not_called()
+    art.select_image.assert_not_called()
+    art.set_artmode.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["on", "ON", " true ", True, 1])
+@patch("frameart.tv.controller._run_art_call")
+def test_guarded_upload_checks_art_mode_immediately_before_uploading(mock_call, mode):
+    profile = TVProfile(ip="192.168.1.207")
+    art = MagicMock()
+    art.get_artmode.return_value = mode
+    art.upload.return_value = "MY_F0007"
+    mock_call.side_effect = lambda _profile, callback, *_args, **_kwargs: callback(art)
+    payload = b"\xff\xd8" + b"x" * 120
+
+    result = upload_image(profile, payload, "JPEG", require_art_mode=True)
+
+    assert result.success is True
+    assert result.content_id == "MY_F0007"
+    assert result.deferred is False
+    assert art.mock_calls == [
+        call.get_artmode(), call.upload(file=payload, matte="none", file_type="jpg"),
+    ]
+
+
+@patch("frameart.tv.controller._run_art_call")
+def test_unguarded_upload_preserves_explicit_manual_upload_behavior(mock_call):
+    profile = TVProfile(ip="192.168.1.207")
+    art = MagicMock()
+    art.get_artmode.return_value = "off"
+    art.upload.return_value = "MY_F0007"
+    mock_call.side_effect = lambda _profile, callback, *_args, **_kwargs: callback(art)
+    payload = b"\xff\xd8" + b"x" * 120
+
+    result = upload_image(profile, payload, "JPEG")
+
+    assert result.success is True
+    assert result.deferred is False
+    art.get_artmode.assert_not_called()
+    art.upload.assert_called_once_with(file=payload, matte="none", file_type="jpg")
+
+
+@pytest.mark.parametrize(
+    "final_mode", ["off", False, None, "unknown", {}, {"error": "unknown"}, ["unknown"], 2]
+)
+@patch("frameart.tv.controller._run_art_call")
+def test_guarded_switch_rechecks_selection_connection_after_advisory_read(mock_call, final_mode):
+    profile = TVProfile(ip="192.168.1.208")
+    advisory = MagicMock()
+    advisory.get_artmode.return_value = "on"
+    selection = MagicMock()
+    selection.get_artmode.return_value = final_mode
+    connections = iter([advisory, selection])
+    def run_callback(_profile, callback, *_args, **_kwargs):
+        return callback(next(connections))
+
+    mock_call.side_effect = run_callback
+
+    assert switch_art(profile, "MY_F0008", require_art_mode=True) is False
+
+    advisory.get_artmode.assert_called_once_with()
+    selection.get_artmode.assert_called_once_with()
+    advisory.set_artmode.assert_not_called()
+    selection.set_artmode.assert_not_called()
+    selection.select_image.assert_not_called()
+    assert mock_call.call_count == 2
+
+
+@patch("frameart.tv.controller._get_current_artwork", return_value="MY_F0008")
+@patch("frameart.tv.controller._run_art_call")
+def test_guarded_switch_does_not_reconcile_when_final_mode_is_unknown(mock_call, mock_current):
+    profile = TVProfile(ip="192.168.1.208")
+    advisory = MagicMock()
+    advisory.get_artmode.return_value = "on"
+    selection = MagicMock()
+    selection.get_artmode.side_effect = RuntimeError("status unavailable")
+    connections = iter([advisory, selection])
+    def run_callback(_profile, callback, *_args, **_kwargs):
+        return callback(next(connections))
+
+    mock_call.side_effect = run_callback
+
+    assert switch_art(profile, "MY_F0008", require_art_mode=True) is False
+
+    selection.select_image.assert_not_called()
+    selection.set_artmode.assert_not_called()
+    mock_current.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["on", True, 1])
+@patch("frameart.tv.controller._run_art_call")
+def test_guarded_switch_selects_only_after_same_connection_mode_confirmation(mock_call, mode):
+    profile = TVProfile(ip="192.168.1.208")
+    advisory = MagicMock()
+    advisory.get_artmode.return_value = "on"
+    selection = MagicMock()
+    selection.get_artmode.return_value = mode
+    connections = iter([advisory, selection])
+    def run_callback(_profile, callback, *_args, **_kwargs):
+        return callback(next(connections))
+
+    mock_call.side_effect = run_callback
+
+    assert switch_art(profile, "MY_F0008", require_art_mode=True) is True
+
+    assert selection.mock_calls == [call.get_artmode(), call.select_image("MY_F0008")]
+    selection.set_artmode.assert_not_called()
+
+
+@patch("frameart.tv.controller._run_art_call")
+def test_unguarded_switch_still_enables_art_mode_for_explicit_manual_selection(mock_call):
+    profile = TVProfile(ip="192.168.1.208")
+    art = MagicMock()
+    art.get_artmode.return_value = "off"
+    mock_call.side_effect = lambda _profile, callback, *_args, **_kwargs: callback(art)
+
+    assert switch_art(profile, "MY_F0008") is True
+
+    assert art.mock_calls == [
+        call.get_artmode(), call.set_artmode(True), call.select_image("MY_F0008"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "mode", ["off", False, None, "unknown", {}, {"error": "unknown"}, ["unknown"], 2]
+)
+@patch("frameart.tv.controller._connect_art")
+def test_guarded_delete_never_deletes_during_active_or_unknown_tv_state(mock_connect, mode):
+    profile = TVProfile(ip="192.168.1.209")
+    art = mock_connect.return_value
+    art.get_artmode.return_value = mode
+
+    assert delete_art(profile, ["MY_DELETE"], require_art_mode=True) is False
+
+    art.delete_list.assert_not_called()
+    art.get_current.assert_not_called()
+    art.set_artmode.assert_not_called()
+    art.close.assert_called_once_with()
+
+
+@patch("frameart.tv.controller._connect_art")
+def test_guarded_delete_fails_closed_when_art_mode_read_raises(mock_connect):
+    profile = TVProfile(ip="192.168.1.209")
+    art = mock_connect.return_value
+    art.get_artmode.side_effect = RuntimeError("status unavailable")
+
+    assert delete_art(profile, ["MY_DELETE"], require_art_mode=True) is False
+
+    art.get_current.assert_not_called()
+    art.delete_list.assert_not_called()
+    art.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "current", [
+        None, {}, {"error": "unknown"}, "", "unknown", " MY_DELETE ",
+        {"content_id": "MY_DELETE"}, 7, {"content_id": 7}, {"content_id": True},
+    ]
+)
+@patch("frameart.tv.controller._connect_art")
+def test_guarded_delete_preserves_current_or_unknown_artwork(mock_connect, current):
+    profile = TVProfile(ip="192.168.1.209")
+    art = mock_connect.return_value
+    art.get_artmode.return_value = "on"
+    art.get_current.return_value = current
+
+    assert delete_art(profile, ["MY_DELETE", "MY_OTHER"], require_art_mode=True) is False
+
+    art.delete_list.assert_not_called()
+    art.set_artmode.assert_not_called()
+    art.close.assert_called_once_with()
+
+
+@patch("frameart.tv.controller._connect_art")
+def test_guarded_delete_fails_closed_when_current_artwork_read_raises(mock_connect):
+    profile = TVProfile(ip="192.168.1.209")
+    art = mock_connect.return_value
+    art.get_artmode.return_value = "on"
+    art.get_current.side_effect = RuntimeError("current artwork unavailable")
+
+    assert delete_art(profile, ["MY_DELETE"], require_art_mode=True) is False
+
+    art.delete_list.assert_not_called()
+    art.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("current", ["MY_KEEP", {"content_id": "MY_KEEP"}])
+@patch("frameart.tv.controller._connect_art")
+def test_guarded_delete_checks_actual_deletion_connection(mock_connect, current):
+    profile = TVProfile(ip="192.168.1.209")
+    art = mock_connect.return_value
+    art.get_artmode.return_value = "on"
+    art.get_current.return_value = current
+
+    assert delete_art(profile, ["MY_DELETE"], require_art_mode=True) is True
+
+    assert art.mock_calls == [
+        call.get_artmode(), call.get_current(), call.delete_list(["MY_DELETE"]), call.close(),
+    ]
+
+
+@patch("frameart.tv.controller._connect_art")
+def test_default_delete_preserves_explicit_manual_deletion_behavior(mock_connect):
+    profile = TVProfile(ip="192.168.1.209")
+    art = mock_connect.return_value
+
+    assert delete_art(profile, ["MY_DELETE"]) is True
+
+    art.get_artmode.assert_not_called()
+    art.get_current.assert_not_called()
+    art.delete_list.assert_called_once_with(["MY_DELETE"])
+    art.close.assert_called_once_with()
 
 
 @patch("frameart.tv.controller._run_art_call")

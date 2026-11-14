@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Validate/import exactly 20 full-frame TV renditions; never write NAS originals.
+"""Validate/import an explicitly sized artwork library; never write NAS originals.
 
-Dry-run is the default and makes no network requests. --apply requires a new,
-dedicated ResourceSpace pilot instance and a bootstrap/admin API identity. Runtime
+Dry-run is the default and makes no network requests. --apply requires a
+dedicated ResourceSpace artwork instance and a bootstrap/admin API identity. Runtime
 FrameArt uses a different, read-only identity; this writer is deliberately separate.
 """
 
@@ -25,13 +25,20 @@ from PIL import Image
 from pydantic import ValidationError
 
 from frameart.art_catalog import ArtworkMetadata
-from frameart.resourcespace import canonical_field_name
+from frameart.resourcespace import (
+    CATALOG_LIMIT,
+    MAX_RENDITION_BYTES,
+    ResourceSpaceError,
+    bounded_search,
+    canonical_field_name,
+)
 
 PILOT_SIZE = 20
 ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}\Z")
 SHA256_PATTERN = re.compile(r"[a-fA-F0-9]{64}\Z")
-MAX_IMAGE_BYTES = 50 * 1024 * 1024
-MAX_MANIFEST_BYTES = 2 * 1024 * 1024
+MAX_IMAGE_BYTES = MAX_RENDITION_BYTES
+MAX_MANIFEST_BYTES = 64 * 1024 * 1024
+MAX_API_BYTES = 2 * 1024 * 1024
 METADATA_FIELDS = {
     "frameart_id": 0,
     "frameart_metadata": 5,
@@ -63,6 +70,7 @@ class PilotItem:
 class PilotManifest:
     collection_name: str
     items: tuple[PilotItem, ...]
+    expected_count: int = PILOT_SIZE
 
 
 def file_sha256(path: Path) -> str:
@@ -97,8 +105,22 @@ def checked_hash(path: Path, expected: Any, label: str) -> str:
     return actual
 
 
-def load_manifest(path: Path, originals_root: Path, renditions_root: Path) -> PilotManifest:
+def checked_count(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= CATALOG_LIMIT:
+        raise PilotError(f"Expected count must be between 1 and {CATALOG_LIMIT} artworks")
+    return value
+
+
+def load_manifest(
+    path: Path,
+    originals_root: Path,
+    renditions_root: Path,
+    *,
+    expected_count: int = PILOT_SIZE,
+    collection_name: str | None = None,
+) -> PilotManifest:
     """Read and validate every file before allowing any remote writes."""
+    checked_count(expected_count)
     roots: list[Path] = []
     for root, label in ((originals_root, "originals"), (renditions_root, "renditions")):
         if not root.is_absolute():
@@ -116,9 +138,10 @@ def load_manifest(path: Path, originals_root: Path, renditions_root: Path) -> Pi
     if not isinstance(data, dict) or data.get("schema_version") != 1:
         raise PilotError("Pilot manifest requires schema_version 1")
     raw_items = data.get("items")
-    if not isinstance(raw_items, list) or len(raw_items) != PILOT_SIZE:
-        raise PilotError("The pilot requires exactly 20 artworks")
-    collection_name = data.get("collection_name", "FrameArt — 20 artwork pilot")
+    if not isinstance(raw_items, list) or len(raw_items) != expected_count:
+        raise PilotError(f"The import requires exactly {expected_count} artworks")
+    if collection_name is None:
+        collection_name = data.get("collection_name", "FrameArt — 20 artwork pilot")
     if not isinstance(collection_name, str) or not 1 <= len(collection_name.strip()) <= 200:
         raise PilotError("A nonempty collection_name of at most 200 characters is required")
     items: list[PilotItem] = []
@@ -159,7 +182,7 @@ def load_manifest(path: Path, originals_root: Path, renditions_root: Path) -> Pi
             raise PilotError("Each rendition must be unique and separate from its original")
         rendition_paths.add(rendition)
         if rendition.stat().st_size > MAX_IMAGE_BYTES:
-            raise PilotError(f"{artwork_id}: TV rendition exceeds 50 MiB")
+            raise PilotError(f"{artwork_id}: TV rendition exceeds 32 MiB")
         with Image.open(rendition) as image:
             if image.format != "JPEG" or image.size != (3840, 2160) or image.mode != "RGB":
                 raise PilotError(f"{artwork_id}: TV rendition must be a 3840×2160 RGB JPEG")
@@ -198,7 +221,7 @@ def load_manifest(path: Path, originals_root: Path, renditions_root: Path) -> Pi
         )
         field_values(item)
         items.append(item)
-    return PilotManifest(collection_name.strip(), tuple(items))
+    return PilotManifest(collection_name.strip(), tuple(items), expected_count)
 
 
 class AdminAPI:
@@ -247,7 +270,7 @@ class AdminAPI:
                         files={"userfile": (upload.name, source, "image/jpeg")},
                     )
             response.raise_for_status()
-            if len(response.content) > MAX_MANIFEST_BYTES:
+            if len(response.content) > MAX_API_BYTES:
                 raise PilotError(f"ResourceSpace {function} returned an oversized response")
             result = response.json()
         except (httpx.HTTPError, ValueError) as exc:
@@ -356,13 +379,12 @@ def field_values(item: PilotItem) -> dict[str, str]:
 
 def import_pilot(manifest: PilotManifest, api: AdminAPI) -> dict[str, Any]:
     """Idempotently upload renditions, refusing to overwrite a different artwork."""
+    expected_count = checked_count(manifest.expected_count)
+    if len(manifest.items) != expected_count:
+        raise PilotError(f"The import requires exactly {expected_count} artworks")
     fields, id_shortname = ensure_fields(api)
     collection = ensure_collection(api, manifest.collection_name)
-    current = result_rows(
-        api.call("do_search", search=f"!collection{collection}", fetchrows="0,21", archive="0")
-    )
-    if len(current) > PILOT_SIZE:
-        raise PilotError("Pilot collection already contains more than 20 resources")
+    current = search_resources(api, f"!collection{collection}", maximum=expected_count)
     allowed_ids = {item.metadata["id"] for item in manifest.items}
     existing: dict[str, int] = {}
     for row in current:
@@ -383,14 +405,7 @@ def import_pilot(manifest: PilotManifest, api: AdminAPI) -> dict[str, Any]:
         ref = existing.get(artwork_id)
         if ref is None:
             # Recover resources created before a prior interrupted collection-add.
-            candidates = result_rows(
-                api.call(
-                    "do_search",
-                    search=f"{id_shortname}:{artwork_id}",
-                    fetchrows="0,21",
-                    archive="0",
-                )
-            )
+            candidates = search_resources(api, f"{id_shortname}:{artwork_id}")
             exact = []
             for candidate in candidates:
                 candidate_ref = positive_ref(candidate.get("ref"), "resource")
@@ -439,11 +454,11 @@ def import_pilot(manifest: PilotManifest, api: AdminAPI) -> dict[str, Any]:
             if name in fields:
                 api.call("update_field", resource=ref, field=fields[name], value=value)
         imported.append({"id": artwork_id, "resource_ref": ref})
-    final = result_rows(
-        api.call("do_search", search=f"!collection{collection}", fetchrows="0,21", archive="0")
-    )
-    if len(final) != PILOT_SIZE:
-        raise PilotError("Import did not produce exactly 20 pilot resources")
+    final = search_resources(api, f"!collection{collection}", maximum=expected_count)
+    if len(final) != expected_count or {
+        positive_ref(row.get("ref"), "resource") for row in final
+    } != {item["resource_ref"] for item in imported}:
+        raise PilotError(f"Import did not produce exactly the {expected_count} expected resources")
     for item in manifest.items:
         checked_hash(item.original, item.original_sha256, "original")
         checked_hash(item.rendition, item.rendition_sha256, "rendition")
@@ -457,11 +472,28 @@ def import_pilot(manifest: PilotManifest, api: AdminAPI) -> dict[str, Any]:
     }
 
 
+def search_resources(api: AdminAPI, search: str, *, maximum: int = CATALOG_LIMIT) -> list[dict]:
+    try:
+        return bounded_search(api.call, search, maximum=maximum)
+    except ResourceSpaceError as exc:
+        raise PilotError(str(exc)) from None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--originals-root", required=True, type=Path)
     parser.add_argument("--renditions-root", required=True, type=Path)
+    parser.add_argument(
+        "--expected-count",
+        type=int,
+        default=PILOT_SIZE,
+        help=f"Require exactly this many artworks (1–{CATALOG_LIMIT}; default: 20)",
+    )
+    parser.add_argument(
+        "--collection-name",
+        help="Explicit destination collection name; reuse an existing name to expand it safely",
+    )
     action = parser.add_mutually_exclusive_group()
     action.add_argument("--dry-run", action="store_true", help="Validate only (the default)")
     action.add_argument("--apply", action="store_true", help="Import into the dedicated pilot")
@@ -470,7 +502,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     api: AdminAPI | None = None
     try:
-        manifest = load_manifest(args.manifest, args.originals_root, args.renditions_root)
+        manifest = load_manifest(
+            args.manifest,
+            args.originals_root,
+            args.renditions_root,
+            expected_count=args.expected_count,
+            collection_name=args.collection_name,
+        )
         if args.apply:
             api = AdminAPI(args.url, args.user, os.environ.get("RESOURCESPACE_PILOT_API_KEY", ""))
             report = import_pilot(manifest, api)

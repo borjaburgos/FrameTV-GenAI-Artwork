@@ -203,6 +203,25 @@ class LibraryStore:
                 )
                 """
             )
+        if tv_target and source in {
+            "apply", "import", "tv-art", "library-reuse", "generate", "edit", "catalog-manual",
+        }:
+            from frameart.daily_art import DailyArtStore
+
+            # A user's explicit selection wins over today's automatic artwork.
+            # Keep the display history itself intact and leave other modes alone.
+            DailyArtStore(self.database_path.parent).note_manual_choice(tv_target)
+            if content_id:
+                with self._connect() as connection:
+                    if connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='catalog_daily_owned'"
+                    ).fetchone():
+                        connection.execute(
+                            "DELETE FROM catalog_daily_owned WHERE content_id=? "
+                            "AND (profile_id=? OR tv_ip=?)",
+                            (content_id, tv_target, tv_target),
+                        )
 
     def list_history(self, limit: int = 100) -> list[dict[str, object]]:
         with self._connect() as connection:

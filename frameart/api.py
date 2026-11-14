@@ -77,6 +77,7 @@ import frameart.public_domain as public_domain
 from frameart import __version__
 from frameart.access import AccessStore, InvalidPairingCodeError
 from frameart.art_catalog_api import create_art_catalog_router
+from frameart.art_delivery import CatalogDeliveryService
 from frameart.art_profile import ArtProfileRequest, ArtProfileStore, load_art_quiz
 from frameart.automation import (
     AutomationScheduler,
@@ -85,6 +86,7 @@ from frameart.automation import (
     display_artifact,
 )
 from frameart.config import STYLE_PRESETS, ProviderConfig, Settings, TVProfile, load_settings
+from frameart.daily_art import DailyArtWorker
 from frameart.jobs import JobQueueFullError
 from frameart.library import LibraryStore
 from frameart.live_album import (
@@ -153,7 +155,10 @@ _PUBLIC_PATHS = {
 }
 _PUBLIC_PREFIXES = ("/static/",)
 _ADMIN_PATHS = {
-    "/jobs/delete", "/tv/art/delete", "/tv/art/matte", "/tv/mattes/cache",
+    "/jobs/delete",
+    "/tv/art/delete",
+    "/tv/art/matte",
+    "/tv/mattes/cache",
     "/art-catalog/sync",
 }
 _ADMIN_PREFIXES = (
@@ -192,6 +197,12 @@ JobId = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")]
 _automation_scheduler = AutomationScheduler(load_settings)
 _live_score_service = LiveScoreService(load_settings)
 _live_album_service = LiveAlbumService(load_settings)
+_catalog_delivery = CatalogDeliveryService(load_settings)
+_daily_art_worker = DailyArtWorker(
+    load_settings,
+    _catalog_delivery.deliver,
+    reconcile=_catalog_delivery.reconcile,
+)
 
 
 @asynccontextmanager
@@ -200,9 +211,13 @@ async def _app_lifespan(_app: FastAPI):
     _automation_scheduler.start()
     _live_score_service.start()
     _live_album_service.start()
+    _catalog_delivery.start()
+    _daily_art_worker.start()
     try:
         yield
     finally:
+        _daily_art_worker.stop()
+        _catalog_delivery.stop()
         _live_album_service.stop()
         _live_score_service.stop()
         _automation_scheduler.stop()
@@ -311,9 +326,7 @@ def _authentication_context(request: Request, settings) -> dict[str, object]:
             "device_id": None,
         }
 
-    device = _access_store(settings).authenticate_device(
-        request.cookies.get("frameart_device")
-    )
+    device = _access_store(settings).authenticate_device(request.cookies.get("frameart_device"))
     if device:
         return {
             "scopes": set(device["scopes"]),
@@ -354,6 +367,12 @@ def _origin_matches_request(request: Request) -> bool:
 
 
 def _required_scope(request: Request) -> str:
+    if request.url.path.startswith("/modes/daily-art") and request.method not in {
+        "GET",
+        "HEAD",
+        "OPTIONS",
+    }:
+        return "admin"
     if request.url.path.startswith("/modes/") and request.method == "GET":
         return "read"
     if (
@@ -487,7 +506,8 @@ class GenerateAndApplyRequest(GenerateRequest):
     tv: str | None = Field(None, max_length=100, description="TV profile name from config.")
     tv_ip: PrivateTVIPv4 | None = Field(None, description="Private TV IP address.")
     matte: str = Field(
-        "none", max_length=100,
+        "none",
+        max_length=100,
         description="Matte style (e.g., none, shadowbox_polar, shadowbox_noir).",
     )
     no_switch: bool = Field(False, description="Upload but don't switch displayed art.")
@@ -600,7 +620,10 @@ class ChangeMatteRequest(BaseModel):
 
     content_id: ContentId = Field(..., description="Content ID of the artwork.")
     matte_id: str = Field(
-        ..., min_length=1, max_length=100, pattern=_IDENTIFIER_RE,
+        ...,
+        min_length=1,
+        max_length=100,
+        pattern=_IDENTIFIER_RE,
         description="Matte ID to apply (see GET /tv/mattes).",
     )
     tv: str | None = Field(None, max_length=100, description="TV profile name from config.")
@@ -999,9 +1022,7 @@ class WebhookCreateRequest(BaseModel):
         normalized = list(dict.fromkeys(event.strip() for event in value if event.strip()))
         unsupported = sorted(set(normalized) - supported)
         if not normalized or unsupported:
-            raise ValueError(
-                "events must contain supported schedule or integration events"
-            )
+            raise ValueError("events must contain supported schedule or integration events")
         return normalized
 
 
@@ -1141,7 +1162,9 @@ class PublicDomainApplyRequest(BaseModel):
     """Request body for downloading and displaying public-domain artwork."""
 
     source: str = Field(
-        ..., min_length=1, max_length=20,
+        ...,
+        min_length=1,
+        max_length=20,
         description="Public domain source: met, aic, cma, or europeana.",
     )
     artwork_id: str = Field(..., min_length=1, max_length=300)
@@ -1154,12 +1177,13 @@ class PublicDomainApplyRequest(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _settings():
     """Load settings for the current request."""
     return load_settings()
 
 
-app.include_router(create_art_catalog_router(_settings))
+app.include_router(create_art_catalog_router(_settings, _catalog_delivery))
 
 
 def _library_store(settings=None) -> LibraryStore:
@@ -1197,9 +1221,7 @@ def _cached_tv_thumbnail(settings, profile: TVProfile, content_id: str, *, refre
     with coalesced_cache_fill("thumbnail", key, content_id):
         current = cache.get_thumbnail(key, content_id)
         if current is not None and (
-            not refresh
-            or initial is None
-            or current.updated_at > initial.updated_at
+            not refresh or initial is None or current.updated_at > initial.updated_at
         ):
             return current, "hit"
 
@@ -1265,20 +1287,14 @@ def _cached_tv_mattes(settings, profile: TVProfile, *, refresh: bool = False):
     key = tv_cache_key(profile)
     now = time.time()
     initial = cache.get_mattes(key)
-    if (
-        initial is not None
-        and not refresh
-        and now - initial.updated_at < MATTE_CACHE_TTL_SECONDS
-    ):
+    if initial is not None and not refresh and now - initial.updated_at < MATTE_CACHE_TTL_SECONDS:
         return initial, "hit"
 
     with coalesced_cache_fill("mattes", key):
         current = cache.get_mattes(key)
         if current is not None:
             current_is_fresh = time.time() - current.updated_at < MATTE_CACHE_TTL_SECONDS
-            refreshed_by_other = (
-                initial is None and current.updated_at > now
-            ) or (
+            refreshed_by_other = (initial is None and current.updated_at > now) or (
                 initial is not None and current.updated_at > initial.updated_at
             )
             if (not refresh and current_is_fresh) or refreshed_by_other:
@@ -1378,8 +1394,7 @@ def _validated_import_settings(current: Settings, payload: dict[str, Any]) -> di
         raise HTTPException(
             status_code=400,
             detail=(
-                "Portable settings imports cannot contain API keys, passwords, "
-                "secrets, or tokens."
+                "Portable settings imports cannot contain API keys, passwords, secrets, or tokens."
             ),
         )
     candidate_payload = current.model_dump()
@@ -1444,9 +1459,7 @@ def _probe_readiness(settings) -> tuple[list[dict[str, str]], dict[str, Any]]:
     checks.append(
         {"name": "provider_configuration", "status": "ok" if providers_ready else "warning"}
     )
-    checks.append(
-        {"name": "tv_configuration", "status": "ok" if settings.tvs else "warning"}
-    )
+    checks.append({"name": "tv_configuration", "status": "ok" if settings.tvs else "warning"})
     return checks, details
 
 
@@ -1489,9 +1502,7 @@ def _diagnostics_payload() -> dict[str, Any]:
             "recovered_pending_transaction": journal_pending,
             "managed_settings_present": managed_settings_path(settings.data_dir).is_file(),
             "provider_secrets_present": provider_secrets_path(settings.data_dir).is_file(),
-            "integration_secrets_present": integration_secrets_path(
-                settings.data_dir
-            ).is_file(),
+            "integration_secrets_present": integration_secrets_path(settings.data_dir).is_file(),
             "integration_key_count": len(integration_keys),
         },
         "managed_settings": managed,
@@ -1661,12 +1672,10 @@ def _managed_tvs_response(settings=None) -> ManagedTVsResponse:
     warnings: list[str] = []
     items = sorted(settings.tvs.items())
     for index, (left_id, left) in enumerate(items):
-        for right_id, right in items[index + 1:]:
-            if (
-                left.ip == right.ip
-                or _normalized_tv_profile_id(left_id)
-                == _normalized_tv_profile_id(right_id)
-            ):
+        for right_id, right in items[index + 1 :]:
+            if left.ip == right.ip or _normalized_tv_profile_id(
+                left_id
+            ) == _normalized_tv_profile_id(right_id):
                 conflict_map[left_id].add(right_id)
                 conflict_map[right_id].add(left_id)
                 warnings.append(
@@ -1681,9 +1690,7 @@ def _managed_tvs_response(settings=None) -> ManagedTVsResponse:
                 port=profile.port,
                 client_name=profile.name,
                 ssl=profile.ssl,
-                token_configured=bool(
-                    profile.token_file and Path(profile.token_file).is_file()
-                ),
+                token_configured=bool(profile.token_file and Path(profile.token_file).is_file()),
                 conflicts_with=sorted(conflict_map[name]),
             )
             for name, profile in items
@@ -1749,6 +1756,7 @@ def _test_provider_connection(name: str, config: ProviderConfig) -> str:
 
 def _pipeline_result_to_response(result) -> JobResponse:
     """Convert a PipelineResult dataclass to a JSON-serialisable response."""
+
     def value(name: str, default=None):
         if isinstance(result, dict):
             return result.get(name, default)
@@ -2241,9 +2249,13 @@ def list_providers():
         is_openai_family = name == "openai"
         is_google_family = name in {"google", "gemini"}
         models: list[str] = []
-        if cfg and cfg.model and (
-            (not is_openai_family or _is_openai_image_model(cfg.model))
-            and (not is_google_family or _is_google_image_model_name(cfg.model))
+        if (
+            cfg
+            and cfg.model
+            and (
+                (not is_openai_family or _is_openai_image_model(cfg.model))
+                and (not is_google_family or _is_google_image_model_name(cfg.model))
+            )
         ):
             models.append(cfg.model)
         extra_models = cfg.extra.get("models") if (cfg and isinstance(cfg.extra, dict)) else None
@@ -2251,14 +2263,16 @@ def list_providers():
             if is_openai_family:
                 models.extend(
                     [
-                        m for m in extra_models
+                        m
+                        for m in extra_models
                         if isinstance(m, str) and m and _is_openai_image_model(m)
                     ]
                 )
             elif is_google_family:
                 models.extend(
                     [
-                        m for m in extra_models
+                        m
+                        for m in extra_models
                         if isinstance(m, str) and m and _is_google_image_model_name(m)
                     ]
                 )
@@ -2272,18 +2286,10 @@ def list_providers():
         ):
             models.append(settings.default_model)
         if is_openai_family:
-            models.extend(
-                [
-                    m for m in _fetch_openai_image_models(cfg)
-                    if _is_openai_image_model(m)
-                ]
-            )
+            models.extend([m for m in _fetch_openai_image_models(cfg) if _is_openai_image_model(m)])
         if is_google_family:
             models.extend(
-                [
-                    m for m in _fetch_google_image_models(cfg)
-                    if _is_google_image_model_name(m)
-                ]
+                [m for m in _fetch_google_image_models(cfg) if _is_google_image_model_name(m)]
             )
 
         unique_models = list(dict.fromkeys(models))
@@ -3004,7 +3010,10 @@ def tv_list_art(
 @app.get("/tv/art/thumbnail")
 def tv_art_thumbnail(
     content_id: str = Query(
-        ..., min_length=1, max_length=128, pattern=_IDENTIFIER_RE,
+        ...,
+        min_length=1,
+        max_length=128,
+        pattern=_IDENTIFIER_RE,
         description="Artwork content ID.",
     ),
     tv: str | None = Query(None, max_length=100, description="TV profile name."),
@@ -3169,7 +3178,9 @@ def tv_configured():
 @app.get("/catalog/search", response_model=list[PublicDomainArtwork])
 def catalog_search(
     source: str = Query(
-        ..., min_length=1, max_length=20,
+        ...,
+        min_length=1,
+        max_length=20,
         description="Catalog source: met, aic, cma, or europeana.",
     ),
     q: str = Query(..., min_length=1, max_length=500, description="Search query."),
@@ -3189,9 +3200,7 @@ def catalog_search(
             q,
             safe_error,
         )
-        raise HTTPException(
-            status_code=502, detail=f"Catalog search failed: {safe_error}"
-        ) from e
+        raise HTTPException(status_code=502, detail=f"Catalog search failed: {safe_error}") from e
 
     validated: list[PublicDomainArtwork] = []
     dropped = 0
@@ -3770,9 +3779,7 @@ def create_live_score_tracker(req: LiveScoreCreateRequest):
     if req.tv_profile_id is not None and req.tv_profile_id not in settings.tvs:
         raise HTTPException(status_code=422, detail="TV profile was not found.")
     tracker_api_key = _secret_value(req.api_key)
-    if req.provider == "thesportsdb" and not sportsdb_api_key(
-        settings.data_dir, tracker_api_key
-    ):
+    if req.provider == "thesportsdb" and not sportsdb_api_key(settings.data_dir, tracker_api_key):
         raise HTTPException(
             status_code=422,
             detail=(
@@ -3875,8 +3882,7 @@ def list_live_album_photos(album_id: AutomationId):
     photos = store.source_items(album_id)
     for photo in photos:
         photo["image_url"] = (
-            f"/modes/live-album/{album_id}/photos/{photo['item_id']}/image"
-            f"?v={photo['version']}"
+            f"/modes/live-album/{album_id}/photos/{photo['item_id']}/image?v={photo['version']}"
         )
     return photos
 
@@ -3911,9 +3917,7 @@ def display_live_album_photo(album_id: AutomationId, item_id: AlbumPhotoId):
 @app.post("/modes/live-album", status_code=201)
 def create_live_album(req: LiveAlbumCreateRequest):
     settings = _settings()
-    _validate_live_album_target(
-        settings, group_id=req.group_id, tv_profile_id=req.tv_profile_id
-    )
+    _validate_live_album_target(settings, group_id=req.group_id, tv_profile_id=req.tv_profile_id)
     target_type = "group" if req.group_id is not None else "tv"
     target_id = req.group_id or req.tv_profile_id or ""
     try:
@@ -3928,9 +3932,7 @@ def create_live_album(req: LiveAlbumCreateRequest):
             enabled=req.enabled,
         )
     except sqlite3.IntegrityError as exc:
-        raise HTTPException(
-            status_code=409, detail="A live album with that name exists."
-        ) from exc
+        raise HTTPException(status_code=409, detail="A live album with that name exists.") from exc
 
 
 @app.put("/modes/live-album/{album_id}")
@@ -3940,9 +3942,7 @@ def update_live_album(album_id: AutomationId, req: LiveAlbumUpdateRequest):
     current = store.get_album(album_id, include_source=True)
     if current is None:
         raise HTTPException(status_code=404, detail="Live album was not found.")
-    _validate_live_album_target(
-        settings, group_id=req.group_id, tv_profile_id=req.tv_profile_id
-    )
+    _validate_live_album_target(settings, group_id=req.group_id, tv_profile_id=req.tv_profile_id)
     source_url = req.source_url or current["source_url"]
     try:
         source_url = validate_album_url(req.provider, source_url)
@@ -3958,9 +3958,7 @@ def update_live_album(album_id: AutomationId, req: LiveAlbumUpdateRequest):
             enabled=req.enabled,
         )
     except sqlite3.IntegrityError as exc:
-        raise HTTPException(
-            status_code=409, detail="A live album with that name exists."
-        ) from exc
+        raise HTTPException(status_code=409, detail="A live album with that name exists.") from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if not updated:
@@ -4084,7 +4082,8 @@ class JobApplyRequest(BaseModel):
     tv: str | None = Field(None, max_length=100, description="TV profile name from config.")
     tv_ip: PrivateTVIPv4 | None = Field(None, description="Private TV IP address.")
     matte: str = Field(
-        "none", max_length=100,
+        "none",
+        max_length=100,
         description="Matte style (e.g., none, shadowbox_polar, shadowbox_noir).",
     )
 
@@ -4361,9 +4360,7 @@ def apply_job_to_tv(job_id: str, req: JobApplyRequest):
     if profile is not None:
         preflight = preflight_tv(profile)
         if not (preflight.reachable and preflight.art_mode_supported):
-            error_code = (
-                "tv_unreachable" if not preflight.reachable else "tv_art_mode_unavailable"
-            )
+            error_code = "tv_unreachable" if not preflight.reachable else "tv_art_mode_unavailable"
             message = (
                 "TV is unreachable. Wake it or check its network connection, then retry "
                 "this saved artwork; generation will not run again."
@@ -4455,9 +4452,7 @@ def apply_job_to_tv(job_id: str, req: JobApplyRequest):
         if result.content_id:
             persisted_meta["content_id"] = result.content_id
             result_tv_ip = (
-                result.metadata.get("tv_ip")
-                if isinstance(result.metadata, dict)
-                else None
+                result.metadata.get("tv_ip") if isinstance(result.metadata, dict) else None
             )
             target_tv_ip = (
                 result_tv_ip
@@ -4670,9 +4665,7 @@ def run_server(host: str = "127.0.0.1", port: int = 8000) -> None:
 
     settings = load_settings()
     if settings.tailscale_auth_enabled and not settings.auth_enabled:
-        raise RuntimeError(
-            "Tailscale authentication requires FRAMEART_AUTH_ENABLED=true."
-        )
+        raise RuntimeError("Tailscale authentication requires FRAMEART_AUTH_ENABLED=true.")
     if settings.tailscale_auth_enabled and not _is_loopback_host(host):
         raise RuntimeError(
             "Tailscale authentication headers are trusted only on a loopback bind. "

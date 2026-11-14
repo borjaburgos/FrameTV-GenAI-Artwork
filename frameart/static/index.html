@@ -6,6 +6,7 @@
 <title>FrameArt</title>
 <link rel="stylesheet" href="/static/app.css">
 <link rel="stylesheet" href="/static/art-catalog.css">
+<link rel="stylesheet" href="/static/daily-art.css">
 </head>
 <body data-1p-ignore="true">
 
@@ -222,7 +223,7 @@
   <section class="art-catalog" id="art-catalog-root" aria-labelledby="art-catalog-heading">
     <div class="art-catalog-heading">
       <div>
-        <div class="page-eyebrow">ResourceSpace · Read-only pilot</div>
+        <div class="page-eyebrow">Your year in art · ResourceSpace collection</div>
         <h2 id="art-catalog-heading">Curated artwork</h2>
       </div>
       <button class="btn btn-secondary btn-small" id="art-catalog-refresh" type="button">Refresh metadata</button>
@@ -236,6 +237,7 @@
       <p class="art-catalog-count" id="art-catalog-count" aria-live="polite"></p>
     </div>
     <div class="art-catalog-grid" id="art-catalog-grid"></div>
+    <div class="art-catalog-pagination"><button class="btn btn-secondary" id="art-catalog-more" type="button" hidden>Show more artworks</button></div>
     <p class="art-catalog-empty" id="art-catalog-empty" hidden></p>
   </section>
   <div class="section-heading">
@@ -331,6 +333,21 @@
 </div>
 
 <div class="panel" id="panel-modes">
+  <section class="settings-card daily-art" id="daily-art-root" aria-labelledby="daily-art-heading">
+    <div class="daily-art-heading"><div><div class="page-eyebrow">One artwork each day</div><h2 id="daily-art-heading">Daily Art</h2></div><button class="btn btn-secondary btn-small" id="daily-art-refresh" type="button">Refresh Daily Art</button></div>
+    <p>Follow your curated calendar on one Frame or a TV group. Daily Art only changes a TV that is already in Art Mode.</p>
+    <p class="daily-art-status" id="daily-art-status" role="status" aria-live="polite">Open Modes to load Daily Art.</p>
+    <p id="daily-art-error" class="error-text" role="alert" hidden></p>
+    <div class="daily-art-preview-grid" id="daily-art-previews"></div>
+    <form id="daily-art-form" autocomplete="off" data-1p-ignore="true">
+      <div class="row"><div><label for="daily-art-target">Daily Art TV or group</label><select id="daily-art-target" autocomplete="off" data-1p-ignore="true"></select></div><div><label for="daily-art-timezone">Daily Art time zone</label><input id="daily-art-timezone" maxlength="100" autocomplete="off" data-1p-ignore="true" placeholder="America/New_York" required></div><div><label for="daily-art-time">Change artwork at</label><input id="daily-art-time" type="time" autocomplete="off" data-1p-ignore="true" required></div></div>
+      <label class="daily-art-enable"><input id="daily-art-enabled" type="checkbox" autocomplete="off" data-1p-ignore="true"> Enable daily rotation</label>
+      <p class="hint">At midnight, Daily Art changes each available TV in Art Mode. Busy, offline, or unknown TVs retry hourly; TVs that already changed are skipped. New family-album photos take priority on their own TV until the next local midnight after safe display; a photo waiting for Art Mode keeps its priority. Daily Art resumes the following midnight. Album checks continue every 5 minutes, and active viewing is never interrupted. Manual artwork choices hold daily rotation for the rest of the local day. Clearing manual holds does not override family-album priority.</p>
+      <div class="daily-art-actions"><button class="btn btn-small" id="daily-art-save" type="submit">Save Daily Art</button><button class="btn btn-secondary btn-small" id="daily-art-pause" type="button">Pause rotation</button><button class="btn btn-secondary btn-small" id="daily-art-hold" type="button">Hold until tomorrow</button><button class="btn btn-ghost btn-small" id="daily-art-resume" type="button">Clear manual holds</button></div>
+    </form>
+    <div class="daily-art-import"><h3>Artwork calendar</h3><p id="daily-art-coverage">No calendar loaded.</p><label for="daily-art-calendar">Import calendar JSON</label><input id="daily-art-calendar" type="file" accept=".json,application/json" autocomplete="off" data-1p-ignore="true"><button class="btn btn-secondary btn-small" id="daily-art-import" type="button">Import calendar</button><p class="hint">Choose a calendar JSON file of 512 KiB or smaller, including its year and date-to-artwork entries. Importing a calendar does not enable rotation.</p></div>
+    <ul id="daily-art-results" class="daily-art-results"></ul>
+  </section>
   <div class="page-eyebrow">Modes</div>
   <div class="section-heading">
     <h2>Live Display Modes</h2>
@@ -939,6 +956,7 @@
 
 <script src="/static/curation.js" defer></script>
 <script src="/static/art-catalog.js" defer></script>
+<script src="/static/daily-art.js" defer></script>
 <script src="/static/app.js" defer></script>
 </body>
 </html>

@@ -277,9 +277,7 @@ def _icloud_asset_url(payload: dict[str, Any], checksum: str) -> str:
 def fetch_icloud_album(source_url: str, *, limit: int = MAX_SYNC_PHOTOS) -> AlbumSnapshot:
     """Fetch the newest stills from an iCloud public Shared Album."""
     token = _icloud_token(source_url)
-    stream, base_url = _post_icloud(
-        _icloud_stream_base(token), "webstream", {"streamCtag": None}
-    )
+    stream, base_url = _post_icloud(_icloud_stream_base(token), "webstream", {"streamCtag": None})
     rows = stream.get("photos")
     if not isinstance(rows, list):
         raise RuntimeError("iCloud Shared Album did not return a photo list.")
@@ -337,9 +335,7 @@ def _get_google_page(source_url: str) -> str:
             try:
                 response.raise_for_status()
             except Exception as exc:
-                raise RuntimeError(
-                    f"Google Photos returned HTTP {response.status_code}."
-                ) from exc
+                raise RuntimeError(f"Google Photos returned HTTP {response.status_code}.") from exc
             return _response_bytes(
                 response, limit=_MAX_PAGE_BYTES, label="Google Photos album page"
             ).decode("utf-8", errors="replace")
@@ -467,9 +463,7 @@ def parse_google_album_page(page: str, *, limit: int = MAX_SYNC_PHOTOS) -> Album
     return AlbumSnapshot(name=name, total_count=len(ordered), items=tuple(ordered[:limit]))
 
 
-def fetch_google_photos_album(
-    source_url: str, *, limit: int = MAX_SYNC_PHOTOS
-) -> AlbumSnapshot:
+def fetch_google_photos_album(source_url: str, *, limit: int = MAX_SYNC_PHOTOS) -> AlbumSnapshot:
     return parse_google_album_page(_get_google_page(source_url), limit=limit)
 
 
@@ -516,9 +510,7 @@ def download_album_image(provider: str, item: AlbumItem) -> bytes:
             content_type = response.headers.get("content-type", "").lower()
             if content_type and not content_type.startswith("image/"):
                 raise ValueError("Public album item did not return an image.")
-            body = _response_bytes(
-                response, limit=_MAX_IMAGE_BYTES, label="Public album photo"
-            )
+            body = _response_bytes(response, limit=_MAX_IMAGE_BYTES, label="Public album photo")
             break
         location = response.headers.get("location")
         if not location:
@@ -602,6 +594,13 @@ class LiveAlbumStore:
                     created_at REAL NOT NULL,
                     PRIMARY KEY (album_id, tv_profile_id, content_id),
                     FOREIGN KEY (album_id) REFERENCES photo_album_feeds(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS photo_album_unverified_uploads (
+                    album_id TEXT NOT NULL, tv_profile_id TEXT NOT NULL,
+                    source_item_id TEXT NOT NULL, source_checksum TEXT NOT NULL,
+                    content_id TEXT NOT NULL,
+                    PRIMARY KEY(album_id,tv_profile_id,source_item_id),
+                    FOREIGN KEY(album_id) REFERENCES photo_album_feeds(id) ON DELETE CASCADE
                 );
                 """
             )
@@ -720,6 +719,10 @@ class LiveAlbumStore:
                     album_id,
                 ),
             )
+        if cursor.rowcount and (not enabled or not display_newest):
+            from frameart.daily_art import DailyArtStore
+
+            DailyArtStore(self.data_dir).reconcile_album_priority(album_id, [], None)
         return cursor.rowcount > 0
 
     def set_enabled(self, album_id: str, enabled: bool) -> bool:
@@ -729,6 +732,10 @@ class LiveAlbumStore:
                    SET enabled = ?, next_sync = ?, updated_at = ? WHERE id = ?""",
                 (int(enabled), time.time(), time.time(), album_id),
             )
+        if cursor.rowcount and not enabled:
+            from frameart.daily_art import DailyArtStore
+
+            DailyArtStore(self.data_dir).reconcile_album_priority(album_id, [], None)
         return cursor.rowcount > 0
 
     def due_album_ids(self, now: float | None = None) -> list[str]:
@@ -799,9 +806,7 @@ class LiveAlbumStore:
                 "item_id": row["source_item_id"],
                 "added_at": row["added_at"],
                 "title": row["title"],
-                "version": hashlib.sha256(
-                    row["source_checksum"].encode()
-                ).hexdigest()[:16],
+                "version": hashlib.sha256(row["source_checksum"].encode()).hexdigest()[:16],
                 "uploaded_to": sorted(uploaded_to.get(row["source_item_id"], [])),
             }
             for row in rows
@@ -820,9 +825,7 @@ class LiveAlbumStore:
         cache_name = item.pop("cache_name")
         if not _CACHE_NAME_RE.fullmatch(cache_name):
             raise RuntimeError("Live album preview metadata is invalid.")
-        item["cache_path"] = _album_cache_directory(
-            self.data_dir, album_id
-        ) / cache_name
+        item["cache_path"] = _album_cache_directory(self.data_dir, album_id) / cache_name
         return item
 
     def replace_source_items(self, album_id: str, items: tuple[AlbumItem, ...]) -> None:
@@ -952,6 +955,44 @@ class LiveAlbumStore:
                 (album_id, tv_profile_id, source_item_id),
             )
 
+    def note_upload_verification(self, album_id, profile_id, item, content_id, verified):
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM photo_album_unverified_uploads "
+                "WHERE album_id=? AND tv_profile_id=? AND source_item_id=?",
+                (album_id, profile_id, item.item_id),
+            )
+            if not verified:
+                connection.execute(
+                    "INSERT INTO photo_album_unverified_uploads VALUES(?,?,?,?,?)",
+                    (album_id, profile_id, item.item_id, item.checksum, content_id),
+                )
+
+    def upload_is_unverified(self, album_id, profile_id, item_id, checksum, content_id):
+        with self._connect() as connection:
+            return (
+                connection.execute(
+                    "SELECT 1 FROM photo_album_unverified_uploads WHERE album_id=? "
+                    "AND tv_profile_id=? AND source_item_id=? "
+                    "AND source_checksum=? AND content_id=?",
+                    (album_id, profile_id, item_id, checksum, content_id),
+                ).fetchone()
+                is not None
+            )
+
+    def forget_content_claim(self, album_id, profile_id, content_id):
+        """Forget recycled/unverifiable IDs locally; never delete their TV files."""
+        with self._connect() as connection:
+            for table in (
+                "photo_album_tv_items",
+                "photo_album_stale_items",
+                "photo_album_unverified_uploads",
+            ):
+                connection.execute(
+                    f"DELETE FROM {table} WHERE album_id=? AND tv_profile_id=? AND content_id=?",
+                    (album_id, profile_id, content_id),
+                )
+
     def clear_stale(self, album_id: str, tv_profile_id: str, content_ids: list[str]) -> None:
         if not content_ids:
             return
@@ -966,14 +1007,17 @@ class LiveAlbumStore:
 
     def all_owned_ids(self, album_id: str, tv_profile_id: str) -> list[str]:
         current = [
-            item["content_id"]
-            for item in self.current_items(album_id, tv_profile_id).values()
+            item["content_id"] for item in self.current_items(album_id, tv_profile_id).values()
         ]
         return list(dict.fromkeys([*current, *self.stale_ids(album_id, tv_profile_id)]))
 
     def delete_album(self, album_id: str) -> bool:
         with self._connect() as connection:
             cursor = connection.execute("DELETE FROM photo_album_feeds WHERE id = ?", (album_id,))
+        if cursor.rowcount:
+            from frameart.daily_art import DailyArtStore
+
+            DailyArtStore(self.data_dir).reconcile_album_priority(album_id, [], None)
         return cursor.rowcount > 0
 
     def replace_tv_profile_ids(self, replacements: dict[str, str]) -> int:
@@ -989,7 +1033,11 @@ class LiveAlbumStore:
                     (new, time.time(), old),
                 )
                 updated += cursor.rowcount
-                for table in ("photo_album_tv_items", "photo_album_stale_items"):
+                for table in (
+                    "photo_album_tv_items",
+                    "photo_album_stale_items",
+                    "photo_album_unverified_uploads",
+                ):
                     connection.execute(
                         f"UPDATE OR REPLACE {table} SET tv_profile_id = ? WHERE tv_profile_id = ?",
                         (new, old),
@@ -1011,9 +1059,7 @@ class LiveAlbumService:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._loop, name="frameart-live-album", daemon=True
-        )
+        self._thread = threading.Thread(target=self._loop, name="frameart-live-album", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
@@ -1051,20 +1097,26 @@ class LiveAlbumService:
         return group["tv_profile_ids"], None
 
     @staticmethod
-    def _drain_stale(store, album_id, profile_id, profile) -> str | None:
+    def _drain_stale(store, album_id, profile_id, profile) -> tuple[str | None, int]:
+        from frameart.art_delivery import CatalogDeliveryService
         from frameart.tv.controller import delete_art
 
-        stale = store.stale_ids(album_id, profile_id)
+        stale = []
+        for identity in store.stale_ids(album_id, profile_id):
+            if CatalogDeliveryService._fingerprint_matches(store, profile, identity):
+                stale.append(identity)
+            else:
+                store.forget_content_claim(album_id, profile_id, identity)
         if not stale:
-            return None
+            return None, 0
         try:
-            deleted = delete_art(profile, stale)
+            deleted = delete_art(profile, stale, require_art_mode=True)
         except Exception as exc:
-            return str(exc)
+            return str(exc), 0
         if not deleted:
-            return "TV did not delete superseded album photos"
+            return "TV did not delete superseded album photos", 0
         store.clear_stale(album_id, profile_id, stale)
-        return None
+        return None, len(stale)
 
     @staticmethod
     def _cache_snapshot(
@@ -1132,6 +1184,159 @@ class LiveAlbumService:
         except OSError as exc:
             raise RuntimeError("The cached album photo is unavailable; synchronize again.") from exc
 
+    @staticmethod
+    def _priority_candidate(item: AlbumItem) -> str:
+        return hashlib.sha256(json.dumps([item.item_id, item.checksum]).encode()).hexdigest()
+
+    def _sync_profile(self, settings, store, album, snapshot, prepared, profile_id, is_target):
+        """One serialized per-TV reconciliation; caller has committed photo priority."""
+        from frameart.art_delivery import CatalogDeliveryService, tv_delivery_lock
+        from frameart.daily_art import DailyArtStore
+        from frameart.tv.controller import get_status, switch_art, upload_image
+
+        album_id = album["id"]
+        profile = settings.tvs[profile_id]
+        priority = DailyArtStore(settings.data_dir)
+        newest = snapshot.items[0] if is_target and snapshot.items else None
+        candidate = self._priority_candidate(newest) if newest else None
+        desired = {item.item_id: item for item in snapshot.items} if is_target else {}
+        uploaded = deleted = displayed = 0
+        errors = []
+
+        def display_pending(*, just_uploaded=False):
+            nonlocal displayed
+            if (
+                not newest
+                or not album["display_newest"]
+                or not priority.album_priority_pending(profile_id, album_id, candidate)
+            ):
+                return
+            current = store.current_items(album_id, profile_id).get(newest.item_id)
+            if not current or current["source_checksum"] != newest.checksum:
+                return
+            if not just_uploaded and not CatalogDeliveryService._fingerprint_matches(
+                settings, profile, current["content_id"]
+            ):
+                errors.append(
+                    "Pending photo identity could not be verified; TV file was preserved."
+                )
+                return
+            if switch_art(profile, current["content_id"], require_art_mode=True):
+                priority.confirm_album_priority(profile_id, album_id, candidate)
+                displayed += 1
+            else:
+                errors.append("Newest photo is pending confirmed Art Mode display.")
+
+        with tv_delivery_lock(profile.ip):
+            state = get_status(profile)
+            if not (state.reachable and state.art_mode_supported and state.art_mode_on):
+                errors.append(
+                    "TV is busy, offline or not confirmed in Art Mode; album update deferred."
+                )
+            else:
+                for item_id, saved in store.current_items(album_id, profile_id).items():
+                    if not CatalogDeliveryService._fingerprint_matches(
+                        settings, profile, saved["content_id"]
+                    ):
+                        if store.upload_is_unverified(
+                            album_id,
+                            profile_id,
+                            item_id,
+                            saved["source_checksum"],
+                            saved["content_id"],
+                        ):
+                            errors.append(
+                                "An uploaded photo remains unverified; it was not uploaded again."
+                            )
+                        else:
+                            store.forget_content_claim(album_id, profile_id, saved["content_id"])
+                # A prior upload may be complete while selection was deferred.
+                # Retry this pending photo even when this poll uploads nothing.
+                display_pending()
+                stale_error, drained = self._drain_stale(store, album_id, profile_id, profile)
+                deleted += drained
+                if stale_error:
+                    errors.append(stale_error + "; sync paused to bound TV storage")
+                else:
+                    current = store.current_items(album_id, profile_id)
+                    for item in desired.values():
+                        saved = current.get(item.item_id)
+                        if saved and saved["source_checksum"] == item.checksum:
+                            continue
+                        is_pending_newest = (
+                            newest
+                            and item.item_id == newest.item_id
+                            and (priority.album_priority_pending(profile_id, album_id, candidate))
+                        )
+                        try:
+                            image_bytes = self._cached_image_bytes(store, album_id, item, prepared)
+                            if is_pending_newest and not priority.claim_album_upload(
+                                profile_id, album_id, candidate
+                            ):
+                                errors.append("Newest photo upload is unconfirmed; not repeated.")
+                                continue
+                            result = upload_image(
+                                profile,
+                                image_bytes,
+                                file_type="JPEG",
+                                matte="none",
+                                require_art_mode=True,
+                            )
+                            if getattr(result, "deferred", False):
+                                if is_pending_newest:
+                                    priority.defer_album_upload(profile_id, album_id, candidate)
+                                errors.append("TV left Art Mode; upload was safely deferred.")
+                                break
+                            if not result.success or not result.content_id:
+                                raise RuntimeError(result.error or "TV upload failed")
+                            store.upsert_current(album_id, profile_id, item, result.content_id)
+                            verified = CatalogDeliveryService._record_fingerprint(
+                                settings, profile, result.content_id
+                            )
+                            store.note_upload_verification(
+                                album_id, profile_id, item, result.content_id, verified
+                            )
+                            current = store.current_items(album_id, profile_id)
+                            uploaded += 1
+                            # Show the new family photo immediately, before the
+                            # remaining nine cache members or retention work.
+                            if is_pending_newest:
+                                display_pending(just_uploaded=True)
+                        except Exception:
+                            errors.append(f"photo {item.item_id[:12]}: upload was not confirmed")
+                    ready = all(
+                        item_id in current and current[item_id]["source_checksum"] == item.checksum
+                        for item_id, item in desired.items()
+                    )
+                    if ready:
+                        for item_id in list(current):
+                            if item_id not in desired:
+                                store.mark_current_stale(album_id, profile_id, item_id)
+                        stale_error, drained = self._drain_stale(
+                            store, album_id, profile_id, profile
+                        )
+                        if stale_error:
+                            errors.append(stale_error)
+                        else:
+                            deleted += drained
+                    elif errors:
+                        errors.append(
+                            "Older photos were kept until replacements upload successfully."
+                        )
+        current = store.current_items(album_id, profile_id)
+        return {
+            "tv_profile_id": profile_id,
+            "uploaded": uploaded,
+            "owned": len(current),
+            "displayed": displayed,
+            "deleted": deleted,
+            "errors": errors,
+            "synced": sum(
+                item_id in current and current[item_id]["source_checksum"] == item.checksum
+                for item_id, item in desired.items()
+            ),
+        }
+
     def sync_album(self, album_id: str) -> dict[str, Any]:
         """Fetch one album and reconcile only the TV content owned by this feed."""
         with self._lock:
@@ -1148,9 +1353,30 @@ class LiveAlbumService:
                     snapshot.total_count,
                     tuple(snapshot.items[:MAX_SYNC_PHOTOS]),
                 )
-                prepared = self._cache_snapshot(
-                    store, album_id, album["provider"], snapshot
+                from frameart.daily_art import DailyArtStore
+
+                target_ids, target_error = self._target_profile_ids(settings, album)
+                priority = DailyArtStore(settings.data_dir)
+                newest = snapshot.items[0] if snapshot.items else None
+                candidate = self._priority_candidate(newest) if newest else None
+                priority_targets = (
+                    target_ids if album["enabled"] and album["display_newest"] else []
                 )
+                if newest and priority_targets:
+                    saved = store.source_item(album_id, newest.item_id)
+                    # On an old deployment without source-cache history, baseline
+                    # the first poll; enabling this feature is not a new-photo event.
+                    cached_history = bool(store.source_items(album_id))
+                    legacy_baseline = (
+                        not cached_history
+                        and album["last_sync"] is not None
+                        and (album["source_count"] is not None or store.owned_profile_ids(album_id))
+                    )
+                    established = not legacy_baseline
+                    if established and (not saved or saved["source_checksum"] != newest.checksum):
+                        priority.begin_album_priority(album_id, priority_targets, candidate, now)
+                priority.reconcile_album_priority(album_id, priority_targets, candidate)
+                prepared = self._cache_snapshot(store, album_id, album["provider"], snapshot)
             except Exception as exc:
                 store.update_runtime(
                     album_id,
@@ -1163,109 +1389,51 @@ class LiveAlbumService:
                 )
                 raise
 
-            desired = {item.item_id: item for item in snapshot.items}
             target_ids, target_error = self._target_profile_ids(settings, album)
-            all_profile_ids = list(
-                dict.fromkeys([*target_ids, *store.owned_profile_ids(album_id)])
-            )
+            all_profile_ids = list(dict.fromkeys([*target_ids, *store.owned_profile_ids(album_id)]))
             errors: list[str] = [target_error] if target_error else []
             results: list[dict[str, Any]] = []
             total_uploaded = 0
             total_deleted = 0
             target_synced_counts: dict[str, int] = {}
 
-            from frameart.tv.controller import switch_art, upload_image
-
             for profile_id in all_profile_ids:
                 profile = settings.tvs.get(profile_id)
                 if profile is None:
                     errors.append(f"{profile_id}: TV profile is no longer configured")
                     continue
-                stale_error = self._drain_stale(store, album_id, profile_id, profile)
-                if stale_error:
-                    errors.append(f"{profile_id}: {stale_error}; sync paused to bound TV storage")
-                    continue
-                is_target = profile_id in target_ids
-                profile_desired = desired if is_target else {}
-                current = store.current_items(album_id, profile_id)
-                uploaded = 0
-                profile_errors: list[str] = []
-                for item in profile_desired.values():
-                    saved = current.get(item.item_id)
-                    if saved and saved["source_checksum"] == item.checksum:
-                        continue
-                    try:
-                        image_bytes = self._cached_image_bytes(
-                            store, album_id, item, prepared
-                        )
-                        result = upload_image(
-                            profile, image_bytes, file_type="JPEG", matte="none"
-                        )
-                        if not result.success or not result.content_id:
-                            raise RuntimeError(result.error or "TV upload failed")
-                        store.upsert_current(
-                            album_id, profile_id, item, result.content_id
-                        )
-                        current = store.current_items(album_id, profile_id)
-                        uploaded += 1
-                        total_uploaded += 1
-                    except Exception as exc:
-                        profile_errors.append(f"photo {item.item_id[:12]}: {exc}")
-
-                ready = all(
-                    item_id in current
-                    and current[item_id]["source_checksum"] == item.checksum
-                    for item_id, item in profile_desired.items()
-                )
-                if ready:
-                    for item_id in list(current):
-                        if item_id not in profile_desired:
-                            store.mark_current_stale(album_id, profile_id, item_id)
-                    stale_before = store.stale_ids(album_id, profile_id)
-                    stale_error = self._drain_stale(store, album_id, profile_id, profile)
-                    if stale_error:
-                        profile_errors.append(stale_error)
-                    else:
-                        total_deleted += len(stale_before)
-                    if is_target and uploaded and album["display_newest"] and snapshot.items:
-                        newest = store.current_items(album_id, profile_id).get(
-                            snapshot.items[0].item_id
-                        )
-                        if newest and not switch_art(
-                            profile,
-                            newest["content_id"],
-                            require_art_mode=True,
-                        ):
-                            profile_errors.append(
-                                "newest photo was not displayed because the TV was not "
-                                "confirmed in Art Mode; normal viewing was left untouched"
-                            )
-                elif profile_errors:
-                    profile_errors.append(
-                        "older photos were kept until every replacement uploads successfully"
+                try:
+                    result = self._sync_profile(
+                        settings,
+                        store,
+                        album,
+                        snapshot,
+                        prepared,
+                        profile_id,
+                        profile_id in target_ids,
                     )
-                results.append(
-                    {
-                        "tv_profile_id": profile_id,
-                        "uploaded": uploaded,
-                        "owned": len(store.current_items(album_id, profile_id)),
-                    }
-                )
-                if is_target:
-                    final_current = store.current_items(album_id, profile_id)
-                    target_synced_counts[profile_id] = sum(
-                        item_id in final_current
-                        and final_current[item_id]["source_checksum"] == item.checksum
-                        for item_id, item in desired.items()
+                    total_uploaded += result["uploaded"]
+                    total_deleted += result["deleted"]
+                    results.append(
+                        {
+                            key: result[key]
+                            for key in ("tv_profile_id", "uploaded", "owned", "displayed")
+                        }
                     )
-                errors.extend(f"{profile_id}: {error}" for error in profile_errors)
+                    if profile_id in target_ids:
+                        target_synced_counts[profile_id] = result["synced"]
+                    errors.extend(f"{profile_id}: {error}" for error in result["errors"])
+                except Exception:
+                    errors.append(f"{profile_id}: album update deferred safely")
 
             synced_count = (
                 min(target_synced_counts.get(profile_id, 0) for profile_id in target_ids)
                 if target_ids
                 else 0
             )
-            changed = bool(total_uploaded or total_deleted)
+            changed = bool(
+                total_uploaded or total_deleted or any(row["displayed"] for row in results)
+            )
             if errors:
                 status = "partial" if results else "error"
             else:
@@ -1294,6 +1462,60 @@ class LiveAlbumService:
                 f"live_album.{status}", payload
             )
             return payload
+
+    def _display_profile_photo(self, settings, store, album_id, profile_id, item, image_bytes):
+        from frameart.art_delivery import CatalogDeliveryService, tv_delivery_lock
+        from frameart.daily_art import DailyArtStore
+        from frameart.tv.controller import get_status, switch_art, upload_image
+
+        profile = settings.tvs[profile_id]
+        priority = DailyArtStore(settings.data_dir)
+        candidate = self._priority_candidate(item)
+        with tv_delivery_lock(profile.ip):
+            state = get_status(profile)
+            if not (state.reachable and state.art_mode_supported and state.art_mode_on):
+                return {"skipped": "TV is not in Art Mode; normal viewing was left untouched."}
+            existing = store.current_items(album_id, profile_id).get(item.item_id)
+            content_id = (
+                existing["content_id"]
+                if (existing and existing["source_checksum"] == item.checksum)
+                else None
+            )
+            if content_id and not CatalogDeliveryService._fingerprint_matches(
+                settings, profile, content_id
+            ):
+                if store.upload_is_unverified(
+                    album_id, profile_id, item.item_id, item.checksum, content_id
+                ):
+                    return {"error": "Photo identity is unverified; no repeated upload was sent."}
+                store.forget_content_claim(album_id, profile_id, content_id)
+                content_id = None
+            pending = priority.album_priority_pending(profile_id, album_id, candidate)
+            if content_id is None:
+                if pending and not priority.claim_album_upload(profile_id, album_id, candidate):
+                    return {"error": "A previous upload is unconfirmed; it was not repeated."}
+                uploaded = upload_image(
+                    profile, image_bytes, file_type="JPEG", matte="none", require_art_mode=True
+                )
+                if getattr(uploaded, "deferred", False):
+                    if pending:
+                        priority.defer_album_upload(profile_id, album_id, candidate)
+                    return {"skipped": "TV left Art Mode; normal viewing was left untouched."}
+                if not uploaded.success or not uploaded.content_id:
+                    return {"error": "TV upload was not confirmed."}
+                content_id = uploaded.content_id
+                store.upsert_current(album_id, profile_id, item, content_id)
+                verified = CatalogDeliveryService._record_fingerprint(settings, profile, content_id)
+                store.note_upload_verification(album_id, profile_id, item, content_id, verified)
+            if not switch_art(profile, content_id, require_art_mode=True):
+                return {
+                    "skipped": "Art Mode changed before display; normal viewing was left untouched."
+                }
+            if pending:
+                priority.confirm_album_priority(profile_id, album_id, candidate)
+            else:
+                priority.note_manual_choice(profile_id)
+            return {"content_id": content_id}
 
     def display_photo(self, album_id: str, item_id: str) -> dict[str, Any]:
         """Display one cached album photo without ever enabling Art Mode."""
@@ -1325,72 +1547,23 @@ class LiveAlbumService:
             skipped: list[dict[str, str]] = []
             errors: list[str] = [target_error] if target_error else []
 
-            from frameart.tv.controller import get_status, switch_art, upload_image
-
             for profile_id in profile_ids:
                 profile = settings.tvs.get(profile_id)
                 if profile is None:
                     errors.append(f"{profile_id}: TV profile is no longer configured")
                     continue
                 try:
-                    tv_status = get_status(profile)
-                except Exception as exc:
-                    skipped.append(
-                        {
-                            "tv_profile_id": profile_id,
-                            "reason": f"Could not confirm Art Mode: {exc}",
-                        }
+                    outcome = self._display_profile_photo(
+                        settings, store, album_id, profile_id, item, image_bytes
                     )
-                    continue
-                if not (
-                    tv_status.reachable
-                    and tv_status.art_mode_supported
-                    and tv_status.art_mode_on
-                ):
-                    skipped.append(
-                        {
-                            "tv_profile_id": profile_id,
-                            "reason": (
-                                "TV is not in Art Mode; normal viewing was left untouched."
-                            ),
-                        }
-                    )
-                    continue
-
-                current = store.current_items(album_id, profile_id)
-                existing = current.get(item_id)
-                content_id = (
-                    existing["content_id"]
-                    if existing and existing["source_checksum"] == item.checksum
-                    else None
-                )
-                try:
-                    if content_id is None:
-                        uploaded = upload_image(
-                            profile, image_bytes, file_type="JPEG", matte="none"
-                        )
-                        if not uploaded.success or not uploaded.content_id:
-                            raise RuntimeError(uploaded.error or "TV upload failed")
-                        content_id = uploaded.content_id
-                        store.upsert_current(album_id, profile_id, item, content_id)
-                    if not switch_art(
-                        profile, content_id, require_art_mode=True
-                    ):
-                        skipped.append(
-                            {
-                                "tv_profile_id": profile_id,
-                                "reason": (
-                                    "Art Mode changed before display; normal viewing was left "
-                                    "untouched."
-                                ),
-                            }
-                        )
-                        continue
-                    results.append(
-                        {"tv_profile_id": profile_id, "content_id": content_id}
-                    )
-                except Exception as exc:
-                    errors.append(f"{profile_id}: {exc}")
+                    if "content_id" in outcome:
+                        results.append({"tv_profile_id": profile_id, **outcome})
+                    elif "skipped" in outcome:
+                        skipped.append({"tv_profile_id": profile_id, "reason": outcome["skipped"]})
+                    else:
+                        errors.append(f"{profile_id}: {outcome['error']}")
+                except Exception:
+                    errors.append(f"{profile_id}: album display was not confirmed")
 
             if results and not skipped and not errors:
                 status = "displayed"
@@ -1431,7 +1604,14 @@ class LiveAlbumService:
                 continue
             if content_ids:
                 try:
-                    if not delete_art(profile, content_ids):
+                    from frameart.art_delivery import CatalogDeliveryService
+
+                    verified = [
+                        identity
+                        for identity in content_ids
+                        if CatalogDeliveryService._fingerprint_matches(store, profile, identity)
+                    ]
+                    if verified and not delete_art(profile, verified, require_art_mode=True):
                         failures.append(f"{profile_id}: TV did not delete album photos")
                 except Exception as exc:
                     failures.append(f"{profile_id}: {exc}")

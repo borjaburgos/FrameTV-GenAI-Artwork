@@ -9,16 +9,20 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from urllib.parse import urlencode, urljoin, urlsplit
 
 import httpx2 as httpx
 
-PILOT_LIMIT = 20
+CATALOG_LIMIT = 1000
+# Kept for integrations using the pilot's original public constant.
+PILOT_LIMIT = CATALOG_LIMIT
+COLLECTION_PAGE_SIZE = 100
 MAX_API_BYTES = 2 * 1024 * 1024
 MAX_THUMBNAIL_BYTES = 5 * 1024 * 1024
+MAX_RENDITION_BYTES = 32 * 1024 * 1024
 READ_FUNCTIONS = frozenset({"do_search", "get_resource_field_data", "get_resource_path"})
 _FRAMEART_FIELDS = (
     "frameart_id",
@@ -122,8 +126,68 @@ def signed_post_data(user: str, key: str, function: str, **parameters: object) -
     return {"query": query + "&sign=" + signature, "sign": signature, "user": user}
 
 
+def bounded_search(call: Callable, search: str, *, maximum: int = CATALOG_LIMIT) -> list[dict]:
+    """Read every ordered search page, refusing partial or changing results.
+
+    ResourceSpace 10.3+ returns ``{total, data}`` for an offset,count
+    fetchrows value. Requiring that envelope detects silent truncation;
+    ordered unique references detect ignored offsets and repeated pages.
+    """
+    if (
+        isinstance(maximum, bool)
+        or not isinstance(maximum, int)
+        or not 1 <= maximum <= CATALOG_LIMIT
+    ):
+        raise ResourceSpaceError("ResourceSpace search limit is invalid.")
+    resources: list[dict] = []
+    total: int | None = None
+    last_ref = 0
+    while total is None or len(resources) < total:
+        result = call(
+            "do_search",
+            search=search,
+            archive=0,
+            order_by="resourceid",
+            sort="asc",
+            fetchrows=f"{len(resources)},{COLLECTION_PAGE_SIZE}",
+        )
+        if not isinstance(result, dict):
+            raise ResourceSpaceError("ResourceSpace returned an invalid collection page.")
+        reported = _decimal_integer(result.get("total"))
+        if reported is None:
+            raise ResourceSpaceError("ResourceSpace returned an invalid collection total.")
+        if reported > maximum:
+            raise ResourceSpaceError("ResourceSpace collection exceeds the catalog size limit.")
+        if total is not None and reported != total:
+            raise ResourceSpaceError("ResourceSpace collection changed during pagination.")
+        total = reported
+        rows = result.get("data")
+        expected = min(COLLECTION_PAGE_SIZE, total - len(resources))
+        if not isinstance(rows, list) or len(rows) != expected:
+            raise ResourceSpaceError("ResourceSpace returned an incomplete collection page.")
+        for row in rows:
+            ref = _decimal_integer(row.get("ref")) if isinstance(row, dict) else None
+            if ref is None or ref <= last_ref:
+                raise ResourceSpaceError(
+                    "ResourceSpace returned duplicate or invalid artwork references."
+                )
+            last_ref = ref
+        resources.extend(rows)
+    return resources
+
+
+def _decimal_integer(value: object) -> int | None:
+    """Accept bounded JSON integers/decimal strings, never floats or booleans."""
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return None
+    encoded = str(value)
+    if not 1 <= len(encoded) <= 20 or not encoded.isascii() or not encoded.isdecimal():
+        return None
+    return int(encoded)
+
+
 class ResourceSpaceClient:
-    """Read one collection and its already-generated previews with hard limits."""
+    """Read a bounded collection and its existing image files with hard limits."""
 
     def __init__(self, base_url: str, user: str, key: str, *, timeout: float = 10) -> None:
         self.base_url = validated_base_url(base_url)
@@ -137,7 +201,7 @@ class ResourceSpaceClient:
         payload = bytearray()
         for chunk in response.iter_bytes():
             if len(payload) + len(chunk) > maximum:
-                raise ResourceSpaceError("ResourceSpace response exceeded the pilot size limit.")
+                raise ResourceSpaceError("ResourceSpace response exceeded its size limit.")
             payload.extend(chunk)
         return bytes(payload)
 
@@ -170,20 +234,7 @@ class ResourceSpaceClient:
         return result
 
     def collection_resources(self, collection_id: int) -> list[dict]:
-        result = self.call(
-            "do_search",
-            search=f"!collection{collection_id}",
-            archive=0,
-            order_by="resourceid",
-            sort="asc",
-            fetchrows=f"0,{PILOT_LIMIT}",
-        )
-        rows = result.get("data") if isinstance(result, dict) else result
-        if not isinstance(rows, list) or len(rows) > PILOT_LIMIT:
-            raise ResourceSpaceError("ResourceSpace returned an invalid pilot collection.")
-        if any(not isinstance(row, dict) for row in rows):
-            raise ResourceSpaceError("ResourceSpace returned an invalid pilot collection.")
-        return rows
+        return bounded_search(self.call, f"!collection{collection_id}")
 
     def resource_fields(self, ref: int) -> dict[str, str]:
         result = self.call("get_resource_field_data", resource=ref)
@@ -219,16 +270,36 @@ class ResourceSpaceClient:
                 break
         if result is None or result is False:
             return None
+        return self._download_image(result, MAX_THUMBNAIL_BYTES, "preview")
+
+    def rendition(self, ref: int) -> bytes:
+        """Read an existing managed JPEG rendition; never generate or alter it."""
+        if isinstance(ref, bool) or not isinstance(ref, int) or ref < 1:
+            raise ResourceSpaceError("ResourceSpace artwork reference must be a positive integer.")
+        result = self.call(
+            "get_resource_path",
+            ref=ref,
+            size="",
+            generate=0,
+            extension="jpg",
+            write_metadata=False,
+        )
+        if result is None or result is False:
+            raise ResourceSpaceError("ResourceSpace artwork rendition is unavailable.")
+        return self._download_image(result, MAX_RENDITION_BYTES, "rendition")
+
+    def _download_image(self, result: object, maximum: int, label: str) -> bytes:
+        """Keep every temporarily authorized image URL on the configured origin."""
         if not isinstance(result, str) or not result:
-            raise ResourceSpaceError("ResourceSpace returned an invalid preview location.")
-        location = urljoin(self.base_url + "/", result)
+            raise ResourceSpaceError(f"ResourceSpace returned an invalid {label} location.")
         try:
+            location = urljoin(self.base_url + "/", result)
             origin, target = urlsplit(self.base_url), urlsplit(location)
             origin_port = origin.port or (443 if origin.scheme == "https" else 80)
             target_port = target.port or (443 if target.scheme == "https" else 80)
         except ValueError:
             raise ResourceSpaceError(
-                "ResourceSpace returned an invalid preview location."
+                f"ResourceSpace returned an invalid {label} location."
             ) from None
         if (
             (origin.scheme, origin.hostname, origin_port)
@@ -237,7 +308,7 @@ class ResourceSpaceClient:
             or target.password is not None
             or target.fragment
         ):
-            raise ResourceSpaceError("ResourceSpace preview must use the configured server.")
+            raise ResourceSpaceError(f"ResourceSpace {label} must use the configured server.")
         try:
             with (
                 _redacted_preview_logs(),
@@ -248,8 +319,8 @@ class ResourceSpaceClient:
                 ) as client,
                 client.stream("GET", location) as response,
             ):
-                return self._read_response(response, MAX_THUMBNAIL_BYTES)
+                return self._read_response(response, maximum)
         except ResourceSpaceError:
             raise
         except Exception:
-            raise ResourceSpaceError("Could not read a ResourceSpace preview.") from None
+            raise ResourceSpaceError(f"Could not read a ResourceSpace {label}.") from None

@@ -814,12 +814,57 @@ FrameArt can browse a read-only ResourceSpace collection with artist credits,
 artwork details, museum/source and license links, crop information, and explicit
 AI provenance. Metadata and previews are cached locally so browsing never scans
 the NAS or waits for ResourceSpace. An unsuccessful refresh retains the last good
-catalog. This pilot is limited to 20 artworks and does not change TV playback.
+catalog. Collections are paginated with a 1,000-artwork safety bound, including
+365-work annual collections. Refresh runs in the background with visible progress;
+the last good cache remains available until the complete refresh succeeds.
 
 See [the ResourceSpace pilot guide](docs/resourcespace-pilot.md) for the isolated
 Docker deployment, read-only source mounts, validated importer and reader-account
 configuration. Original files stay independent of both applications; only copies
 of approved TV renditions are imported into ResourceSpace.
+
+### Daily Art and sending catalog artwork
+
+In **Library → Curated artwork**, use **Send to TV** to choose one configured TV
+or TV group. FrameArt downloads only the approved 3840×2160 RGB JPEG rendition,
+uses no matte, and requires positively confirmed Art Mode immediately before
+upload and selection. Busy, offline and unknown-state TVs are left untouched.
+The request returns promptly and reports per-TV results; it never wakes a TV,
+changes input, or forces Art Mode. An uncertain TV response is not blindly retried.
+
+In **Modes → Daily Art**, import the annual calendar, select a TV or group, set
+the local change time/timezone (midnight by default), then explicitly enable the mode. It starts
+disabled. A calendar contains exact dates, not an interval-based 365-image
+playlist. Today/Tomorrow previews show the scheduled selection; multiple years
+can coexist and roll over automatically. Importing another year does not replace
+the current year or remap movable holidays.
+
+If a TV is being watched, today's artwork stays pending until it is safely in
+Art Mode, with unsuccessful TVs retried hourly. Missed days are not played back
+in a burst. Uncertain selections receive read-only reconciliation before any
+retry; an unknown upload is never blindly duplicated. Restart, daylight-saving
+changes and partial-group failures do not repeat already confirmed deliveries.
+An explicit manual selection through FrameArt holds that TV's automatic artwork
+for the remainder of its local day. Pause, hold-until-tomorrow and explicit hold
+clearing are available. New family-album photos have higher priority than Daily
+Art on the album's configured TVs: once detected, they display as soon as Art
+Mode is safe and hold that TV until the next local midnight. A pending photo
+keeps priority across midnight until it can be shown. Unchanged album polling
+does not renew the hold; other TVs remain independent. Clearing manual holds
+does not clear album priority. The album's targets, polling and auto-display
+settings are preserved. An overlapping sports feed still blocks Daily Art;
+another mode is never silently disabled.
+
+The originals remain read-only. FrameArt caches at most eight full-resolution
+renditions locally and retains a small set of its own daily uploads on each TV.
+TV content IDs are revalidated rather than trusted after a factory reset. Art
+chosen manually, unrelated TV photos, the currently selected image and any image
+whose ownership cannot be confirmed are not deleted by daily retention.
+
+See the [catalog guide](docs/resourcespace-pilot.md#expand-an-existing-pilot-to-365)
+for the explicit full-library import and calendar schema. Calendar import and
+Daily Art configuration require admin access; catalog sending requires control
+access. Browsing never reveals ResourceSpace credentials or temporary image URLs.
 
 ## Data Layout
 
@@ -837,6 +882,8 @@ of approved TV renditions are imported into ResourceSpace.
     192_168_1_100.token  # Samsung TV auth tokens
     provider-keys.yaml   # Image-provider API keys (mode 0600)
     integration-keys.yaml # Sports and other integration keys (mode 0600)
+  catalog-renditions/    # Bounded full-frame cache; not NAS originals
+  daily-art.sqlite3     # Private calendar, holds and durable daily delivery state
 ```
 
 ---

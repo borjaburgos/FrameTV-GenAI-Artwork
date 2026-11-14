@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import threading
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -235,6 +236,112 @@ def test_duplicate_ids_do_not_replace_existing_cache(settings):
     assert store.thumbnail(record.id) == b"old-preview"
 
 
+def test_cached_lookup_returns_typed_metadata_without_network(settings, monkeypatch):
+    store = ArtCatalogStore(settings.data_dir)
+    record = ArtworkMetadata.model_validate(artwork_data(rendition_ref=7))
+    store.replace([(record, b"preview")], settings)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Cached artwork lookup must not contact ResourceSpace")
+
+    monkeypatch.setattr(art_catalog, "ResourceSpaceClient", forbidden)
+    assert store.get("water-lilies") == record
+    assert store.get("missing") is None
+    assert store.get("' OR 1=1 --") is None
+
+
+def test_full_year_sync_reports_progress_and_gets_all_cached_items(settings, monkeypatch):
+    preview = thumbnail_bytes()
+
+    class FullLibrary:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def collection_resources(self, collection_id):
+            return [{"ref": ref} for ref in range(1, 366)]
+
+        def resource_fields(self, ref):
+            return {"frameart_metadata": json.dumps(artwork_data(id=f"artwork-{ref}"))}
+
+        def thumbnail(self, ref, extension):
+            return preview
+
+    # JPEG/WebP conversion is tested independently; avoid encoding 365 copies
+    # here so this test focuses on complete catalog persistence and progress.
+    monkeypatch.setattr(art_catalog, "_webp_thumbnail", lambda payload: b"cached-webp")
+    monkeypatch.setattr(art_catalog, "ResourceSpaceClient", FullLibrary)
+    progress = []
+    snapshot = sync_catalog(settings, lambda done, total: progress.append((done, total)))
+    assert snapshot["status"] == "ready"
+    assert snapshot["item_count"] == len(snapshot["items"]) == 365
+    assert snapshot["catalog_limit"] == 1000
+    assert progress == [(done, 365) for done in range(366)]
+    store = ArtCatalogStore(settings.data_dir)
+    assert store.get("artwork-365").rendition_ref == 365
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Catalog GET must remain local, even for a full year")
+
+    monkeypatch.setattr(art_catalog, "ResourceSpaceClient", forbidden)
+    app = FastAPI()
+    app.include_router(create_art_catalog_router(lambda: settings))
+    with TestClient(app) as client:
+        response = client.get("/art-catalog")
+        assert response.status_code == 200
+        assert response.json()["items"] == snapshot["items"]
+
+
+@pytest.mark.parametrize("failure", ["pagination", "metadata", "duplicate_ids", "overflow"])
+def test_large_library_failure_preserves_exact_previous_cache(settings, monkeypatch, failure):
+    monkeypatch.setattr(art_catalog, "ResourceSpaceClient", FakeResourceSpace)
+    baseline = sync_catalog(settings)
+    store = ArtCatalogStore(settings.data_dir)
+    old_thumbnail = store.thumbnail("water-lilies")
+
+    class BrokenLibrary:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def collection_resources(self, collection_id):
+            if failure == "pagination":
+                raise ResourceSpaceError("ResourceSpace returned an incomplete collection page.")
+            return [{"ref": ref} for ref in range(1, 1002 if failure == "overflow" else 366)]
+
+        def resource_fields(self, ref):
+            if failure == "metadata" and ref == 250:
+                raise RuntimeError("private-reader-key and private upstream URL")
+            artwork_id = "duplicated" if failure == "duplicate_ids" else f"artwork-{ref}"
+            return {"frameart_metadata": json.dumps(artwork_data(id=artwork_id))}
+
+        def thumbnail(self, ref, extension):
+            return b"not-needed"
+
+    monkeypatch.setattr(art_catalog, "_webp_thumbnail", lambda payload: b"new-preview")
+    monkeypatch.setattr(art_catalog, "ResourceSpaceClient", BrokenLibrary)
+    with pytest.raises(ResourceSpaceError) as error:
+        sync_catalog(settings)
+    assert "private-reader-key" not in str(error.value)
+    retained = store.snapshot(settings)
+    assert retained["status"] == "stale"
+    assert retained["items"] == baseline["items"]
+    assert retained["last_synced_at"] == baseline["last_synced_at"]
+    assert store.thumbnail("water-lilies") == old_thumbnail
+
+
+def test_catalog_store_accepts_1000_but_refuses_overflow_atomically(settings):
+    store = ArtCatalogStore(settings.data_dir)
+    records = [
+        (ArtworkMetadata.model_validate(artwork_data(id=f"artwork-{ref}")), b"preview")
+        for ref in range(1000)
+    ]
+    store.replace(records, settings)
+    baseline = store.snapshot(settings)
+    assert baseline["item_count"] == 1000
+    with pytest.raises(ResourceSpaceError, match="size limit"):
+        store.replace(records + [(ArtworkMetadata.model_validate(artwork_data()), None)], settings)
+    assert store.snapshot(settings) == baseline
+
+
 def test_concurrent_sync_is_rejected_and_lock_is_released(settings, monkeypatch):
     entered, release = threading.Event(), threading.Event()
     failures = []
@@ -324,7 +431,7 @@ def test_real_frameart_app_enforces_reader_and_admin_scopes_without_tv_calls(
     settings,
     monkeypatch,
 ):
-    from frameart import api
+    from frameart import api, catalog_sync
     from frameart.tv import controller
 
     secured = settings.model_copy(
@@ -346,6 +453,16 @@ def test_real_frameart_app_enforces_reader_and_admin_scopes_without_tv_calls(
     monkeypatch.setattr(api, "preflight_tv", forbidden)
     monkeypatch.setattr(controller, "_connect", forbidden)
     monkeypatch.setattr(controller, "_connect_art", forbidden)
+    workers = []
+
+    class ControlledThread:
+        def __init__(self, *, target, **kwargs):
+            self.target = target
+
+        def start(self):
+            workers.append(self.target)
+
+    monkeypatch.setattr(catalog_sync, "threading", SimpleNamespace(Thread=ControlledThread))
     # No lifespan context: this test exercises the actual middleware/router,
     # not unrelated scheduler startup or device discovery.
     client = TestClient(api.app)
@@ -356,9 +473,14 @@ def test_real_frameart_app_enforces_reader_and_admin_scopes_without_tv_calls(
     assert client.get("/art-catalog", headers=automation).status_code == 200
     assert client.post("/art-catalog/sync", headers=automation).status_code == 403
     refreshed = client.post("/art-catalog/sync", headers=admin)
-    assert refreshed.status_code == 200
+    assert refreshed.status_code == 202
     assert "private-reader-key" not in refreshed.text
-    preview_url = refreshed.json()["items"][0]["thumbnail_url"]
+    assert refreshed.json()["status"] == "running"
+    assert len(workers) == 1
+    workers[0]()  # Run deterministically, without sleeping or starting an external worker.
+    completed = client.get("/art-catalog", headers=automation).json()
+    assert completed["sync"]["status"] == "completed"
+    preview_url = completed["items"][0]["thumbnail_url"]
     assert client.get(preview_url).status_code == 401
     assert client.get(preview_url, headers=automation).status_code == 200
     assert client.get("/art-catalog", headers=automation).json()["item_count"] == 1
