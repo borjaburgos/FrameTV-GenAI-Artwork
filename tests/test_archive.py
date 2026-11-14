@@ -303,6 +303,9 @@ def test_verified_cleanup_failure_does_not_revoke_receipt(setup_archive):
     with patch.object(archive.shutil, "rmtree", side_effect=OSError("local cleanup error")):
         assert store.run(discover=False)["verified"] == 1
     assert store.status()["failed"] == 0
+    assert (store.outbox / KEY).exists()
+    assert store.run(discover=False)["verified"] == 1
+    assert not (store.outbox / KEY).exists()
 
 
 def test_generate_only_stages_locally_and_nas_failure_cannot_affect_result(setup_archive):

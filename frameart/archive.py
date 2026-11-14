@@ -146,8 +146,10 @@ def _metadata(settings: Settings, raw: dict) -> dict:
             result[name] = sanitize_log_value(value, secrets=secrets)
         elif value is None or type(value) in (int, float, bool):
             result[name] = value
-        elif name == "postprocess_steps" and isinstance(value, list) and all(
-            isinstance(step, str) for step in value
+        elif (
+            name == "postprocess_steps"
+            and isinstance(value, list)
+            and all(isinstance(step, str) for step in value)
         ):
             result[name] = [sanitize_log_value(step, secrets=secrets) for step in value]
     # Deliberately exclude raw provider responses, URLs, arbitrary nested
@@ -434,6 +436,22 @@ class ArchiveStore:
         if not self.settings.archive_enabled:
             raise ValueError("Archive is disabled.")
         with self._lock("worker.lock", blocking=False):
+            # Retry interrupted local cleanup, but only against an immutable
+            # verified receipt. This path never contacts or deletes from NAS.
+            with self._connect() as connection:
+                verified = connection.execute(
+                    "SELECT generation_key,manifest_sha256 FROM generations WHERE state='verified'"
+                ).fetchall()
+            for key, checksum in verified:
+                try:
+                    leftover = _plain_path(self.outbox / _key(key))
+                    if leftover.exists():
+                        _verify(leftover, key)
+                        if _digest(leftover / "manifest.json") != checksum:
+                            raise ArchiveConflictError("Verified local outbox was modified.")
+                        shutil.rmtree(leftover)
+                except (OSError, ValueError, RuntimeError):
+                    logger.warning("Verified local outbox cleanup still needs attention.")
             discovery = self.backfill() if discover else None
             with self._connect() as connection:
                 rows = connection.execute(
