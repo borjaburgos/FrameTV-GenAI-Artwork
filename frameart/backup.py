@@ -60,6 +60,18 @@ def create_data_backup(data_dir: Path, output: Path | None = None) -> Path:
 
         def ignore_backup_state(directory: str, names: list[str]) -> list[str]:
             ignored = [name for name in names if name in _DATABASE_FILES]
+            if Path(directory).resolve() == source / "archive":
+                ignored.extend(
+                    name
+                    for name in names
+                    if name
+                    in {
+                        "queue.sqlite3",
+                        "queue.sqlite3-journal",
+                        "queue.sqlite3-wal",
+                        "queue.sqlite3-shm",
+                    }
+                )
             if Path(directory).resolve() == source:
                 ignored.extend(name for name in names if name == "backups")
             return ignored
@@ -77,6 +89,18 @@ def create_data_backup(data_dir: Path, output: Path | None = None) -> Path:
             ):
                 live.backup(snapshot)
             os.chmod(stage / "frameart.sqlite3", 0o600)
+
+        # The independent archive queue is also live SQLite state. Never copy
+        # its database/journal bytes mid-transaction as an ordinary file.
+        queue = source / "archive" / "queue.sqlite3"
+        if queue.is_file():
+            queue_target = stage / "archive" / "queue.sqlite3"
+            with (
+                sqlite3.connect(queue, timeout=30) as live,
+                sqlite3.connect(queue_target) as snapshot,
+            ):
+                live.backup(snapshot)
+            os.chmod(queue_target, 0o600)
 
         manifest = {
             "format_version": BACKUP_FORMAT_VERSION,

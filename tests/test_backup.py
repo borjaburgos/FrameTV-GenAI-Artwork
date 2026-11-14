@@ -50,6 +50,29 @@ def test_backup_rejects_symbolic_links(tmp_path: Path):
         create_data_backup(data_dir, tmp_path / "backup.tar.gz")
 
 
+def test_backup_snapshots_live_archive_queue_including_wal(tmp_path: Path):
+    data_dir = _data_dir(tmp_path)
+    (data_dir / "archive").mkdir()
+    queue = data_dir / "archive" / "queue.sqlite3"
+    with sqlite3.connect(queue) as live:
+        live.execute("PRAGMA journal_mode=WAL")
+        live.execute("CREATE TABLE generations (generation_key TEXT)")
+        live.execute("INSERT INTO generations VALUES ('queued-generation')")
+        live.commit()
+        archive_path = create_data_backup(data_dir, tmp_path / "backup.tar.gz")
+        with tarfile.open(archive_path) as archive:
+            names = archive.getnames()
+            assert not any(name.endswith(("-wal", "-shm", "-journal")) for name in names)
+            restored_queue = tmp_path / "recovered-queue.sqlite3"
+            stream = archive.extractfile("frameart-backup/archive/queue.sqlite3")
+            assert stream is not None
+            restored_queue.write_bytes(stream.read())
+        with sqlite3.connect(restored_queue) as restored:
+            assert restored.execute("SELECT generation_key FROM generations").fetchone() == (
+                "queued-generation",
+            )
+
+
 def test_in_volume_backup_is_not_nested_and_survives_restore(tmp_path: Path):
     data_dir = _data_dir(tmp_path)
     backups_dir = data_dir / "backups"

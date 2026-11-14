@@ -128,6 +128,13 @@ class Settings(BaseSettings):
     # Directories
     data_dir: Path = DEFAULT_DATA_DIR
 
+    # Append-only NAS archive. The application only stages local snapshots;
+    # `frameart archive run` performs network I/O in a separate process.
+    archive_enabled: bool = False
+    archive_path: Path | None = None
+    archive_mount_source: str | None = None
+    archive_id: str | None = Field(None, min_length=1, max_length=200)
+
     # Optional local artwork catalog. The API key stays server-side; FrameArt
     # only reads the selected pilot collection, never uploads or deletes files.
     resourcespace_url: str | None = None

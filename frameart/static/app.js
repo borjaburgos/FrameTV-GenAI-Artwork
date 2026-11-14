@@ -2356,6 +2356,7 @@
   }
 
   async function loadManagementSettings(triggerButton) {
+    void loadArchiveStatus();
     if (triggerButton) setButtonBusy(triggerButton, 'Refreshing...');
     try {
       const [providerResponse, tvResponse, backupResponse, accessResponse, sportsResponse] =
@@ -2409,6 +2410,36 @@
       if (triggerButton) clearButtonBusy(triggerButton);
     }
   }
+
+  async function loadArchiveStatus(button) {
+    if (button) setButtonBusy(button, 'Refreshing...');
+    const container = document.getElementById('settings-archive-status');
+    try {
+      const response = await apiFetch('/archive/status');
+      const status = await parseJSONResponse(response, 'Could not load archive status.');
+      const last = status.last_verified_at
+        ? new Date(status.last_verified_at * 1000).toLocaleString() : 'Never';
+      const oldest = status.oldest_pending_at
+        ? new Date(status.oldest_pending_at * 1000).toLocaleString() : 'None';
+      const behind = status.oldest_pending_at && Date.now() / 1000 - status.oldest_pending_at > 900;
+      container.innerHTML = '<div class="settings-item"><strong>' +
+        (status.enabled ? (status.failed || behind ? 'Archive needs attention' : 'Archive enabled')
+          : 'Archive disabled') + '</strong><span>' +
+        esc(String(status.verified)) + ' verified · ' + esc(String(status.pending)) +
+        ' pending · ' + esc(String(status.failed)) + ' failed</span></div>' +
+        '<div class="settings-item"><strong>Last verified: ' + esc(last) +
+        '</strong><span>Oldest pending: ' + esc(oldest) + '</span></div>';
+    } catch (error) {
+      container.innerHTML = '<div class="settings-item"><strong>Archive status unavailable</strong>' +
+        '<span>' + esc(error?.message || 'Try refreshing.') + '</span></div>';
+    } finally {
+      if (button) clearButtonBusy(button);
+    }
+  }
+
+  document.getElementById('btn-archive-refresh').addEventListener('click', (event) => {
+    void loadArchiveStatus(event.currentTarget);
+  });
 
   function renderSportsIntegrationSettings() {
     const state = document.getElementById('settings-sportsdb-key-state');

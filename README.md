@@ -808,6 +808,18 @@ See [docs/LXC.md](docs/LXC.md) for running FrameArt in a Proxmox LXC container. 
 
 ---
 
+## Generated-art NAS archive
+
+FrameArt can preserve generated originals, TV-ready images and sanitized generation
+metadata in an append-only NAS archive, separate from curated Daily Art. A durable
+local outbox and independent worker keep NAS outages out of generation and TV
+display. Library deletion never deletes an archived image. Settings → Storage
+shows pending/failed counts and verification timestamps.
+
+See the [NAS archive guide](docs/nas-archive.md) for scoped mount provisioning,
+checksum verification, a one-minute timer, backfill and offline restore tests.
+This is opt-in and does not replace full application or off-site backups.
+
 ## Optional ResourceSpace artwork catalog
 
 FrameArt can browse a read-only ResourceSpace collection with artist credits,
