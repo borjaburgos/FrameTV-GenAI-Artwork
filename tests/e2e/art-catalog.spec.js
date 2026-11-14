@@ -89,7 +89,7 @@ test('curated library searches artists, shows verified metadata and keeps unsafe
   await root.getByLabel('Search curated artwork').fill('geometry');
   await expect(root.locator('.art-catalog-card')).toHaveCount(1);
   await expect(root.getByText('AI-created original', {exact: true})).toBeVisible();
-  await root.locator('.art-catalog-card button').click();
+  await root.locator('.art-catalog-card [data-art-catalog-id]').click();
   const aiDialog = page.locator('#art-catalog-dialog');
   await expect(aiDialog.getByRole('heading', {name: catalog().items[1].title, exact: true})).toBeVisible();
   await expect(aiDialog.getByText('Creator & provenance', {exact: true})).toBeVisible();
@@ -132,6 +132,59 @@ test('unconfigured catalog explains setup without interrupting the existing artw
   await expect(root.getByRole('button', {name: 'Refresh metadata'})).toBeDisabled();
   await expect(page.getByRole('heading', {name: 'Artwork Library', exact: true})).toBeVisible();
   await expect(page.locator('#btn-refresh-gallery')).toBeEnabled();
+});
+
+test('dislike removes a card, then adds a fresh replacement without touching TVs', async ({page}) => {
+  const initial = catalog();
+  initial.replacements = {pending_count: 0, rejected_count: 0, jobs: []};
+  const store = await mockCatalog(page, initial);
+  let checks = 0;
+  let disliked = false;
+  const writes = [];
+  const fresh = {...initial.items[0], id: 'fresh-aic-9000', title: 'Fresh public-domain landscape',
+    thumbnail_url: '/art-catalog/fresh-aic-9000/thumbnail'};
+  const job = {artwork_id: 'rs-1', title: 'Water Lilies', status: 'queued', replacement_id: null};
+  page.on('request', (request) => {
+    if (request.method() === 'POST') writes.push(new URL(request.url()).pathname);
+  });
+  await page.route('**/curated-artwork/rs-1/dislike', route => {
+    disliked = true;
+    return route.fulfill({status: 202, json: job});
+  });
+  await page.route('**/curated-artwork/replacements', route => {
+    checks += 1;
+    const complete = checks > 1;
+    const state = {pending_count: complete ? 0 : 1, rejected_count: 1,
+      jobs: [{...job, status: complete ? 'completed' : 'queued',
+        replacement_id: complete ? fresh.id : null}]};
+    store.setCurrent({...initial, items: complete ? [fresh, initial.items[1]] : [initial.items[1]],
+      item_count: complete ? 2 : 1, replacements: state});
+    return route.fulfill({json: state});
+  });
+  await page.goto('/?page=library');
+  const root = page.locator('#art-catalog-root');
+  await root.getByRole('button', {name: 'Dislike and replace Water Lilies', exact: true}).click();
+  expect(disliked).toBe(true);
+  await expect(root.locator('[data-art-catalog-id="rs-1"]')).toHaveCount(0);
+  await expect(page.locator('#art-catalog-replacements')).toContainText('replacement(s) pending');
+  await expect(root.locator('[data-art-catalog-id="fresh-aic-9000"]')).toBeVisible({timeout: 12000});
+  await expect(root.locator('.art-catalog-card')).toHaveCount(2);
+  await root.getByRole('button', {name: 'Refresh metadata'}).click();
+  await expect(root.locator('[data-art-catalog-id="rs-1"]')).toHaveCount(0);
+  expect(writes.some(path => /\/tv\/|\/jobs\//.test(path))).toBe(false);
+});
+
+test('failed dislike leaves the card intact and always releases its button', async ({page}) => {
+  await mockCatalog(page);
+  await page.route('**/curated-artwork/rs-1/dislike', route =>
+    route.fulfill({status: 403, json: {detail: 'Administrator access is required.'}}));
+  await page.goto('/?page=library');
+  const button = page.getByRole('button', {name: 'Dislike and replace Water Lilies', exact: true});
+  await button.click();
+  await expect(button).toBeEnabled();
+  await expect(button).toContainText('Dislike & replace');
+  await expect(page.locator('[data-art-catalog-id="rs-1"]')).toBeVisible();
+  await expect(page.locator('#art-catalog-error')).toHaveText('Administrator access is required.');
 });
 
 test('stale catalog and artwork details remain usable without horizontal overflow on mobile', async ({page}, testInfo) => {

@@ -18,6 +18,10 @@
   let targetError = '';
   let selectedItem = null;
   let sending = false;
+  let replacementTimer = null;
+  const rejectedIds = new Set();
+  const disliking = new Set();
+  let replacementRefreshPending = false;
 
   function esc(value) {
     return String(value ?? '').replace(/[&<>"']/g, (char) => ({
@@ -84,7 +88,9 @@
       '<span class="art-catalog-caption"><strong>' + esc(item.title) + '</strong><span>' +
       esc(creator(item)) + (item.date ? ' · ' + esc(item.date) : '') + '</span>' +
       (item.ai_generated ? '<span class="art-catalog-ai">AI-created original</span>' : '') +
-      '<span>View artwork &amp; artist details →</span></span></button></article>').join('');
+      '<span>View artwork &amp; artist details →</span></span></button>' +
+      '<button class="art-catalog-dislike" type="button" data-dislike-id="' + esc(item.id) +
+      '" aria-label="Dislike and replace ' + esc(item.title) + '"><span aria-hidden="true">👎</span> Dislike &amp; replace</button></article>').join('');
     empty.hidden = filtered.length > 0;
     if (items.length && !filtered.length) empty.textContent = 'No artwork matches this search. Try another artist, title or tag.';
     else if (snapshot?.configured === false) {
@@ -166,9 +172,16 @@
       '<label for="art-catalog-target">TV or TV group</label><select id="art-catalog-target" autocomplete="off" data-1p-ignore="true">' +
       targetOptions() + '</select><p class="hint">Only TVs confirmed to be in Art Mode can change artwork. Active viewing, offline TVs, or an uncertain status leave the screen untouched.</p>' +
       '<button class="btn" id="art-catalog-send" type="button"' + (!targets.length ? ' disabled' : '') + '>Send to TV</button>' +
-      '<p id="art-catalog-delivery" class="art-catalog-delivery" role="status" aria-live="polite"></p></section>';
+      '<p id="art-catalog-delivery" class="art-catalog-delivery" role="status" aria-live="polite"></p></section>' +
+      '<section class="art-catalog-replace"><h3>Not for your collection?</h3>' +
+      '<button class="btn btn-secondary" type="button" data-dislike-id="' + esc(item.id) +
+      '"><span aria-hidden="true">👎</span> Dislike &amp; replace</button>' +
+      '<p class="hint">Removes this piece from your active collection and finds a new, full-frame public-domain artwork. Protected NAS originals and current TV playback are left untouched.</p></section>';
     wireImageFallbacks(detail);
     detail.querySelector('#art-catalog-send').addEventListener('click', sendArtwork);
+    detail.querySelector('[data-dislike-id]').addEventListener('click', (event) => {
+      void dislikeArtwork(event.currentTarget);
+    });
     dialog.showModal();
   }
 
@@ -261,8 +274,10 @@
         pollTimer = setTimeout(() => load(), 1800);
       }
       if (!result || !Array.isArray(result.items)) throw new Error('The artwork catalog response was invalid.');
+      result.items = result.items.filter((item) => !rejectedIds.has(item.id));
       snapshot = result;
       renderStatus();
+      renderReplacements(result.replacements || {pending_count: 0, jobs: []});
     } catch (error) {
       if (snapshot?.items?.length) {
         status.dataset.state = 'stale';
@@ -280,8 +295,98 @@
       refresh.disabled = snapshot?.configured === false;
       refresh.textContent = 'Refresh metadata';
       root.setAttribute('aria-busy', 'false');
+      if (replacementRefreshPending) {
+        replacementRefreshPending = false;
+        setTimeout(() => load(), 0);
+      }
     }
   }
+
+  function renderReplacements(state) {
+    if (snapshot) snapshot.replacements = state;
+    const container = document.getElementById('art-catalog-replacements');
+    container.hidden = !state.pending_count;
+    const pending = (state.jobs || []).filter((job) => job.status !== 'completed');
+    container.innerHTML = '<strong>' + esc(String(state.pending_count || 0)) +
+      ' new artwork replacement(s) pending</strong><p>Your disliked pieces stay removed. No TV changes or paid generations are requested.</p>' +
+      pending.slice(0, 8).map((job) => '<p>' + esc(job.title || 'Artwork') + ' — ' +
+        (job.status === 'retrying' ? 'Retry scheduled. ' : 'Finding a new artwork… ') +
+        (job.status === 'retrying' ? '<button type="button" class="btn btn-small btn-secondary" data-replacement-retry="' +
+          esc(job.artwork_id) + '">Retry now</button>' : '') + '</p>').join('');
+    clearTimeout(replacementTimer);
+    if (state.pending_count) replacementTimer = setTimeout(pollReplacements, 4000);
+  }
+
+  async function pollReplacements() {
+    try {
+      const response = await services.apiFetch('/curated-artwork/replacements');
+      const state = await services.parseJSONResponse(response, 'Could not check replacements.');
+      const completed = (value) => (value?.jobs || []).filter((job) => job.status === 'completed')
+        .map((job) => job.artwork_id + ':' + job.replacement_id).sort().join('|');
+      const changed = completed(state) !== completed(snapshot?.replacements);
+      renderReplacements(state);
+      if (changed) {
+        if (loading) replacementRefreshPending = true;
+        else await load();
+      }
+    } catch (_) {
+      replacementTimer = setTimeout(pollReplacements, 15000);
+    }
+  }
+
+  async function dislikeArtwork(button) {
+    const id = button.dataset.dislikeId;
+    if (!services || disliking.has(id)) return;
+    disliking.add(id);
+    const label = button.textContent;
+    button.disabled = true;
+    button.textContent = 'Removing…';
+    try {
+      const response = await services.apiFetch('/curated-artwork/' + encodeURIComponent(id) + '/dislike', {method: 'POST'});
+      const result = await services.parseJSONResponse(response, 'Could not remove this artwork.');
+      const old = snapshot?.items.find((item) => item.id === id);
+      rejectedIds.add(id);
+      if (selectedItem?.id === id && dialog.open) dialog.close();
+      if (snapshot) snapshot.items = snapshot.items.filter((item) => item.id !== id);
+      renderCards();
+      if (result.status !== 'completed') {
+        const state = snapshot?.replacements || {pending_count: 0, jobs: []};
+        const jobs = (state.jobs || []).filter((job) => job.artwork_id !== id);
+        renderReplacements({ ...state, pending_count: state.pending_count +
+          (jobs.length === (state.jobs || []).length ? 1 : 0),
+          jobs: [{...result, title: old?.title || 'Artwork'}, ...jobs] });
+      }
+      await pollReplacements();
+    } catch (error) {
+      errorBox.hidden = false;
+      errorBox.textContent = error?.message || 'Could not remove this artwork.';
+    } finally {
+      disliking.delete(id);
+      button.disabled = false;
+      button.textContent = label;
+    }
+  }
+
+  grid.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-dislike-id]');
+    if (button) void dislikeArtwork(button);
+  });
+
+  document.getElementById('art-catalog-replacements').addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-replacement-retry]');
+    if (!button) return;
+    button.disabled = true;
+    try {
+      const response = await services.apiFetch('/curated-artwork/' + encodeURIComponent(button.dataset.replacementRetry) + '/retry', {method: 'POST'});
+      await services.parseJSONResponse(response, 'Could not retry replacement.');
+      await pollReplacements();
+    } catch (error) {
+      errorBox.hidden = false;
+      errorBox.textContent = error?.message || 'Could not retry replacement.';
+    } finally {
+      button.disabled = false;
+    }
+  });
 
   search.addEventListener('input', () => { visibleCount = 24; renderCards(); });
   document.getElementById('art-catalog-more').addEventListener('click', () => {

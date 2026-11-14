@@ -19,6 +19,7 @@ from frameart.art_catalog import (
 )
 from frameart.art_delivery import CatalogDeliveryService, CatalogDeliveryStore, resolve_targets
 from frameart.catalog_sync import start_sync, sync_progress
+from frameart.curated_replacements import CuratedReplacementService, CuratedReplacementStore
 from frameart.daily_art import DailyArtStore
 
 _ARTWORK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$")
@@ -124,10 +125,12 @@ def _invalid_constant(value):
 def create_art_catalog_router(
     settings_loader: Callable,
     delivery: CatalogDeliveryService | None = None,
+    replacements: CuratedReplacementService | None = None,
 ) -> APIRouter:
     """Mount behind FrameArt's existing authentication and admin middleware."""
     router = APIRouter()
     delivery = delivery or CatalogDeliveryService(settings_loader)
+    replacements = replacements or CuratedReplacementService(settings_loader)
 
     @router.get("/art-catalog")
     def catalog(response: Response):
@@ -135,7 +138,32 @@ def create_art_catalog_router(
         settings = settings_loader()
         result = ArtCatalogStore(settings.data_dir).snapshot(settings)
         result["sync"] = sync_progress(settings)
+        result["replacements"] = CuratedReplacementStore(settings.data_dir).summary()
         return result
+
+    @router.post("/curated-artwork/{artwork_id}/dislike", status_code=202)
+    def dislike(artwork_id: str, response: Response):
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            return replacements.dislike(artwork_id)
+        except KeyError:
+            raise HTTPException(404, "Artwork is not in the active collection.") from None
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+
+    @router.get("/curated-artwork/replacements")
+    def replacement_status(response: Response):
+        response.headers["Cache-Control"] = "no-store"
+        return CuratedReplacementStore(settings_loader().data_dir).summary()
+
+    @router.post("/curated-artwork/{artwork_id}/retry", status_code=202)
+    def retry_replacement(artwork_id: str, response: Response):
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            CuratedReplacementStore(settings_loader().data_dir).retry(artwork_id)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return {"artwork_id": artwork_id, "status": "queued"}
 
     @router.post("/art-catalog/sync", status_code=202)
     def refresh(response: Response):

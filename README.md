@@ -837,6 +837,13 @@ of approved TV renditions are imported into ResourceSpace.
 
 ### Daily Art and sending catalog artwork
 
+Use **👎 Dislike & replace** on a curated artwork card or its details to remove
+it from your active collection and automatically acquire a genuinely new,
+public-domain, full-frame replacement. Rejected pieces stay excluded on refresh;
+progress and retries are visible. NAS masters and TV playback stay untouched.
+See [curated replacements](docs/curated-replacements.md) for deletion boundaries,
+calendar behavior and recovery details.
+
 In **Library → Curated artwork**, use **Send to TV** to choose one configured TV
 or TV group. FrameArt downloads only the approved 3840×2160 RGB JPEG rendition,
 uses no matte, and requires positively confirmed Art Mode immediately before

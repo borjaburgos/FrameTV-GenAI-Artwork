@@ -35,6 +35,27 @@ _tv_locks: dict[str, threading.Lock] = {}
 _cache_lock = threading.RLock()
 
 
+def purge_cached_artwork(data_dir: Path, artwork_id: str) -> None:
+    """Delete only this artwork's unshared local cache; never mutate TV/NAS files."""
+    CatalogDeliveryStore(data_dir)
+    with _cache_lock:
+        with _database(data_dir) as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute("SELECT content_hash FROM catalog_renditions WHERE artwork_id=?",
+                              (artwork_id,)).fetchall()
+            db.execute("DELETE FROM catalog_renditions WHERE artwork_id=?", (artwork_id,))
+            db.execute("DELETE FROM catalog_rendition_sources WHERE artwork_id=?", (artwork_id,))
+            live = {row[0] for row in db.execute("SELECT content_hash FROM catalog_renditions")}
+        directory = Path(data_dir) / "catalog-renditions"
+        if directory.is_symlink():
+            raise ValueError("The rendition cache must not be a symbolic link.")
+        for row in rows:
+            if _HASH.fullmatch(row[0]) and row[0] not in live:
+                path = directory / (row[0] + ".jpg")
+                if path.is_file() and not path.is_symlink():
+                    path.unlink()
+
+
 def tv_delivery_lock(ip: str) -> threading.Lock:
     """Shared whole-delivery arbitration for album and catalog operations.
 
@@ -387,6 +408,9 @@ class CatalogDeliveryService:
             lock.release()
 
     def _rendition(self, settings, artwork) -> tuple[bytes, str]:
+        local = ArtCatalogStore(settings.data_dir).local_rendition(artwork.id)
+        if local is not None:
+            return local
         if not artwork.rendition_ref or not integration_configured(settings):
             raise ResourceSpaceError("The artwork rendition is not configured.")
         directory = Path(settings.data_dir) / "catalog-renditions"
@@ -445,6 +469,8 @@ class CatalogDeliveryService:
                     )
                 image.load()
             digest = hashlib.sha256(payload).hexdigest()
+            if ArtCatalogStore(settings.data_dir).get(artwork.id) is None:
+                raise ResourceSpaceError("The artwork was removed while its image was loading.")
             path = directory / (digest + ".jpg")
             if path.is_symlink():
                 raise ResourceSpaceError("The local rendition cache contains an unsafe path.")
@@ -648,7 +674,10 @@ class CatalogDeliveryService:
                                 return True
                     return any(item["tv"] in {identity, address} for item in state.get("holds", []))
 
-                if not manual and held():
+                def removed() -> bool:
+                    return ArtCatalogStore(settings.data_dir).get(artwork_id) is None
+
+                if removed() or (not manual and held()):
                     results.append(
                         {"tv": tv, "status": "deferred", "detail": "Manual choice is held today."}
                     )
@@ -681,7 +710,7 @@ class CatalogDeliveryService:
                 if row and content_id is None:
                     self._forget_content(settings, profile, row[0])
                 if not content_id:
-                    if not manual and held():
+                    if removed() or (not manual and held()):
                         results.append(
                             {
                                 "tv": tv,
@@ -728,7 +757,7 @@ class CatalogDeliveryService:
                     # thumbnail evidence is unavailable. Without that evidence
                     # do not claim ownership or reuse its potentially recycled ID.
                     self._record_fingerprint(settings, profile, content_id)
-                if not manual and held():
+                if removed() or (not manual and held()):
                     results.append(
                         {
                             "tv": tv,

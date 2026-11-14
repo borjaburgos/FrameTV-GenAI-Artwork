@@ -87,6 +87,7 @@ from frameart.automation import (
     display_artifact,
 )
 from frameart.config import STYLE_PRESETS, ProviderConfig, Settings, TVProfile, load_settings
+from frameart.curated_replacements import CuratedReplacementService
 from frameart.daily_art import DailyArtWorker
 from frameart.jobs import JobQueueFullError
 from frameart.library import LibraryStore
@@ -163,6 +164,7 @@ _ADMIN_PATHS = {
     "/art-catalog/sync",
 }
 _ADMIN_PREFIXES = (
+    "/curated-artwork",
     "/curation",
     "/settings",
     "/automation",
@@ -199,6 +201,7 @@ _automation_scheduler = AutomationScheduler(load_settings)
 _live_score_service = LiveScoreService(load_settings)
 _live_album_service = LiveAlbumService(load_settings)
 _catalog_delivery = CatalogDeliveryService(load_settings)
+_curated_replacements = CuratedReplacementService(load_settings)
 _daily_art_worker = DailyArtWorker(
     load_settings,
     _catalog_delivery.deliver,
@@ -213,10 +216,12 @@ async def _app_lifespan(_app: FastAPI):
     _live_score_service.start()
     _live_album_service.start()
     _catalog_delivery.start()
+    _curated_replacements.start()
     _daily_art_worker.start()
     try:
         yield
     finally:
+        _curated_replacements.stop()
         _daily_art_worker.stop()
         _catalog_delivery.stop()
         _live_album_service.stop()
@@ -1184,7 +1189,7 @@ def _settings():
     return load_settings()
 
 
-app.include_router(create_art_catalog_router(_settings, _catalog_delivery))
+app.include_router(create_art_catalog_router(_settings, _catalog_delivery, _curated_replacements))
 
 
 def _library_store(settings=None) -> LibraryStore:

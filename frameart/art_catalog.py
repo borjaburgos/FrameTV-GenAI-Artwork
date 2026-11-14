@@ -195,6 +195,26 @@ class ArtCatalogStore:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS curated_rejections (
+                    artwork_id TEXT PRIMARY KEY, metadata TEXT NOT NULL,
+                    rejected_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS curated_local_art (
+                    id TEXT PRIMARY KEY, ready INTEGER NOT NULL DEFAULT 0,
+                    metadata TEXT NOT NULL, rendition_hash TEXT NOT NULL,
+                    thumbnail BLOB NOT NULL, rendition BLOB NOT NULL, source_image BLOB NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS curated_seen_sources (
+                    identity TEXT PRIMARY KEY, source_hash TEXT UNIQUE NOT NULL,
+                    rendition_hash TEXT UNIQUE NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS curated_replacement_jobs (
+                    artwork_id TEXT PRIMARY KEY, replacement_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'queued', attempts INTEGER NOT NULL DEFAULT 0,
+                    queued_at REAL NOT NULL, updated_at REAL NOT NULL,
+                    retry_at REAL NOT NULL DEFAULT 0, lease_until REAL NOT NULL DEFAULT 0,
+                    claim_token TEXT, detail TEXT NOT NULL DEFAULT ''
+                );
                 """
             )
         os.chmod(self.database_path, 0o600)
@@ -210,8 +230,13 @@ class ArtCatalogStore:
         with self._connect() as connection:
             state = dict(connection.execute("SELECT key, value FROM art_catalog_state"))
             rows = connection.execute(
-                "SELECT id, metadata, thumbnail IS NOT NULL AS has_thumbnail "
-                "FROM art_catalog_items ORDER BY id LIMIT ?",
+                "SELECT id,metadata,thumbnail IS NOT NULL AS has_thumbnail "
+                "FROM art_catalog_items WHERE id NOT IN "
+                "(SELECT artwork_id FROM curated_rejections) UNION ALL "
+                "SELECT id,metadata,thumbnail IS NOT NULL AS has_thumbnail "
+                "FROM curated_local_art WHERE ready=1 AND id NOT IN "
+                "(SELECT artwork_id FROM curated_rejections) "
+                "ORDER BY id LIMIT ?",
                 (CATALOG_LIMIT,),
             ).fetchall()
         items = []
@@ -249,8 +274,11 @@ class ArtCatalogStore:
         with self._connect() as connection:
             connection.execute("DELETE FROM art_catalog_items")
             connection.executemany(
-                "INSERT INTO art_catalog_items (id, metadata, thumbnail) VALUES (?, ?, ?)",
-                [(record.id, record.model_dump_json(), thumbnail) for record, thumbnail in records],
+                "INSERT INTO art_catalog_items (id, metadata, thumbnail) SELECT ?, ?, ? "
+                "WHERE NOT EXISTS(SELECT 1 FROM curated_rejections WHERE artwork_id=?) "
+                "AND NOT EXISTS(SELECT 1 FROM curated_local_art WHERE id=?)",
+                [(record.id, record.model_dump_json(), thumbnail, record.id, record.id)
+                 for record, thumbnail in records],
             )
             for key, value in (
                 ("last_synced_at", datetime.now(timezone.utc).isoformat()),
@@ -272,7 +300,9 @@ class ArtCatalogStore:
     def thumbnail(self, artwork_id: str) -> bytes | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT thumbnail FROM art_catalog_items WHERE id = ?",
+                "SELECT thumbnail FROM (SELECT id,thumbnail FROM art_catalog_items UNION ALL "
+                "SELECT id,thumbnail FROM curated_local_art WHERE ready=1) WHERE id=? "
+                "AND id NOT IN (SELECT artwork_id FROM curated_rejections)",
                 (artwork_id,),
             ).fetchone()
         return row["thumbnail"] if row else None
@@ -281,9 +311,25 @@ class ArtCatalogStore:
         """Look up one cached artwork without performing any upstream request."""
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT metadata FROM art_catalog_items WHERE id = ?", (artwork_id,)
+                "SELECT metadata FROM (SELECT id,metadata FROM art_catalog_items UNION ALL "
+                "SELECT id,metadata FROM curated_local_art WHERE ready=1) WHERE id=? "
+                "AND id NOT IN (SELECT artwork_id FROM curated_rejections)", (artwork_id,)
             ).fetchone()
         return ArtworkMetadata.model_validate_json(row["metadata"]) if row else None
+
+    def local_rendition(self, artwork_id: str) -> tuple[bytes, str] | None:
+        """Read a self-contained replacement; never contact ResourceSpace/NAS."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT rendition,rendition_hash FROM curated_local_art WHERE id=? AND ready=1 "
+                "AND id NOT IN (SELECT artwork_id FROM curated_rejections)", (artwork_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = bytes(row["rendition"])
+        if hashlib.sha256(payload).hexdigest() != row["rendition_hash"]:
+            raise ResourceSpaceError("The local replacement failed its integrity check.")
+        return payload, row["rendition_hash"]
 
 
 class CatalogSyncBusyError(RuntimeError):
