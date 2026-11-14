@@ -1,8 +1,21 @@
-# Dagger CI
+# Dagger CI with GitHub Actions
 
-This branch adds a Dagger pipeline alongside the existing GitHub Actions checks.
-GitHub Actions remains the active remote gate. Native Dagger Cloud execution and
-branch-gate cutover have not been demonstrated.
+GitHub Actions remains the CI trigger and remote gate. Its jobs run the shared
+Dagger pipeline: trusted jobs are configured to use Cloud Engines for cache and
+traces; fork and other untrusted pull requests use a local engine without Cloud
+credentials. Actual GitHub OIDC eligibility, remote execution, and cross-run
+Cloud cache reuse are still awaiting a verified GitHub run.
+
+These are separate capabilities:
+
+| Component | Role in this setup |
+| --- | --- |
+| GitHub Actions | Trigger main-branch pushes, pull requests, and manual runs; report required checks |
+| Dagger Cloud Engines | Intended remote execution, persistent engine cache, and execution traces for trusted jobs |
+| Native Dagger Cloud Checks | Dagger-managed triggers/checks; off and not required for this GitHub-triggered design |
+
+The release workflow and image publisher are unchanged. Ordinary checks do not
+publish images or require production credentials.
 
 ## Pinned CLI
 
@@ -51,6 +64,67 @@ scripts/ci check --frameart-ci --check=docker
 `scripts/ci check` runs all nine discovered checks: the eight FrameArt checks
 below and the official Python SDK check for stale generated code. The generated
 SDK and client sources remain committed and are marked as generated in GitHub.
+
+## Local and Cloud Engine commands
+
+With no `DAGGER_ENGINE` override, the normal local entry point is:
+
+```sh
+scripts/ci check
+```
+
+An explicitly selected Cloud Engine requires compute authorization. For a
+separately provisioned **ComputeToken**, supply its value through a trusted
+environment variable, not a source file or command-line argument:
+
+```sh
+DAGGER_ENGINE=cloud DAGGER_CLOUD_TOKEN="$DAGGER_COMPUTE_TOKEN" scripts/ci check
+```
+
+`DAGGER_COMPUTE_TOKEN` above is an example variable supplied by the caller; the
+wrapper does not read a token store. The two available organization tokens were
+verified as telemetry tokens, and Cloud Engine provisioning rejected them with
+an invalid-token-type error. A telemetry token is not a ComputeToken. Merely
+attaching a telemetry token to a local engine does not establish remote compute
+or shared Cloud cache reuse.
+
+The GitHub trusted job instead uses the supported first-party OIDC route:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+# Set only on the Dagger step of the trusted job:
+env:
+  DAGGER_ENGINE: cloud
+  DAGGER_CLOUD_TOKEN: oidc
+```
+
+`oidc` is a literal selector for short-lived GitHub identity, not a stored secret.
+No personal OAuth session or API key is saved as a GitHub secret. Successful
+organization/repository eligibility and Cloud Engine provisioning must still be
+proved by an actual trusted GitHub run; this configuration alone is not proof.
+
+## GitHub trust and failure handling
+
+One selected job runs all nine checks through the same pinned `scripts/ci`.
+The trusted Cloud job receives only job-scoped `contents: read` and
+`id-token: write` permissions. Fork and other untrusted pull-request jobs use a
+local engine, have no Cloud credentials, and do not receive OIDC-token write
+permission. They run the same complete check suite, not a reduced substitute.
+
+This separates the ordinary untrusted-PR path; it is not a security boundary
+against a malicious same-repository collaborator who can change a trusted
+workflow or its caller. Repository write access and workflow changes must remain
+trusted and reviewed. Never run untrusted source with Cloud identity merely to
+obtain a cache hit.
+
+The GitHub helper preserves Dagger's exit status and writes the run summary and
+any available trace link even when checks fail. A missing trace on an
+authentication/provisioning failure must not hide the failure or turn the job
+green. Trace links, execution results, and a second unchanged Cloud run will be
+recorded after remote verification; no Cloud performance claim is established
+yet.
 
 ## Check coverage
 
@@ -117,7 +191,8 @@ scripts/ci --progress=plain -vvv check
 ```
 
 The cold run took **79.498 seconds**; the immediate warm repeat took **1.006
-seconds**, about **79.0× faster**. All nine checks passed both times: 717 tests
+seconds**, about **79.0× faster**. At this measurement, all nine checks passed
+both times: 717 tests
 and 22 subtests on each Python version from 3.10 through 3.14, 28 browser tests,
 Ruff, the Docker CLI smoke check reporting version 0.2.0, and the generated-SDK
 staleness check. The warm trace explicitly marks all eight authored check
@@ -128,8 +203,8 @@ These are engine-local measurements, not a general speed guarantee. The engine
 used isolated user configuration with both `DAGGER_CLOUD_TOKEN` and
 `DAGGER_API_TOKEN` unset. No existing global cache was pruned and no Cloud cache
 was used. Raw timing and source-invalidation evidence is retained privately
-outside the repository. These results do not establish native Cloud execution,
-automatic push checks, or CI cutover.
+outside the repository. These results do not establish Cloud Engine performance,
+GitHub-triggered remote execution, automatic native Cloud Checks, or CI cutover.
 
 ## Working efficiently
 
@@ -138,8 +213,8 @@ all checks before pushing. Dependencies are installed before source is copied,
 so editing a test does not repeat package installation. Stable content hashes
 let the engine reuse successful operations; changed inputs invalidate their
 dependent work. Keep an engine's cache rather than creating an empty engine for
-every edit. Once Cloud Checks is enabled, the same check definitions can run on
-Cloud Engines without a second workflow implementation.
+every edit. The same check definitions can run on a Cloud Engine from GitHub
+Actions without enabling native Cloud Checks or duplicating the pipeline.
 
 The checks make no LLM calls and require no `--allow-llm` permission. That does
 not make the coding assistant's reasoning free: use the check selector and a
@@ -152,31 +227,28 @@ dependency ranges are preserved, not converted into a complete transitive lock.
 Update pins and dependency constraints deliberately, regenerate the SDK when
 needed, and rerun the checks; do not equate a cached pass with a dependency audit.
 
-## Native Cloud cutover is pending
+## Current proof and optional native Cloud Checks
 
-Local checks, source-change invalidation, and engine-local cache reuse have been
-demonstrated. Native Cloud execution, automatic push proof, and CI cutover are
-not complete. The repository's existing
-GitHub App access has been verified; no additional repository permissions were
-requested.
+Local checks, tracked-source invalidation, and engine-local warm reuse have been
+demonstrated. The GitHub-triggered Cloud Engine route is configured but remains
+pending remote OIDC, trace, and cache evidence. GitHub Actions stays the trigger
+and gate; there is no native-check cutover in this change.
 
-An organization/CI token is not a user-management session. The source-management
-API rejects such tokens with **“API token is not allowed for this field”**.
-User-approved OAuth device authorization succeeded through the API without an
-agent-operated browser. No credentials belong in pipeline inputs or this repo.
-
-The final authenticated inventory reports Cloud caching enabled, but only
-`CLOUD_MODULES` active and no `CLOUD_CHECKS` entitlement. The
+Native Cloud Checks remains off. The final authenticated inventory reports
+Cloud caching enabled but no `CLOUD_CHECKS` entitlement. The
 [official beta.27 guard](https://github.com/dagger/dagger/blob/400b82d6f3c09ef096d2f59b3e920267b5969bf4/internal/cmd/dagger/cloud_check.go#L84)
-requires both; a caching subscription alone does not satisfy it. No documented
-API/CLI operation was found to activate Cloud Checks for an existing organization.
-Its owner must resolve that entitlement in organization settings or with Dagger
-support. No plan, billing, trial, or trigger changes were made to bypass it.
+for native checks requires both `CLOUD_MODULES` and `CLOUD_CHECKS`; a caching
+subscription alone does not satisfy it. That native-check entitlement is not a
+prerequisite for the GitHub-triggered Cloud Engine design. No plan, billing,
+trial, or native trigger changes were made to bypass it.
 
-After entitlement is available, enable default-branch, pull-request **and branch
-push** triggers through the supported repository-settings API. Verify all nine
-checks on an actual pushed commit, then update required branch gates and retire
-both Actions workflows. The release workflow also publishes multiarchitecture
-images with SBOM/provenance: its replacement must preserve those capabilities
-and never publish during ordinary checks. Until this verified cutover, both
-existing Actions workflows remain intact to avoid losing the remote CI gate.
+User-approved OAuth device authorization worked for management reads, but it is
+not used by the pipeline. Organization/API tokens were rejected by the
+source-management API with **“API token is not allowed for this field”**. Neither
+management authorization nor telemetry-token availability proves compute access.
+No credentials belong in pipeline inputs or this repository.
+
+Native Dagger-managed triggers could be evaluated separately in the future after
+entitlement and branch-gate verification. They are optional, not the next blocker
+for this setup. The existing release workflow still publishes multiarchitecture
+images with SBOM/provenance and is deliberately outside this change.

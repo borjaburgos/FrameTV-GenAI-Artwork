@@ -26,6 +26,8 @@ _TEST_INPUTS = [
     "deploy/resourcespace/compose.yaml",
     "deploy/resourcespace/pilot-entrypoint.sh",
     "deploy/resourcespace/safety.php",
+    ".github/workflows/ci.yml",
+    ".github/workflows/release.yml",
     *_MODULE_INPUTS,
 ]
 _BROWSER_INPUTS = ["tests/e2e/**", "playwright.config.js"]

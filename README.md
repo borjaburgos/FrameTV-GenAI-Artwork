@@ -982,13 +982,16 @@ npx playwright install chromium
 npm run test:e2e
 ```
 
-Pull requests run the Python matrix, container build, and Playwright browser suite in
-GitHub Actions. Failed browser runs upload a trace, screenshot, and HTML report for diagnosis.
+GitHub Actions triggers CI for main-branch pushes, pull requests, and manual runs.
+Its Dagger pipeline runs the Python matrix, lint, browser tests, container smoke
+check, and generated-SDK check. Trusted jobs target Cloud Engines for cache and
+traces; untrusted pull requests run the same checks locally without Cloud credentials.
+Remote OIDC eligibility and Cloud cache/trace evidence are still being verified.
 
-The same checks are also available locally through `scripts/ci check`, using the
-pinned Dagger CLI and reusable engine cache. See the [Dagger CI guide](docs/dagger-ci.md)
-for individual check commands, cache-invalidation validation status, input boundaries, and
-the remaining native Cloud entitlement gate. GitHub Actions remains the active remote gate.
+Run the same pipeline locally with `scripts/ci check`. See the
+[Dagger CI guide](docs/dagger-ci.md) for individual checks, the verified local-only
+cache benchmark, input boundaries, and GitHub OIDC setup. GitHub remains the remote
+gate; native Dagger Cloud Checks is off and is not required for this design.
 
 ## Architecture
 
