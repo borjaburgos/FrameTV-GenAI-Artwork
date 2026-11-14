@@ -602,6 +602,13 @@ class LiveAlbumStore:
                     PRIMARY KEY(album_id,tv_profile_id,source_item_id),
                     FOREIGN KEY(album_id) REFERENCES photo_album_feeds(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS photo_album_upload_epochs (
+                    album_id TEXT NOT NULL, tv_profile_id TEXT NOT NULL,
+                    source_item_id TEXT NOT NULL, source_checksum TEXT NOT NULL,
+                    content_id TEXT NOT NULL, token_hash TEXT NOT NULL,
+                    PRIMARY KEY(album_id,tv_profile_id,source_item_id),
+                    FOREIGN KEY(album_id) REFERENCES photo_album_feeds(id) ON DELETE CASCADE
+                );
                 """
             )
         os.chmod(self.database_path, 0o600)
@@ -955,10 +962,17 @@ class LiveAlbumStore:
                 (album_id, tv_profile_id, source_item_id),
             )
 
-    def note_upload_verification(self, album_id, profile_id, item, content_id, verified):
+    def note_upload_verification(
+        self, album_id, profile_id, item, content_id, verified, token_hash=None
+    ):
         with self._connect() as connection:
             connection.execute(
                 "DELETE FROM photo_album_unverified_uploads "
+                "WHERE album_id=? AND tv_profile_id=? AND source_item_id=?",
+                (album_id, profile_id, item.item_id),
+            )
+            connection.execute(
+                "DELETE FROM photo_album_upload_epochs "
                 "WHERE album_id=? AND tv_profile_id=? AND source_item_id=?",
                 (album_id, profile_id, item.item_id),
             )
@@ -967,6 +981,82 @@ class LiveAlbumStore:
                     "INSERT INTO photo_album_unverified_uploads VALUES(?,?,?,?,?)",
                     (album_id, profile_id, item.item_id, item.checksum, content_id),
                 )
+                if token_hash is not None:
+                    connection.execute(
+                        "INSERT INTO photo_album_upload_epochs VALUES(?,?,?,?,?,?)",
+                        (album_id, profile_id, item.item_id, item.checksum, content_id, token_hash),
+                    )
+
+    def reconcile_upload(self, settings, profile_id, album_id, saved, image_bytes):
+        """Verify one ACKed upload from fresh pixels, then atomically retire its warning."""
+        from frameart.album_verification import thumbnail_matches_photo
+        from frameart.art_delivery import CatalogDeliveryService, _pairing_token_hash
+
+        profile = settings.tvs[profile_id]
+        key = (
+            album_id,
+            profile_id,
+            saved["source_item_id"],
+            saved["source_checksum"],
+            saved["content_id"],
+        )
+        with self._connect() as db:
+            receipt = db.execute(
+                "SELECT e.token_hash FROM photo_album_unverified_uploads u "
+                "LEFT JOIN photo_album_upload_epochs e "
+                "USING(album_id,tv_profile_id,source_item_id,source_checksum,content_id) "
+                "WHERE u.album_id=? AND u.tv_profile_id=? AND u.source_item_id=? "
+                "AND u.source_checksum=? AND u.content_id=?",
+                key,
+            ).fetchone()
+        if receipt is None:
+            return False
+        epoch = _pairing_token_hash(profile)
+        if epoch is None or (receipt[0] is not None and receipt[0] != epoch):
+            return False
+        evidence = CatalogDeliveryService._thumbnail_evidence(
+            profile, saved["content_id"], batch=True
+        )
+        if (
+            not evidence
+            or evidence[1] != epoch
+            or not thumbnail_matches_photo(image_bytes, evidence[0])
+        ):
+            return False
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if _pairing_token_hash(profile) != epoch:
+                return False
+            # Recheck receipt + current photo version after the TV read. No
+            # changed/deleted claim can be resurrected by delayed evidence.
+            present = db.execute(
+                "SELECT 1 FROM photo_album_unverified_uploads u JOIN photo_album_tv_items t "
+                "USING(album_id,tv_profile_id,source_item_id,source_checksum,content_id) "
+                "JOIN photo_album_source_items s USING(album_id,source_item_id,source_checksum) "
+                "LEFT JOIN photo_album_upload_epochs e "
+                "USING(album_id,tv_profile_id,source_item_id,source_checksum,content_id) "
+                "WHERE u.album_id=? AND u.tv_profile_id=? AND u.source_item_id=? "
+                "AND u.source_checksum=? AND u.content_id=? AND e.token_hash IS ?",
+                (*key, receipt[0]),
+            ).fetchone()
+            if not present:
+                return False
+            db.execute(
+                "INSERT OR REPLACE INTO catalog_tv_fingerprints "
+                "(tv_ip,content_id,thumbnail_hash,token_hash) VALUES(?,?,?,?)",
+                (profile.ip, saved["content_id"], hashlib.sha256(evidence[0]).hexdigest(), epoch),
+            )
+            db.execute(
+                "DELETE FROM photo_album_unverified_uploads WHERE album_id=? AND tv_profile_id=? "
+                "AND source_item_id=? AND source_checksum=? AND content_id=?",
+                key,
+            )
+            db.execute(
+                "DELETE FROM photo_album_upload_epochs WHERE album_id=? AND tv_profile_id=? "
+                "AND source_item_id=? AND source_checksum=? AND content_id=?",
+                key,
+            )
+        return True
 
     def upload_is_unverified(self, album_id, profile_id, item_id, checksum, content_id):
         with self._connect() as connection:
@@ -987,6 +1077,7 @@ class LiveAlbumStore:
                 "photo_album_tv_items",
                 "photo_album_stale_items",
                 "photo_album_unverified_uploads",
+                "photo_album_upload_epochs",
             ):
                 connection.execute(
                     f"DELETE FROM {table} WHERE album_id=? AND tv_profile_id=? AND content_id=?",
@@ -1037,6 +1128,7 @@ class LiveAlbumStore:
                     "photo_album_tv_items",
                     "photo_album_stale_items",
                     "photo_album_unverified_uploads",
+                    "photo_album_upload_epochs",
                 ):
                     connection.execute(
                         f"UPDATE OR REPLACE {table} SET tv_profile_id = ? WHERE tv_profile_id = ?",
@@ -1103,8 +1195,11 @@ class LiveAlbumService:
 
         stale = []
         for identity in store.stale_ids(album_id, profile_id):
-            if CatalogDeliveryService._fingerprint_matches(store, profile, identity):
+            state = CatalogDeliveryService._fingerprint_state(store, profile, identity, batch=True)
+            if state == "verified":
                 stale.append(identity)
+            elif state == "unavailable":
+                return "Photo cleanup verification is temporarily unavailable", 0
             else:
                 store.forget_content_claim(album_id, profile_id, identity)
         if not stale:
@@ -1188,9 +1283,38 @@ class LiveAlbumService:
     def _priority_candidate(item: AlbumItem) -> str:
         return hashlib.sha256(json.dumps([item.item_id, item.checksum]).encode()).hexdigest()
 
+    @staticmethod
+    def _verify_saved(settings, store, album_id, profile_id, saved):
+        from frameart.art_delivery import CatalogDeliveryService
+
+        if store.upload_is_unverified(
+            album_id,
+            profile_id,
+            saved["source_item_id"],
+            saved["source_checksum"],
+            saved["content_id"],
+        ):
+            source = store.source_item(album_id, saved["source_item_id"])
+            if source is not None and source["source_checksum"] == saved["source_checksum"]:
+                try:
+                    if store.reconcile_upload(
+                        settings, profile_id, album_id, saved, source["cache_path"].read_bytes()
+                    ):
+                        return "verified"
+                except OSError:
+                    pass
+            return "unavailable"
+        return CatalogDeliveryService._fingerprint_state(
+            settings, settings.tvs[profile_id], saved["content_id"], batch=True
+        )
+
     def _sync_profile(self, settings, store, album, snapshot, prepared, profile_id, is_target):
         """One serialized per-TV reconciliation; caller has committed photo priority."""
-        from frameart.art_delivery import CatalogDeliveryService, tv_delivery_lock
+        from frameart.art_delivery import (
+            CatalogDeliveryService,
+            _pairing_token_hash,
+            tv_delivery_lock,
+        )
         from frameart.daily_art import DailyArtStore
         from frameart.tv.controller import get_status, switch_art, upload_image
 
@@ -1202,6 +1326,7 @@ class LiveAlbumService:
         desired = {item.item_id: item for item in snapshot.items} if is_target else {}
         uploaded = deleted = displayed = 0
         errors = []
+        verified_content = set()
 
         def display_pending(*, just_uploaded=False):
             nonlocal displayed
@@ -1214,9 +1339,7 @@ class LiveAlbumService:
             current = store.current_items(album_id, profile_id).get(newest.item_id)
             if not current or current["source_checksum"] != newest.checksum:
                 return
-            if not just_uploaded and not CatalogDeliveryService._fingerprint_matches(
-                settings, profile, current["content_id"]
-            ):
+            if not just_uploaded and current["content_id"] not in verified_content:
                 errors.append(
                     "Pending photo identity could not be verified; TV file was preserved."
                 )
@@ -1234,22 +1357,16 @@ class LiveAlbumService:
                     "TV is busy, offline or not confirmed in Art Mode; album update deferred."
                 )
             else:
-                for item_id, saved in store.current_items(album_id, profile_id).items():
-                    if not CatalogDeliveryService._fingerprint_matches(
-                        settings, profile, saved["content_id"]
-                    ):
-                        if store.upload_is_unverified(
-                            album_id,
-                            profile_id,
-                            item_id,
-                            saved["source_checksum"],
-                            saved["content_id"],
-                        ):
-                            errors.append(
-                                "An uploaded photo remains unverified; it was not uploaded again."
-                            )
-                        else:
-                            store.forget_content_claim(album_id, profile_id, saved["content_id"])
+                for saved in store.current_items(album_id, profile_id).values():
+                    verification = self._verify_saved(settings, store, album_id, profile_id, saved)
+                    if verification == "verified":
+                        verified_content.add(saved["content_id"])
+                    elif verification == "unavailable":
+                        errors.append(
+                            "An uploaded photo remains unverified; it was not uploaded again."
+                        )
+                    else:
+                        store.forget_content_claim(album_id, profile_id, saved["content_id"])
                 # A prior upload may be complete while selection was deferred.
                 # Retry this pending photo even when this poll uploads nothing.
                 display_pending()
@@ -1275,6 +1392,7 @@ class LiveAlbumService:
                             ):
                                 errors.append("Newest photo upload is unconfirmed; not repeated.")
                                 continue
+                            token_hash = _pairing_token_hash(profile)
                             result = upload_image(
                                 profile,
                                 image_bytes,
@@ -1290,11 +1408,20 @@ class LiveAlbumService:
                             if not result.success or not result.content_id:
                                 raise RuntimeError(result.error or "TV upload failed")
                             store.upsert_current(album_id, profile_id, item, result.content_id)
-                            verified = CatalogDeliveryService._record_fingerprint(
-                                settings, profile, result.content_id
+                            verified = bool(
+                                token_hash
+                                and token_hash == _pairing_token_hash(profile)
+                                and CatalogDeliveryService._record_fingerprint(
+                                    settings, profile, result.content_id, batch=True
+                                )
                             )
                             store.note_upload_verification(
-                                album_id, profile_id, item, result.content_id, verified
+                                album_id,
+                                profile_id,
+                                item,
+                                result.content_id,
+                                verified,
+                                token_hash or "",
                             )
                             current = store.current_items(album_id, profile_id)
                             uploaded += 1
@@ -1464,7 +1591,11 @@ class LiveAlbumService:
             return payload
 
     def _display_profile_photo(self, settings, store, album_id, profile_id, item, image_bytes):
-        from frameart.art_delivery import CatalogDeliveryService, tv_delivery_lock
+        from frameart.art_delivery import (
+            CatalogDeliveryService,
+            _pairing_token_hash,
+            tv_delivery_lock,
+        )
         from frameart.daily_art import DailyArtStore
         from frameart.tv.controller import get_status, switch_art, upload_image
 
@@ -1481,19 +1612,18 @@ class LiveAlbumService:
                 if (existing and existing["source_checksum"] == item.checksum)
                 else None
             )
-            if content_id and not CatalogDeliveryService._fingerprint_matches(
-                settings, profile, content_id
-            ):
-                if store.upload_is_unverified(
-                    album_id, profile_id, item.item_id, item.checksum, content_id
-                ):
+            if content_id:
+                verification = self._verify_saved(settings, store, album_id, profile_id, existing)
+                if verification == "unavailable":
                     return {"error": "Photo identity is unverified; no repeated upload was sent."}
-                store.forget_content_claim(album_id, profile_id, content_id)
-                content_id = None
+                if verification != "verified":
+                    store.forget_content_claim(album_id, profile_id, content_id)
+                    content_id = None
             pending = priority.album_priority_pending(profile_id, album_id, candidate)
             if content_id is None:
                 if pending and not priority.claim_album_upload(profile_id, album_id, candidate):
                     return {"error": "A previous upload is unconfirmed; it was not repeated."}
+                token_hash = _pairing_token_hash(profile)
                 uploaded = upload_image(
                     profile, image_bytes, file_type="JPEG", matte="none", require_art_mode=True
                 )
@@ -1505,8 +1635,16 @@ class LiveAlbumService:
                     return {"error": "TV upload was not confirmed."}
                 content_id = uploaded.content_id
                 store.upsert_current(album_id, profile_id, item, content_id)
-                verified = CatalogDeliveryService._record_fingerprint(settings, profile, content_id)
-                store.note_upload_verification(album_id, profile_id, item, content_id, verified)
+                verified = bool(
+                    token_hash
+                    and token_hash == _pairing_token_hash(profile)
+                    and CatalogDeliveryService._record_fingerprint(
+                        settings, profile, content_id, batch=True
+                    )
+                )
+                store.note_upload_verification(
+                    album_id, profile_id, item, content_id, verified, token_hash or ""
+                )
             if not switch_art(profile, content_id, require_art_mode=True):
                 return {
                     "skipped": "Art Mode changed before display; normal viewing was left untouched."
