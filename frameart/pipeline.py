@@ -15,6 +15,7 @@ from typing import Any
 
 from PIL import Image
 
+from frameart.archive import enqueue_generation
 from frameart.artifacts import (
     generate_job_id,
     get_job_dir,
@@ -343,9 +344,14 @@ def run_generate(
             "timings": timings,
             "generation_succeeded": True,
             "delivery_status": result.delivery_status,
+            "seed": seed,
+            "steps": steps,
+            "guidance": guidance,
+            "negative_prompt": negative_prompt,
             **gen_result.metadata,
         }
         save_metadata(job_dir, result.metadata)
+        enqueue_generation(settings, job_dir)
 
     except Exception as e:
         result.error = _safe_pipeline_error(settings, e)
@@ -573,6 +579,9 @@ def run_edit_and_apply(
             height=2160,
         )
         timings["edit_ms"] = (time.monotonic() - t0) * 1000
+        # Retain the unprocessed edit as well as the original input and TV
+        # derivative; older edits cannot recover bytes that were never saved.
+        (job_dir / "edited.png").write_bytes(edited.data)
 
         upscaler = _get_upscaler_instance(settings, upscaler_name)
         t0 = time.monotonic()
@@ -605,6 +614,10 @@ def run_edit_and_apply(
             "timings": timings,
             **edited.metadata,
         }
+
+        # Archive completion is independent of subsequent delivery failures.
+        save_metadata(job_dir, result.metadata)
+        enqueue_generation(settings, job_dir)
 
         if not no_upload:
             profile = _resolve_tv_profile(settings, tv_name, tv_ip)

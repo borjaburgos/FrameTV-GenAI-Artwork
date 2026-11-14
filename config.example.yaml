@@ -4,6 +4,14 @@
 # Where artifacts, logs, and secrets are stored
 data_dir: /data/frameart
 
+# Optional generated-art archive; no network I/O in generation/web requests.
+# Enable only after the scoped NAS mount and its identity marker are provisioned.
+# Run `frameart archive run` from a one-minute systemd timer (see docs/nas-archive.md).
+archive_enabled: false
+# archive_path: /mnt/frameart-generated
+# archive_mount_source: //nas.example.home/Media
+# archive_id: your-dedicated-archive-identifier
+
 # Default image generation provider: openai | ollama | google (or gemini alias)
 default_provider: openai
 # default_model: dall-e-3  # provider-specific model ID
