@@ -41,8 +41,9 @@ def purge_cached_artwork(data_dir: Path, artwork_id: str) -> None:
     with _cache_lock:
         with _database(data_dir) as db:
             db.execute("BEGIN IMMEDIATE")
-            rows = db.execute("SELECT content_hash FROM catalog_renditions WHERE artwork_id=?",
-                              (artwork_id,)).fetchall()
+            rows = db.execute(
+                "SELECT content_hash FROM catalog_renditions WHERE artwork_id=?", (artwork_id,)
+            ).fetchall()
             db.execute("DELETE FROM catalog_renditions WHERE artwork_id=?", (artwork_id,))
             db.execute("DELETE FROM catalog_rendition_sources WHERE artwork_id=?", (artwork_id,))
             live = {row[0] for row in db.execute("SELECT content_hash FROM catalog_renditions")}
@@ -514,15 +515,19 @@ class CatalogDeliveryService:
             return payload, digest
 
     @staticmethod
-    def _fingerprint(profile, content_id: str) -> tuple[str, str] | None:
+    def _thumbnail_evidence(profile, content_id: str, *, batch=False) -> tuple[bytes, str] | None:
         """Read fresh TV evidence; cached HTTP thumbnails must not be used here."""
-        from frameart.tv.controller import get_art_thumbnail
+        from frameart.tv.controller import get_art_thumbnail, get_art_thumbnails
 
         token_hash = _pairing_token_hash(profile)
         if token_hash is None:
             return None
         try:
-            payload = get_art_thumbnail(profile, content_id)
+            payload = (
+                get_art_thumbnails(profile, [content_id]).get(content_id)
+                if batch
+                else get_art_thumbnail(profile, content_id)
+            )
         except Exception:
             return None
         if (
@@ -531,7 +536,12 @@ class CatalogDeliveryService:
             or _pairing_token_hash(profile) != token_hash
         ):
             return None
-        return hashlib.sha256(payload).hexdigest(), token_hash
+        return bytes(payload), token_hash
+
+    @classmethod
+    def _fingerprint(cls, profile, content_id: str, *, batch=False) -> tuple[str, str] | None:
+        evidence = cls._thumbnail_evidence(profile, content_id, batch=batch)
+        return (hashlib.sha256(evidence[0]).hexdigest(), evidence[1]) if evidence else None
 
     @staticmethod
     def _forget_content(settings, profile, content_id: str) -> None:
@@ -567,8 +577,8 @@ class CatalogDeliveryService:
             )
 
     @classmethod
-    def _record_fingerprint(cls, settings, profile, content_id: str) -> bool:
-        fingerprint = cls._fingerprint(profile, content_id)
+    def _record_fingerprint(cls, settings, profile, content_id: str, *, batch=False) -> bool:
+        fingerprint = cls._fingerprint(profile, content_id, batch=batch)
         if fingerprint is None:
             cls._forget_content(settings, profile, content_id)
             return False
@@ -582,7 +592,8 @@ class CatalogDeliveryService:
         return True
 
     @classmethod
-    def _fingerprint_matches(cls, settings, profile, content_id: str) -> bool:
+    def _fingerprint_state(cls, settings, profile, content_id: str, *, batch=False) -> str:
+        """Distinguish missing/mismatched identity from a transient read failure."""
         with _database(settings.data_dir) as db:
             stored = db.execute(
                 "SELECT thumbnail_hash,token_hash FROM catalog_tv_fingerprints "
@@ -592,19 +603,29 @@ class CatalogDeliveryService:
         current_token = _pairing_token_hash(profile)
         if stored is not None and current_token and stored[1] != current_token:
             cls._forget_obsolete_epoch(settings, profile, current_token)
-        if (
-            stored is None
-            or current_token is None
-            or not _HASH.fullmatch(stored[0])
-            or stored[1] != current_token
-        ):
+        if current_token is None:
+            return "unavailable"
+        if stored is None:
+            return "missing"
+        if not _HASH.fullmatch(stored[0]) or stored[1] != current_token:
             cls._forget_content(settings, profile, content_id)
-            return False
-        current = cls._fingerprint(profile, content_id)
+            return "mismatch"
+        current = cls._fingerprint(profile, content_id, batch=batch)
+        if current is None:
+            return "unavailable"
         if current != (stored[0], stored[1]):
             cls._forget_content(settings, profile, content_id)
-            return False
-        return True
+            return "mismatch"
+        return "verified"
+
+    @classmethod
+    def _fingerprint_matches(cls, settings, profile, content_id: str) -> bool:
+        # Preserve existing catalog caller behavior. Album callers use the
+        # tri-state check so an unavailable read cannot trigger another upload.
+        if cls._fingerprint_state(settings, profile, content_id) == "verified":
+            return True
+        cls._forget_content(settings, profile, content_id)
+        return False
 
     def _deliver_targets(
         self,

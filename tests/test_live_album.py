@@ -82,6 +82,14 @@ def confirmed_sync_art_mode():
             "frameart.art_delivery.CatalogDeliveryService._fingerprint_matches", return_value=True
         ),
         patch(
+            "frameart.art_delivery.CatalogDeliveryService._fingerprint_state",
+            return_value="verified",
+        ),
+        patch(
+            "frameart.art_delivery.CatalogDeliveryService._thumbnail_evidence", return_value=None
+        ),
+        patch("frameart.art_delivery._pairing_token_hash", return_value="a" * 64),
+        patch(
             "frameart.art_delivery.CatalogDeliveryService._record_fingerprint", return_value=True
         ),
     ):

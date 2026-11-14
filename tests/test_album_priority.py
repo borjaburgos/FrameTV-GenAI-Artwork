@@ -71,6 +71,9 @@ def setup(tmp_path, monkeypatch):
     monkeypatch.setattr(controller, "switch_art", select)
     monkeypatch.setattr(controller, "delete_art", Mock(return_value=True))
     monkeypatch.setattr(CatalogDeliveryService, "_fingerprint_matches", Mock(return_value=True))
+    monkeypatch.setattr(CatalogDeliveryService, "_fingerprint_state", Mock(return_value="verified"))
+    monkeypatch.setattr(CatalogDeliveryService, "_thumbnail_evidence", Mock(return_value=None))
+    monkeypatch.setattr("frameart.art_delivery._pairing_token_hash", Mock(return_value="a" * 64))
     monkeypatch.setattr(CatalogDeliveryService, "_record_fingerprint", Mock(return_value=True))
     monkeypatch.setattr(live_album.IntegrationPublisher, "publish", Mock(return_value=[]))
     daily = DailyArtStore(tmp_path)
@@ -331,6 +334,7 @@ def test_recycled_legacy_content_id_is_not_reused_or_deleted(setup, monkeypatch)
     state = setup
     state.albums.upsert_current(state.album["id"], "family", photo(1), "RECYCLED-ID")
     monkeypatch.setattr(CatalogDeliveryService, "_fingerprint_matches", Mock(return_value=False))
+    monkeypatch.setattr(CatalogDeliveryService, "_fingerprint_state", Mock(return_value="mismatch"))
     state.service.sync_album(state.album["id"])
     state.upload.assert_called_once()
     assert state.select.call_args.args[1] != "RECYCLED-ID"
@@ -343,6 +347,7 @@ def test_unverified_stale_content_id_is_preserved_on_tv(setup, monkeypatch):
     state.albums.mark_current_stale(state.album["id"], "family", photo(1).item_id)
     state.fetch.return_value = AlbumSnapshot("Family", 0, ())
     monkeypatch.setattr(CatalogDeliveryService, "_fingerprint_matches", Mock(return_value=False))
+    monkeypatch.setattr(CatalogDeliveryService, "_fingerprint_state", Mock(return_value="mismatch"))
     result = state.service.sync_album(state.album["id"])
     controller.delete_art.assert_not_called()
     assert state.albums.all_owned_ids(state.album["id"], "family") == []
