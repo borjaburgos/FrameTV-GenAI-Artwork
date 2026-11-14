@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -13,75 +14,49 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  dagger:
+    name: Dagger (GitHub + traces)
+    # Repository writers and the owner's same-repository PRs are trusted.
+    # Only this trusted path may request short-lived OIDC identity for traces.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.user.login == github.repository_owner &&
+       github.actor == github.repository_owner)
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
-
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v7
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v7
         with:
-          python-version: ${{ matrix.python-version }}
+          persist-credentials: false
+      - name: Run all Dagger checks on the GitHub runner with Cloud traces
+        env:
+          DAGGER_ENGINE: image://registry.dagger.io/engine:v1.0.0-beta.27
+          DAGGER_CLOUD_TOKEN: oidc
+          DAGGER_CHECK_PARALLEL: "2"
+        run: python3 scripts/ci_github.py
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install ".[dev,api]"
-
-      - name: Lint with ruff
-        run: ruff check frameart/ tests/ scripts/resourcespace_pilot.py
-
-      - name: Run tests
-        run: pytest --tb=short -v
-
-  docker:
+  untrusted:
+    name: Dagger (local)
+    if: >-
+      github.event_name == 'pull_request' &&
+      (github.event.pull_request.head.repo.full_name != github.repository ||
+       github.event.pull_request.user.login != github.repository_owner ||
+       github.actor != github.repository_owner)
     runs-on: ubuntu-latest
-    needs: test
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
-
-      - name: Build Docker image
-        run: docker build -t frameart:test .
-
-      - name: Verify CLI loads
-        run: docker run --rm frameart:test --version
-
-  browser:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Set up Python
-        uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
-
-      - name: Set up Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-          cache: npm
-
-      - name: Install FrameArt
-        run: pip install ".[api]"
-
-      - name: Install browser test dependencies
-        run: npm ci
-
-      - name: Install Chromium
-        run: npx playwright install --with-deps chromium
-
-      - name: Run browser tests
-        run: npm run test:e2e
-
-      - name: Upload browser report on failure
-        if: failure()
-        uses: actions/upload-artifact@v6
-        with:
-          name: playwright-report
-          path: playwright-report/
-          retention-days: 7
+          persist-credentials: false
+      - name: Run all Dagger checks without Cloud credentials
+        env:
+          DAGGER_ENGINE: image://registry.dagger.io/engine:v1.0.0-beta.27
+          DAGGER_CLOUD_TOKEN: ""
+          DAGGER_CHECK_PARALLEL: "2"
+        run: python3 scripts/ci_github.py

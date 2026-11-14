@@ -49,3 +49,7 @@ node_modules
 .e2e-data/
 playwright-report/
 test-results/
+
+# Project-local CI bootstrap binaries and exported reports
+.dagger/bin/
+dagger-ci-artifacts/

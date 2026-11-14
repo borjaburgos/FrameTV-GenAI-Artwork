@@ -18,6 +18,8 @@ This project depends on third-party open-source software.
 
 - pytest / pytest-cov - https://pytest.org/
 - ruff - https://github.com/astral-sh/ruff
+- Dagger Python SDK and generated core client - https://github.com/dagger/python-sdk/tree/v1.8.0
+  (Apache-2.0; bundled CI SDK license: `.dagger/modules/frameart-ci/sdk/LICENSE`)
 
 For exact dependency versions used by this project, see `pyproject.toml`.
 For each dependency's license terms and notices, refer to that dependency's own repository and distribution metadata.

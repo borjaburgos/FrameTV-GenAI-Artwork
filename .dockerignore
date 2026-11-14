@@ -21,3 +21,8 @@ secrets
 data
 dist
 build
+.dagger
+dagger.toml
+dagger.lock
+dagger-ci-artifacts
+.e2e-data
