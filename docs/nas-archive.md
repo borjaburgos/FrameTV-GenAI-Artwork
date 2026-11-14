@@ -64,9 +64,18 @@ receipts are not protection against host loss before a successful NAS copy.
 ## Provision and enable
 
 1. Create only `Media/Artwork/Generated/FrameArt` using an approved NAS control
-   plane and a dedicated folder-scoped writer. Leave curated originals/readers
-   unchanged. Mount that subtree at, for example, `/mnt/frameart-generated`.
+   plane and preferably a dedicated folder-scoped writer. Leave curated
+   originals/readers unchanged. Mount that subtree at, for example,
+   `/mnt/frameart-generated`.
    Do not put credentials in Git, command arguments or the image archive.
+   If the NAS only supports share-wide permissions, an owner may explicitly
+   approve a Media-writable credential **without** a global ACL migration.
+   In that case, keep that credential protected on the host, outside FrameArt;
+   expose only `Media/Artwork/Generated/FrameArt` through a guarded scoped mount
+   and guest bind. The provisioning/copy workflow must allow only that exact
+   subtree, with readback and rollback. The worker's write sandbox must expose
+   no other Media folders. Never silently substitute share-wide access for a
+   folder-scoped credential or remount the catalog read/write.
 2. Create a non-secret identity marker `.frameart-archive-id` inside that NAS
    directory; its exact short identifier must match `archive_id`. The worker
    never creates or repairs the marker itself.
