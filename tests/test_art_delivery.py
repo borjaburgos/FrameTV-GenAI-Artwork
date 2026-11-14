@@ -661,10 +661,11 @@ class TestCatalogDelivery(unittest.TestCase):
 
     def test_rendition_cache_is_bounded_to_eight_files(self):
         CatalogDeliveryStore(self.data_dir)
-        for index in range(9):
-            artwork = self.artwork.model_copy(
-                update={"id": f"art-{index}", "rendition_ref": index + 1}
-            )
+        artworks = [self.artwork.model_copy(
+            update={"id": f"art-{index}", "rendition_ref": index + 1}
+        ) for index in range(9)]
+        self.catalog.replace([(artwork, None) for artwork in artworks], self.settings)
+        for index, artwork in enumerate(artworks):
             self.client.rendition.return_value = jpeg(color=(index * 20, 35, 55))
             self.service._rendition(self.settings, artwork)
         with sqlite3.connect(self.data_dir / "frameart.sqlite3") as connection:

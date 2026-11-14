@@ -248,6 +248,17 @@ class DailyArtStore:
             self._put(connection, "calendars", calendars)
         return {"calendar_year": year, "calendar_count": len(rows), "timezone": calendar_zone}
 
+    def replace_unattempted_artwork(self, old_id: str, new_id: str) -> int:
+        """Redirect unplayed slots only; never rewrite TV dispatch/history state."""
+        _identity(old_id, "rejected artwork ID")
+        _identity(new_id, "replacement artwork ID")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            return connection.execute(
+                "UPDATE daily_art_calendar SET artwork_id=? WHERE artwork_id=? "
+                "AND day NOT IN (SELECT day_key FROM daily_art_runs)", (new_id, old_id),
+            ).rowcount
+
     def note_manual_choice(self, tv_id: str, now: datetime | float | None = None) -> None:
         tv_id = _identity(tv_id, "TV ID")
         instant = _now(now)
