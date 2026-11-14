@@ -985,6 +985,11 @@ npm run test:e2e
 Pull requests run the Python matrix, container build, and Playwright browser suite in
 GitHub Actions. Failed browser runs upload a trace, screenshot, and HTML report for diagnosis.
 
+The same checks are also available locally through `scripts/ci check`, using the
+pinned Dagger CLI and reusable engine cache. See the [Dagger CI guide](docs/dagger-ci.md)
+for individual check commands, cache-invalidation validation status, input boundaries, and
+the remaining native Cloud entitlement gate. GitHub Actions remains the active remote gate.
+
 ## Architecture
 
 ```

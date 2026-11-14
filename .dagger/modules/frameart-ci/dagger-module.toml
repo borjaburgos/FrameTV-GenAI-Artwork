@@ -1,0 +1,5 @@
+name = "frameart-ci"
+
+[entrypoint]
+  kind = "dang"
+  source = "./sdk/entrypoint"

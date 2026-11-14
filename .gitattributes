@@ -1,0 +1,16 @@
+scripts/ci text eol=lf
+# Preserve upstream generator output byte-for-byte; check it with SDK staleness validation.
+.dagger/modules/frameart-ci/sdk/** linguist-generated=true -whitespace
+.dagger/modules/frameart-ci/clients/** linguist-generated=true -whitespace
+.dagger/bin export-ignore
+.dagger/bin/** export-ignore
+dagger-ci-artifacts export-ignore
+dagger-ci-artifacts/** export-ignore
+.e2e-data export-ignore
+.e2e-data/** export-ignore
+.env export-ignore
+config.yaml export-ignore
+secrets export-ignore
+secrets/** export-ignore
+data export-ignore
+data/** export-ignore
