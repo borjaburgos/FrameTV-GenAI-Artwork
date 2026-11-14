@@ -1,0 +1,21 @@
+[Unit]
+Description=FrameArt append-only generated artwork archive
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Adjust the executable, service identity and scoped mount for your installation.
+User=frameart
+Group=frameart
+EnvironmentFile=/etc/frameart/archive.env
+ExecStart=/opt/frameart/venv/bin/frameart archive run --limit 25
+TimeoutStartSec=240
+UMask=0077
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/data/frameart/archive /data/frameart/logs /mnt/frameart-generated
