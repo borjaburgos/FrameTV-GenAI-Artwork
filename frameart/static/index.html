@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>FrameArt</title>
 <link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="/static/art-catalog.css">
 </head>
 <body data-1p-ignore="true">
 
@@ -218,6 +219,25 @@
 
 <div class="panel" id="panel-library">
   <div class="page-eyebrow">Library</div>
+  <section class="art-catalog" id="art-catalog-root" aria-labelledby="art-catalog-heading">
+    <div class="art-catalog-heading">
+      <div>
+        <div class="page-eyebrow">ResourceSpace · Read-only pilot</div>
+        <h2 id="art-catalog-heading">Curated artwork</h2>
+      </div>
+      <button class="btn btn-secondary btn-small" id="art-catalog-refresh" type="button">Refresh metadata</button>
+    </div>
+    <p class="page-intro">Explore the artists and stories behind your artwork. Browsing and refreshing metadata do not change originals or send artwork to a TV.</p>
+    <p class="art-catalog-status" id="art-catalog-status" role="status" aria-live="polite">Open Library to load the local artwork catalog.</p>
+    <p class="art-catalog-error" id="art-catalog-error" role="alert" hidden></p>
+    <div id="art-catalog-tools" hidden>
+      <label for="art-catalog-search">Search curated artwork</label>
+      <input id="art-catalog-search" type="search" maxlength="200" autocomplete="off" data-1p-ignore="true" placeholder="Artist, title, medium or tag…">
+      <p class="art-catalog-count" id="art-catalog-count" aria-live="polite"></p>
+    </div>
+    <div class="art-catalog-grid" id="art-catalog-grid"></div>
+    <p class="art-catalog-empty" id="art-catalog-empty" hidden></p>
+  </section>
   <div class="section-heading">
     <h2>Artwork Library</h2>
     <div class="btn-group">
@@ -900,6 +920,13 @@
 </div>
 
 <div class="toast-wrap" id="toast-wrap" aria-live="polite"></div>
+<dialog class="art-catalog-dialog" id="art-catalog-dialog" aria-labelledby="art-catalog-detail-title">
+  <div class="art-catalog-dialog-heading">
+    <span class="page-eyebrow">Artwork details</span>
+    <button class="btn btn-ghost btn-small" id="art-catalog-close" type="button" aria-label="Close artwork details">Close</button>
+  </div>
+  <div id="art-catalog-detail"></div>
+</dialog>
 <div class="mobile-nav" id="mobile-nav">
   <button class="active" data-page="create">Create</button>
   <button data-page="library">Library</button>
@@ -911,6 +938,7 @@
 </div>
 
 <script src="/static/curation.js" defer></script>
+<script src="/static/art-catalog.js" defer></script>
 <script src="/static/app.js" defer></script>
 </body>
 </html>

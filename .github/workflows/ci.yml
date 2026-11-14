@@ -33,7 +33,7 @@ jobs:
           pip install ".[dev,api]"
 
       - name: Lint with ruff
-        run: ruff check frameart/ tests/
+        run: ruff check frameart/ tests/ scripts/resourcespace_pilot.py
 
       - name: Run tests
         run: pytest --tb=short -v

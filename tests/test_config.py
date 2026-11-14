@@ -63,6 +63,25 @@ class TestStylePresets:
 
 
 class TestLoadSettings:
+    def test_empty_optional_resourcespace_compose_environment(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("FRAMEART_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("FRAMEART_RESOURCESPACE_URL", "")
+        monkeypatch.setenv("FRAMEART_RESOURCESPACE_USER", "")
+        monkeypatch.setenv("FRAMEART_RESOURCESPACE_API_KEY", "")
+        monkeypatch.setenv("FRAMEART_RESOURCESPACE_COLLECTION", "")
+        assert load_settings().resourcespace_collection is None
+
+    def test_resourcespace_environment_keeps_reader_key_secret(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("FRAMEART_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("FRAMEART_RESOURCESPACE_URL", "http://catalog.home")
+        monkeypatch.setenv("FRAMEART_RESOURCESPACE_USER", "frameart-reader")
+        monkeypatch.setenv("FRAMEART_RESOURCESPACE_API_KEY", "private-reader-key")
+        monkeypatch.setenv("FRAMEART_RESOURCESPACE_COLLECTION", "7")
+        settings = load_settings()
+        assert settings.resourcespace_collection == 7
+        assert settings.resourcespace_api_key.get_secret_value() == "private-reader-key"
+        assert "private-reader-key" not in settings.model_dump_json()
+
     def test_load_without_config_file(self):
         settings = load_settings()
         assert settings.default_provider == "openai"

@@ -733,7 +733,7 @@ test('creates TV groups, playlists, and durable schedules', async ({ page, reque
     await expect(createGroupButton).toHaveText('Create Group');
 
     await page.getByLabel('Playlist name').fill('E2E Playlist');
-    await page.getByLabel('Artwork').selectOption(jobId);
+    await page.getByLabel('Artwork', { exact: true }).selectOption(jobId);
     const createPlaylistButton = page.getByRole('button', { name: 'Create Playlist' });
     await createPlaylistButton.click();
     await expect(page.locator('#automation-playlist-list')).toContainText('E2E Playlist');

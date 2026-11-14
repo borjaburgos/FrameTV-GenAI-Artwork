@@ -45,7 +45,7 @@ htmlcov/
 .ruff_cache/
 
 # Browser tests
-node_modules/
+node_modules
 .e2e-data/
 playwright-report/
 test-results/

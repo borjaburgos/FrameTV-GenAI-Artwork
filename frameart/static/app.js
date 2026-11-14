@@ -516,6 +516,7 @@
     localStorage.setItem(storageKeys.page, pageName);
     if (pageName === 'curate') window.FrameArtCuration.open({apiFetch, parseJSONResponse, showToast});
     if (pageName === 'library') {
+      window.FrameArtArtCatalog.open({apiFetch, parseJSONResponse, showToast});
       loadLibraryCollections().then(loadGallery).catch((error) => {
         showToast(error?.message || 'Could not load library metadata.', 'error');
       });

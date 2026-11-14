@@ -1,0 +1,89 @@
+name: frameart-art-library-pilot
+
+services:
+  resourcespace:
+    image: ${RESOURCESPACE_IMAGE:-frameart-resourcespace-pilot:11.0}
+    build:
+      # A reviewed checkout of https://github.com/resourcespace/docker.
+      # Record its commit in the deployment notes; do not build a moving remote HEAD.
+      context: ${RESOURCESPACE_DOCKER_SOURCE:?Set the reviewed official Docker checkout path}
+    restart: unless-stopped
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    entrypoint: ["bash", "/frameart/pilot-entrypoint.sh"]
+    environment:
+      RESOURCESPACE_BASE_URL: ${RESOURCESPACE_BASE_URL:-http://127.0.0.1:8187}
+    ports:
+      - "${RESOURCESPACE_BIND_ADDRESS:-127.0.0.1}:${RESOURCESPACE_PORT:-8187}:80"
+    volumes:
+      - type: volume
+        source: filestore
+        target: /var/www/html/filestore
+      - type: volume
+        source: configuration
+        target: /frameart-config
+      - type: bind
+        source: ./pilot-entrypoint.sh
+        target: /frameart/pilot-entrypoint.sh
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./safety.php
+        target: /frameart/safety.php
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${RESOURCESPACE_NAS_ORIGINALS:?Set the existing NAS artwork originals directory}
+        target: /artwork-originals
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${RESOURCESPACE_TV_RENDITIONS:?Set the existing generated TV rendition directory}
+        target: /artwork-renditions
+        read_only: true
+        bind:
+          create_host_path: false
+    networks: [backend, frontend]
+    healthcheck:
+      test: ["CMD", "php", "-r", "exit(@fsockopen('127.0.0.1', 80) ? 0 : 1);"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  mariadb:
+    image: mariadb:11.4
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: resourcespace
+      MARIADB_USER: resourcespace_rw
+      MARIADB_PASSWORD_FILE: /run/secrets/database_password
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/database_root_password
+    secrets: [database_password, database_root_password]
+    volumes:
+      - database:/var/lib/mysql
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+networks:
+  frontend:
+  backend:
+    internal: true
+
+volumes:
+  database:
+  filestore:
+  configuration:
+
+secrets:
+  database_password:
+    file: ${RESOURCESPACE_DB_PASSWORD_FILE:?Set a private database password file}
+  database_root_password:
+    file: ${RESOURCESPACE_DB_ROOT_PASSWORD_FILE:?Set a different private root password file}
