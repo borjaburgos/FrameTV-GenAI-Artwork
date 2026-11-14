@@ -20,7 +20,8 @@ causing another upload.
   padding, Samsung's standard fill crop and small JPEG/resampling differences.
   Samsung thumbnails can be noncentrally cropped, even for portrait uploads.
   The fill geometry must preserve a complete source axis and at least 25% of its
-  area; only its position along the other axis varies, with at most 513 offsets.
+  area; only its position along the other axis varies, with at most 513 offsets
+  and seven subpixel refinements around the single best position.
   Require the same tight RGB agreement globally and in every spatial tile. Do
   not search arbitrary two-axis patches, zoom levels, rotations or stretches,
   or treat a small perceptual hash, content ID or inventory entry as proof.

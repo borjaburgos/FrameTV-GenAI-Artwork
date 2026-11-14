@@ -13,19 +13,23 @@ import warnings
 from PIL import Image, ImageChops, ImageFilter, ImageOps, ImageStat
 
 
-def _agrees(expected: Image.Image, actual: Image.Image) -> bool:
+def _difference_score(expected: Image.Image, actual: Image.Image) -> float:
     expected = expected.resize((96, 96), Image.Resampling.LANCZOS)
     if ImageStat.Stat(expected.convert("L")).stddev[0] < 12:
-        return False
+        return float("inf")
     expected = expected.filter(ImageFilter.GaussianBlur(1))
     diff = ImageChops.difference(expected, actual)
     stats = ImageStat.Stat(diff)
-    if max(stats.mean) > 2 or max(stats.rms) > 4:
-        return False
-    return all(
-        max(ImageStat.Stat(diff.crop((x, y, x + 12, y + 12))).mean) <= 4
-        for x in range(0, 96, 12)
-        for y in range(0, 96, 12)
+    score = max(max(stats.mean) / 2, max(stats.rms) / 4)
+    if score > 2:
+        return score
+    return max(
+        score,
+        max(
+            max(ImageStat.Stat(diff.crop((x, y, x + 12, y + 12))).mean) / 4
+            for x in range(0, 96, 12)
+            for y in range(0, 96, 12)
+        ),
     )
 
 
@@ -62,7 +66,7 @@ def thumbnail_matches_photo(photo: bytes, thumbnail: bytes) -> bool:
                 observed = actual.resize((96, 96), Image.Resampling.LANCZOS)
                 observed = observed.filter(ImageFilter.GaussianBlur(1))
                 expected = ImageOps.pad(original, target, Image.Resampling.LANCZOS, color=(0, 0, 0))
-                if _agrees(expected, observed):
+                if _difference_score(expected, observed) <= 1:
                     return True
                 scale = max(target[0] / original.width, target[1] / original.height)
                 width = max(target[0], round(original.width * scale))
@@ -74,19 +78,31 @@ def thumbnail_matches_photo(photo: bytes, thumbnail: bytes) -> bool:
                 extent = max(dx, dy)
                 steps = min(extent, 512)
                 offsets = {round(i * extent / max(steps, 1)) for i in range(steps + 1)}
-                return any(
-                    _agrees(
-                        cover.crop(
-                            (
-                                offset if dx else 0,
-                                offset if dy else 0,
-                                (offset if dx else 0) + target[0],
-                                (offset if dy else 0) + target[1],
-                            )
-                        ),
-                        observed,
+                best_offset, best_score = 0, float("inf")
+                for offset in sorted(offsets):
+                    x, y = (offset if dx else 0), (offset if dy else 0)
+                    score = _difference_score(
+                        cover.crop((x, y, x + target[0], y + target[1])), observed
                     )
-                    for offset in sorted(offsets)
-                )
+                    if score <= 1:
+                        return True
+                    if score < best_score:
+                        best_offset, best_score = offset, score
+                if not extent:
+                    return False
+                # Refine the single best position at subpixel precision using
+                # the original source. Do not relax the pixel thresholds to
+                # compensate for rounding or perform a separate zoom search.
+                for adjustment in (-0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75):
+                    position = min(1, max(0, (best_offset + adjustment) / extent))
+                    candidate = ImageOps.fit(
+                        original,
+                        target,
+                        Image.Resampling.LANCZOS,
+                        centering=(position if dx else 0.5, position if dy else 0.5),
+                    )
+                    if _difference_score(candidate, observed) <= 1:
+                        return True
+                return False
     except (OSError, ValueError, Image.DecompressionBombError, Image.DecompressionBombWarning):
         return False

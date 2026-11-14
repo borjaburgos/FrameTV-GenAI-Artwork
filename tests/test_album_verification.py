@@ -27,6 +27,13 @@ def photo():
     for i in range(32):
         draw.rectangle((i * 20, 0, i * 20 + 20, 480), fill=(i * 7, 240 - i * 5, i * 3))
         draw.ellipse((i * 16, i * 10, i * 16 + 100, i * 10 + 120), fill=(200, i * 7, 40))
+    # Texture must remain in each portrait fill crop; a smooth gradient alone
+    # is deliberately insufficient identity evidence for the verifier.
+    for x in range(0, 640, 40):
+        for y in range(0, 480, 40):
+            draw.rectangle(
+                (x + 4, y + 4, x + 20, y + 20), fill="white" if (x + y) % 80 else "black"
+            )
     return image.filter(ImageFilter.GaussianBlur(2))
 
 
