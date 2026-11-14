@@ -54,6 +54,29 @@ def test_source_comparison_rejects_low_detail_tiny_and_arbitrarily_cropped_image
     assert not thumbnail_matches_photo(jpeg(original), jpeg(original.crop((80, 60, 560, 420))))
 
 
+@pytest.mark.parametrize("portrait", [False, True])
+@pytest.mark.parametrize("position", [0.1, 0.5, 0.9])
+def test_samsung_full_axis_fill_crop_is_verified_at_noncentral_offsets(portrait, position):
+    original = photo()
+    if portrait:
+        original = original.transpose(Image.Transpose.ROTATE_90)
+    cropped = ImageOps.fit(
+        original, (384, 216), Image.Resampling.LANCZOS, centering=(position, position)
+    )
+    assert thumbnail_matches_photo(jpeg(original), jpeg(cropped, 90))
+    assert not thumbnail_matches_photo(jpeg(original), jpeg(ImageOps.mirror(cropped), 90))
+
+
+def test_cover_search_rejects_extreme_zoom_and_unrelated_matching_color_distribution():
+    original = photo()
+    assert not thumbnail_matches_photo(jpeg(original), jpeg(original.crop((200, 150, 400, 300))))
+    assert not thumbnail_matches_photo(jpeg(original), jpeg(ImageOps.flip(original)))
+    # Less than a quarter of an extremely tall source is not enough evidence.
+    tall = original.resize((200, 1600))
+    narrow = ImageOps.fit(tall, (384, 216), Image.Resampling.LANCZOS)
+    assert not thumbnail_matches_photo(jpeg(tall), jpeg(narrow))
+
+
 @pytest.fixture
 def state(tmp_path, monkeypatch):
     token = tmp_path / "pairing.token"
@@ -234,3 +257,23 @@ def test_manual_display_reconciles_without_upload_and_retains_art_mode_guard(sta
     assert not unverified(state)
     controller.upload_image.assert_called_once()
     assert controller.switch_art.call_args.kwargs["require_art_mode"] is True
+
+
+def test_legacy_cropped_thumbnail_recovery_clears_warning_without_any_tv_mutation(state):
+    state.service.sync_album(state.album["id"])
+    with state.store._connect() as db:
+        db.execute("DELETE FROM photo_album_upload_epochs")
+    controller.upload_image.reset_mock()
+    controller.switch_art.reset_mock()
+    state.batch.return_value = {
+        "MY-FAMILY": jpeg(
+            ImageOps.fit(photo(), (384, 216), Image.Resampling.LANCZOS, centering=(0.5, 0.9)), 90
+        )
+    }
+    result = state.service.sync_album(state.album["id"])
+    assert result["errors"] == [] and not unverified(state)
+    assert result["uploaded"] == 0 and result["deleted"] == 0
+    assert result["results"][0]["displayed"] == 0
+    controller.upload_image.assert_not_called()
+    controller.switch_art.assert_not_called()
+    controller.delete_art.assert_not_called()

@@ -16,11 +16,15 @@ causing another upload.
   safe pairing token that remains unchanged throughout the read.
 - Require the same cached source version, acknowledged content ID and current
   album mapping. Recheck these inside the final database transaction.
-- Compare the complete cached photo with the TV thumbnail, allowing only scale,
-  centered black padding and small JPEG/resampling differences. Require tight
-  RGB agreement globally and in each spatial tile. Do not search arbitrary crops
+- Compare the cached photo with the TV thumbnail, allowing scale, centered black
+  padding, Samsung's standard fill crop and small JPEG/resampling differences.
+  Samsung thumbnails can be noncentrally cropped, even for portrait uploads.
+  The fill geometry must preserve a complete source axis and at least 25% of its
+  area; only its position along the other axis varies, with at most 513 offsets.
+  Require the same tight RGB agreement globally and in every spatial tile. Do
+  not search arbitrary two-axis patches, zoom levels, rotations or stretches,
   or treat a small perceptual hash, content ID or inventory entry as proof.
-- Low-detail, tiny, corrupt, unusually cropped or nonmatching thumbnails remain
+- Low-detail, tiny, corrupt, excessively cropped or nonmatching thumbnails remain
   uncertain. This conservative visual comparison is not a full-resolution
   cryptographic identity guarantee; false negatives intentionally defer recovery.
 - Only after the checks pass, atomically save the pairing-bound SHA-256 thumbnail
