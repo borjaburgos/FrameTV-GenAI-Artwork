@@ -15,9 +15,9 @@ concurrency:
 
 jobs:
   dagger:
-    name: Dagger (Cloud)
+    name: Dagger (GitHub + traces)
     # Repository writers and the owner's same-repository PRs are trusted.
-    # Forks and other PRs must never receive an OIDC-capable job.
+    # Only this trusted path may request short-lived OIDC identity for traces.
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
@@ -32,10 +32,11 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Run all Dagger checks on Cloud Engines
+      - name: Run all Dagger checks on the GitHub runner with Cloud traces
         env:
-          DAGGER_ENGINE: cloud
+          DAGGER_ENGINE: image://registry.dagger.io/engine:v1.0.0-beta.27
           DAGGER_CLOUD_TOKEN: oidc
+          DAGGER_CHECK_PARALLEL: "2"
         run: python3 scripts/ci_github.py
 
   untrusted:

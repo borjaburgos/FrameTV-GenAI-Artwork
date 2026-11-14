@@ -1,4 +1,4 @@
-"""Offline contracts for trusted OIDC CI and credential-free pull-request checks."""
+"""Offline contracts for GitHub-hosted CI, telemetry and credential-free PR checks."""
 
 from __future__ import annotations
 
@@ -94,12 +94,14 @@ class TestCIWorkflow:
             for step in job["steps"]:
                 assert "if" not in step and "continue-on-error" not in step
 
-    def test_only_cloud_job_gets_oidc_and_no_stored_credentials_are_referenced(self) -> None:
+    def test_oidc_is_trusted_trace_only_and_both_engines_remain_local(self) -> None:
         jobs = _workflow(CI_PATH)["jobs"]
         assert jobs["dagger"]["permissions"] == {"contents": "read", "id-token": "write"}
         assert jobs["untrusted"]["permissions"] == {"contents": "read"}
         assert _run_step(jobs["dagger"])["env"] == {
-            "DAGGER_ENGINE": "cloud", "DAGGER_CLOUD_TOKEN": "oidc",
+            "DAGGER_ENGINE": "image://registry.dagger.io/engine:v1.0.0-beta.27",
+            "DAGGER_CLOUD_TOKEN": "oidc",
+            "DAGGER_CHECK_PARALLEL": "2",
         }
         assert _run_step(jobs["untrusted"])["env"] == {
             "DAGGER_ENGINE": "image://registry.dagger.io/engine:v1.0.0-beta.27",
@@ -107,6 +109,7 @@ class TestCIWorkflow:
         }
         source = CI_PATH.read_text()
         assert "secrets." not in source
+        assert "DAGGER_ENGINE: cloud" not in source
         assert "DAGGER_API_TOKEN" not in source
         assert "pull_request_target" not in source
 

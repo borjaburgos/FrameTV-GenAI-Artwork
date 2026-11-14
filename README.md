@@ -984,14 +984,15 @@ npm run test:e2e
 
 GitHub Actions triggers CI for main-branch pushes, pull requests, and manual runs.
 Its Dagger pipeline runs the Python matrix, lint, browser tests, container smoke
-check, and generated-SDK check. Trusted jobs target Cloud Engines for cache and
-traces; untrusted pull requests run the same checks locally without Cloud credentials.
-Remote OIDC eligibility and Cloud cache/trace evidence are still being verified.
+check, and generated-SDK check on GitHub-hosted runners. Trusted jobs upload
+Dagger Cloud traces; untrusted pull requests run the same checks without Cloud
+credentials. Engine caches are reused within a job, not shared between fresh
+GitHub runners.
 
 Run the same pipeline locally with `scripts/ci check`. See the
 [Dagger CI guide](docs/dagger-ci.md) for individual checks, the verified local-only
-cache benchmark, input boundaries, and GitHub OIDC setup. GitHub remains the remote
-gate; native Dagger Cloud Checks is off and is not required for this design.
+cache benchmark, input boundaries, and trace setup. GitHub remains the remote
+gate; Cloud Engines and native Dagger Cloud Checks are off and are not required.
 
 ## Architecture
 
