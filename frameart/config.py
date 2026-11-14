@@ -128,6 +128,14 @@ class Settings(BaseSettings):
     # Directories
     data_dir: Path = DEFAULT_DATA_DIR
 
+    # Optional local artwork catalog. The API key stays server-side; FrameArt
+    # only reads the selected pilot collection, never uploads or deletes files.
+    resourcespace_url: str | None = None
+    resourcespace_user: str | None = None
+    resourcespace_api_key: SecretStr | None = None
+    resourcespace_collection: int | None = Field(None, ge=1)
+    resourcespace_timeout: float = Field(10.0, ge=1, le=30)
+
     # Default provider
     default_provider: str = "openai"
     default_model: str | None = None
@@ -163,6 +171,12 @@ class Settings(BaseSettings):
     trusted_lan_cidrs: list[str] = Field(default_factory=list)
     device_session_days: int = Field(365, ge=1, le=3650)
     pairing_code_minutes: int = Field(10, ge=1, le=60)
+
+    @field_validator("resourcespace_collection", mode="before")
+    @classmethod
+    def normalize_optional_resourcespace_collection(cls, value):
+        """Compose leaves optional integration variables empty until configured."""
+        return None if isinstance(value, str) and not value.strip() else value
 
     @field_validator("tailscale_allowed_users")
     @classmethod

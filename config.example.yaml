@@ -43,6 +43,15 @@ tailscale_auth_enabled: false
 # trusted_lan_cidrs:
 #   - 192.168.1.0/24
 
+# --- Optional artwork catalog ------------------------------------------------
+# Optional read-only ResourceSpace art catalog (20-artwork pilot).
+# Keep its reader API key in FRAMEART_RESOURCESPACE_API_KEY, not in Git.
+# resourcespace_url: "https://artlibrary.example.home"
+# resourcespace_user: "frameart-reader"
+# resourcespace_collection: 1
+# resourcespace_timeout: 10
+# See docs/resourcespace-pilot.md for deployment and import instructions.
+
 # --- TV profiles -------------------------------------------------------------
 tvs:
   livingroom_frame:

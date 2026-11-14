@@ -808,6 +808,19 @@ See [docs/LXC.md](docs/LXC.md) for running FrameArt in a Proxmox LXC container. 
 
 ---
 
+## Optional ResourceSpace artwork catalog
+
+FrameArt can browse a read-only ResourceSpace collection with artist credits,
+artwork details, museum/source and license links, crop information, and explicit
+AI provenance. Metadata and previews are cached locally so browsing never scans
+the NAS or waits for ResourceSpace. An unsuccessful refresh retains the last good
+catalog. This pilot is limited to 20 artworks and does not change TV playback.
+
+See [the ResourceSpace pilot guide](docs/resourcespace-pilot.md) for the isolated
+Docker deployment, read-only source mounts, validated importer and reader-account
+configuration. Original files stay independent of both applications; only copies
+of approved TV renditions are imported into ResourceSpace.
+
 ## Data Layout
 
 ```

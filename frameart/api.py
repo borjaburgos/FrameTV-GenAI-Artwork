@@ -76,6 +76,7 @@ from pydantic import AfterValidator, BaseModel, Field, SecretStr, field_validato
 import frameart.public_domain as public_domain
 from frameart import __version__
 from frameart.access import AccessStore, InvalidPairingCodeError
+from frameart.art_catalog_api import create_art_catalog_router
 from frameart.art_profile import ArtProfileRequest, ArtProfileStore, load_art_quiz
 from frameart.automation import (
     AutomationScheduler,
@@ -151,7 +152,10 @@ _PUBLIC_PATHS = {
     "/redoc",
 }
 _PUBLIC_PREFIXES = ("/static/",)
-_ADMIN_PATHS = {"/jobs/delete", "/tv/art/delete", "/tv/art/matte", "/tv/mattes/cache"}
+_ADMIN_PATHS = {
+    "/jobs/delete", "/tv/art/delete", "/tv/art/matte", "/tv/mattes/cache",
+    "/art-catalog/sync",
+}
 _ADMIN_PREFIXES = (
     "/curation",
     "/settings",
@@ -1153,6 +1157,9 @@ class PublicDomainApplyRequest(BaseModel):
 def _settings():
     """Load settings for the current request."""
     return load_settings()
+
+
+app.include_router(create_art_catalog_router(_settings))
 
 
 def _library_store(settings=None) -> LibraryStore:
